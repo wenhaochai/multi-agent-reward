@@ -1,5 +1,5 @@
 #!/bin/bash
-# Runs INSIDE miles.sif (sbatch_miles.sh). miles' own launcher (command_utils) starts with `pkill -9 sglang; ray stop
+# Runs INSIDE miles.sif (radixark/miles:latest, built 2026-09-30; its /root/miles is 874b3e275 and MILES_SRC is checked out there) (sbatch_miles.sh). miles' own launcher (command_utils) starts with `pkill -9 sglang; ray stop
 # --force; pkill -9 ray`, which on a shared Della node kills other jobs' processes, so this script does its job by hand:
 # a job-private Ray head on job-derived ports (Della memory reference_slime_della / reference_della_ray_shared_node),
 # every env var the Ray workers need exported BEFORE `ray start` (workers inherit the raylet's env), then
@@ -14,7 +14,7 @@ mkdir -p "$RUN_DIR"
 exec > >(tee -a "$RUN_DIR/console.log") 2>&1
 export HOME=/tmp/home TRITON_CACHE_DIR=/tmp/home/.cache/triton
 mkdir -p "$HOME"
-MEGATRON=$(python3 -c "import megatron, os; print(os.path.dirname(os.path.dirname(megatron.__file__)))" 2>/dev/null || echo /root/Megatron-LM)
+MEGATRON=/root/Megatron-LM   # the image's patched Megatron (a namespace package: megatron.__file__ is None)
 export PYTHONPATH=$MEGATRON:$MILES:$B${PYTHONPATH:+:$PYTHONPATH}
 export PYTHONUNBUFFERED=1 CUDA_DEVICE_MAX_CONNECTIONS=1 MASTER_ADDR=127.0.0.1 no_proxy=127.0.0.1,localhost
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 RAY_USAGE_STATS_ENABLED=0
