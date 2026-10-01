@@ -7,3 +7,5 @@ data/
 build.log
 __pycache__/
 *.pyc
+pyfix/
+wheels/

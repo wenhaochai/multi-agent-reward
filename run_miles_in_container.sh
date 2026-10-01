@@ -15,7 +15,10 @@ exec > >(tee -a "$RUN_DIR/console.log") 2>&1
 export HOME=/tmp/home TRITON_CACHE_DIR=/tmp/home/.cache/triton
 mkdir -p "$HOME"
 MEGATRON=/root/Megatron-LM   # the image's patched Megatron (a namespace package: megatron.__file__ is None)
-export PYTHONPATH=$MEGATRON:$MILES:$B${PYTHONPATH:+:$PYTHONPATH}
+# pyfix/ first: the image (radixark/miles:latest, 2026-09-30) ships opentelemetry-api 1.45.0 with sdk/exporters 1.44.0, so
+# Ray's dashboard agent dies at import ('_ExtendedAttributes') and `ray start` times out (smoke 14791336). pyfix holds
+# opentelemetry-api 1.44.0 (tools: pip download + pip install --target, see README), matching the rest.
+export PYTHONPATH=$B/pyfix:$MEGATRON:$MILES:$B${PYTHONPATH:+:$PYTHONPATH}
 export PYTHONUNBUFFERED=1 CUDA_DEVICE_MAX_CONNECTIONS=1 MASTER_ADDR=127.0.0.1 no_proxy=127.0.0.1,localhost
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 RAY_USAGE_STATS_ENABLED=0
 export NCCL_NVLS_ENABLE=$(nvidia-smi topo -m 2>/dev/null | grep -c 'NV[0-9]' | awk '{print ($1 > 0) ? 1 : 0}')
