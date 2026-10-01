@@ -1,0 +1,76 @@
+"""Frontier-CS reward for miles: FrontierSmith's code extraction (verl/verl/utils/reward_score/frontiercs.py,
+strip_think + extract_cpp, copied verbatim) scored by the local judge (fcs_judge.py, the official engine's rules).
+sample.label is the problem directory; the reward is the judge score / 100 (EasyPPO's continuous 0-100 score, rescaled).
+Judges run in threads (each a few subprocesses), at most FCS_RM_CONCURRENCY at once (default: cpus / FCS_CASE_WORKERS).
+Use: --custom-rm-path miles_team.fcs_rm.fcs_rm
+"""
+import asyncio
+import os
+import re
+
+from miles_team.fcs_judge import CASE_WORKERS, judge
+
+_SEM = None
+
+
+def strip_think(response: str) -> str:
+    """Remove everything through the last closing think tag."""
+    if not response:
+        return response
+    _, sep, suffix = response.rpartition("</think>")
+    return suffix if sep else response
+
+
+def extract_cpp(response_text: str) -> str:
+    """Extract C++ code from model response (markdown or raw), ignoring <think> blocks."""
+    if not response_text:
+        return ""
+
+    response_text = strip_think(response_text)
+    if not response_text:
+        return ""
+
+    code = response_text.strip()
+
+    # Try to extract from ```cpp blocks
+    cpp_pattern = r'```(?:cpp|c\+\+)?\s*\n(.*?)```'
+    matches = re.findall(cpp_pattern, code, re.DOTALL)
+    if matches:
+        return max(matches, key=len).strip()
+
+    # Fallback: strip markdown if present
+    if code.startswith("```cpp"):
+        code = code[6:].strip()
+    elif code.startswith("```c++"):
+        code = code[6:].strip()
+    elif code.startswith("```"):
+        code = code[3:].strip()
+    if code.endswith("```"):
+        code = code[:-3].strip()
+
+    return code
+
+
+def score(response: str, problem_dir: str) -> float:
+    code = extract_cpp(response or "")
+    if not code:
+        return 0.0
+    try:
+        return judge(problem_dir, code)["score"] / 100.0
+    except Exception:
+        return 0.0
+
+
+async def _one(sample) -> float:
+    global _SEM
+    if _SEM is None:
+        n = int(os.environ.get("FCS_RM_CONCURRENCY", max(1, (os.cpu_count() or 8) // CASE_WORKERS)))
+        _SEM = asyncio.Semaphore(n)
+    async with _SEM:
+        return await asyncio.to_thread(score, sample.response or "", sample.label)
+
+
+async def fcs_rm(args, sample, **kwargs):
+    if isinstance(sample, list):
+        return list(await asyncio.gather(*(_one(s) for s in sample)))
+    return await _one(sample)
