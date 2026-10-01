@@ -7,6 +7,7 @@ Use: --custom-rm-path miles_team.fcs_rm.fcs_rm
 import asyncio
 import os
 import re
+import sys
 
 from miles_team.fcs_judge import CASE_WORKERS, judge
 
@@ -57,7 +58,8 @@ def score(response: str, problem_dir: str) -> float:
         return 0.0
     try:
         return judge(problem_dir, code)["score"] / 100.0
-    except Exception:
+    except Exception as e:  # an infrastructure failure (helper compile, disk), not the policy's fault: make it visible
+        print(f"[fcs_rm] JUDGE-ERROR {problem_dir}: {e}"[:500], file=sys.stderr, flush=True)
         return 0.0
 
 

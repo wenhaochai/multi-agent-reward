@@ -8,6 +8,8 @@
 B=/scratch/gpfs/GROUP/USER/project/miles-q38-build
 MODEL=${MODEL:-/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/Qwen3.5-9B}
 OUT=${OUT:-$B/runs/fcs_probe_qwen35_9b}
-apptainer exec --nv --contain --cleanenv --bind /scratch/gpfs/GROUP/USER \
+LT=/tmp/fcs_$SLURM_JOB_ID; mkdir -p $LT  # container /tmp under --contain is a tiny tmpfs (parity 14849538: ENOSPC)
+trap 'rm -rf $LT' EXIT
+apptainer exec --nv --contain --cleanenv --bind /scratch/gpfs/GROUP/USER,$LT:/tmp \
   --env HOME=/tmp/home,HF_HUB_OFFLINE=1,TRANSFORMERS_OFFLINE=1,FCS_JUDGE_CACHE=/tmp/fcsj_cache,PYTHONPATH=$B/pyfix \
   $B/miles.sif python3 $B/tools/fcs_probe.py $MODEL $OUT val:$B/data/fcs_val172.jsonl:5 train:$B/data/fcs_train200.jsonl:4

@@ -80,7 +80,10 @@ VAL = set(open('/scratch/gpfs/GROUP/USER/project/frontiersmith-200/data/frontier
 
 def run(row):
     t = time.time()
-    r = judge(ALG / 'problems' / row['problem'], open(ALG / 'solutions' / row['solution']).read(), case_workers=4)
+    try:
+        r = judge(ALG / 'problems' / row['problem'], open(ALG / 'solutions' / row['solution']).read(), case_workers=4)
+    except Exception as e:
+        r = {'score': float('nan'), 'status': f'judge error: {e}'[:300]}
     return {**row, 'local': r['score'], 'local_status': r['status'], 'sec': round(time.time() - t, 1)}
 
 
@@ -110,6 +113,9 @@ def main():
         for res in ex.map(run, sample):
             f.write(json.dumps(res) + '\n'); f.flush()
     res = [json.loads(l) for l in open(out)]
+    bad = [r for r in res if r['local'] != r['local']]
+    print(f'judge errors: {len(bad)}', *{r['local_status'] for r in bad}, sep='\n  ')
+    res = [r for r in res if r['local'] == r['local']]
     agg = defaultdict(list)
     for r in res:
         agg[(r['interactive'], r['bin'])].append(abs(r['local'] - r['official']))
