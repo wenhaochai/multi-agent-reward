@@ -1,0 +1,375 @@
+From ddaf3453e57ebfd353ab83abc924cc30dbe455c8 Mon Sep 17 00:00:00 2001
+From: Wenhao Chai <reselfchai@gmail.com>
+Date: Thu, 1 Oct 2026 19:48:41 -0400
+Subject: [PATCH 1/2] EasyPPO for PPO: actor-only overlong filter,
+ noise-normalized critic loss, critic mini-batches
+
+Opt-in flags porting EasyPPO (arXiv 2609.36802, github.com/EasyPPO/EasyPPO 85bde92):
+--actor-only-overlong-filter: responses at --rollout-max-response-len (or finish_reason
+length) keep full weight in GAE, advantage whitening and the critic update and are masked
+out of the actor loss only, with no token in the token-mean denominator.
+--critic-variance-weighted-loss (--critic-variance-weight-beta/-min/-max): per-response
+weight 1/max(var**beta, w_min) of the prompt group's rewards, computed on the rollout side
+over the whole batch with EasyPPO's compute_prompt_variance_loss_weights (verbatim), and
+multiplied into the clipped value loss.
+--critic-global-batch-size: the critic trainer's own global batch size (e.g. four critic
+optimizer steps per rollout); turns off the shared rollout-side DP schedule so each trainer
+schedules its equal-size shard locally.
+--value-loss-scale: verl's 0.5 factor on the value loss.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01YBcVrDE1HspU5PgJLmxVZp
+---
+ miles/backends/megatron_utils/actor.py        |   6 +
+ .../megatron_utils/megatron_config.py         |   9 +-
+ miles/backends/megatron_utils/model.py        |   1 +
+ miles/backends/training_utils/loss.py         |   6 +-
+ .../training_utils/loss_hub/easyppo.py        | 109 ++++++++++++++++++
+ .../training_utils/loss_hub/losses.py         |   8 ++
+ miles/ray/rollout/train_data_conversion.py    |  34 ++++++
+ miles/utils/arguments.py                      |  41 +++++++
+ 8 files changed, 212 insertions(+), 2 deletions(-)
+ create mode 100644 miles/backends/training_utils/loss_hub/easyppo.py
+
+diff --git a/miles/backends/megatron_utils/actor.py b/miles/backends/megatron_utils/actor.py
+index 5d1a9201b..3e9f0488e 100644
+--- a/miles/backends/megatron_utils/actor.py
++++ b/miles/backends/megatron_utils/actor.py
+@@ -756,6 +756,12 @@ class MegatronTrainRayActor(TrainRayActor):
+                 # because we may need normalize the whole rollout.
+                 compute_advantages_and_returns(self.args, rollout_data)
+                 log_train_advantage_computation_event(rollout_data)
++                if self.args.actor_only_overlong_filter:
++                    # EasyPPO: overlong responses already fed GAE, whitening and the critic; drop them from the actor loss
++                    from miles.backends.training_utils.loss_hub.easyppo import apply_actor_overlong_mask
++
++                    n_masked = apply_actor_overlong_mask(self.args, rollout_data)
++                    logger.info(f"EasyPPO actor-only overlong filter: masked {n_masked} local responses")
+ 
+             if self.rollout_data_postprocess is not None:
+                 self.rollout_data_postprocess(self.args)
+diff --git a/miles/backends/megatron_utils/megatron_config.py b/miles/backends/megatron_utils/megatron_config.py
+index 2768920e1..dc3cec8b1 100644
+--- a/miles/backends/megatron_utils/megatron_config.py
++++ b/miles/backends/megatron_utils/megatron_config.py
+@@ -272,6 +272,13 @@ def _compute_critic_overrides(args) -> dict[str, Any]:
+         "save": args.critic_save,
+         "lr": args.critic_lr,
+         "lr_warmup_iters": args.critic_lr_warmup_iters,
++        # EasyPPO: the critic takes its own optimizer steps (e.g. four per rollout); its scheduler counts rollouts
++        # (opt_param_scheduler.step(increment=num_rollouts)), so --critic-lr-warmup-iters is in critic steps.
++        **(
++            {"global_batch_size": args.critic_global_batch_size}
++            if getattr(args, "critic_global_batch_size", None) is not None
++            else {}
++        ),
+     }
+ 
+ 
+@@ -301,7 +308,7 @@ _ROLLOUT_SHARED_ARGS: frozenset[str] = frozenset(
+ 
+ def compute_trainer_args(args: Namespace, trainer: MegatronTrainerConfig) -> Namespace:
+     # TODO: support policies with different global batch sizes.
+-    assert "global_batch_size" not in trainer.overrides, (
++    assert "global_batch_size" not in trainer.overrides or trainer.role == CRITIC_ROLE, (
+         f"--megatron-config trainer {trainer.trainer_id!r} overrides global_batch_size; every policy has to "
+         f"share the run's"
+     )
+diff --git a/miles/backends/megatron_utils/model.py b/miles/backends/megatron_utils/model.py
+index 6316dfa70..6d99e2a8c 100644
+--- a/miles/backends/megatron_utils/model.py
++++ b/miles/backends/megatron_utils/model.py
+@@ -477,6 +477,7 @@ def run_forward_backward_pass(
+                 "opd_reverse_kl",
+                 "rollout_mask_sums",
+                 "loss_weights",
++                "critic_loss_weights",
+                 "target_tokens",
+                 "sample_indices",
+                 *sampling_mask_keys,
+diff --git a/miles/backends/training_utils/loss.py b/miles/backends/training_utils/loss.py
+index 81a3eee83..a633f6891 100644
+--- a/miles/backends/training_utils/loss.py
++++ b/miles/backends/training_utils/loss.py
+@@ -161,7 +161,11 @@ def loss_function(
+           Tinker losses may also return "per_datum" outputs.
+     """
+     parallel_state = get_parallel_state()
+-    num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
++    if getattr(args, "actor_only_overlong_filter", False):
++        # EasyPPO masks whole rows: a fully masked response adds no tokens to the token-mean denominator
++        num_tokens = torch.clamp_min(sum([loss_mask.sum() for loss_mask in batch["loss_masks"]]), 1)
++    else:
++        num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
+     num_samples = len(batch["response_lengths"])
+ 
+     sum_of_sample_mean = get_sum_of_sample_mean(
+diff --git a/miles/backends/training_utils/loss_hub/easyppo.py b/miles/backends/training_utils/loss_hub/easyppo.py
+new file mode 100644
+index 000000000..cbe53c382
+--- /dev/null
++++ b/miles/backends/training_utils/loss_hub/easyppo.py
+@@ -0,0 +1,109 @@
++"""EasyPPO (arXiv 2609.36802, github.com/EasyPPO/EasyPPO) critic and actor changes for miles PPO.
++
++1. Actor-only overlong filtering: responses that hit the rollout length limit keep full weight for GAE, advantage
++   whitening and the critic update, and are masked out of the actor update only (EasyPPO
++   trainer/ppo/v1/trainer_base.py: mask_overlong_response_keys around update_actor). `apply_actor_overlong_mask`.
++2. Noise-normalized critic regression: each response's clipped value loss is multiplied by an inverse return-std
++   weight of its prompt group (`compute_prompt_variance_loss_weights`, verbatim from EasyPPO
++   verl/trainer/ppo/core_algos.py), computed on the rollout side over the whole batch.
++3. Critic mini-batches: --critic-global-batch-size (the critic trainer's own global batch size).
++"""
++from collections import defaultdict
++from typing import Any, Optional
++
++import numpy as np
++import torch
++
++
++# verbatim: EasyPPO verl/trainer/ppo/core_algos.py (EasyPPO 85bde92)
++def compute_prompt_variance_loss_weights(
++    sequence_rewards: torch.Tensor,
++    sample_uids: np.ndarray | list[Any],
++    beta: float = 1.0,
++    w_min: float = 0.02,
++    valid_mask: Optional[torch.Tensor] = None,
++    w_max: Optional[float] = None,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Compute per-sequence inverse-variance weights from same-prompt rollout rewards.
++
++    The empirical variance uses the population convention (correction=0). Every rollout from the
++    same prompt first receives ``1 / max(variance**beta, w_min)``. The weights are then divided by
++    their mean across unique prompts so they preserve the unweighted critic loss scale. If ``w_max``
++    is set, the normalized weights are finally clipped to that maximum without renormalizing.
++    Rows excluded by ``valid_mask`` receive zero weight and do not affect prompt statistics.
++    """
++    if sequence_rewards.ndim != 1:
++        raise ValueError(f"sequence_rewards must be one-dimensional, got {tuple(sequence_rewards.shape)}")
++    if beta < 0:
++        raise ValueError(f"beta must be non-negative, got {beta}")
++    if w_min <= 0:
++        raise ValueError(f"w_min must be positive, got {w_min}")
++    if w_max is not None and w_max <= 0:
++        raise ValueError(f"w_max must be positive or None, got {w_max}")
++
++    sample_uids = np.asarray(sample_uids, dtype=object)
++    if sample_uids.ndim != 1 or sample_uids.shape[0] != sequence_rewards.numel():
++        raise ValueError(
++            "sample_uids must be one-dimensional and match sequence_rewards: "
++            f"got shape {sample_uids.shape} for {sequence_rewards.numel()} rewards"
++        )
++
++    if valid_mask is None:
++        valid_mask = torch.ones_like(sequence_rewards, dtype=torch.bool)
++    else:
++        if valid_mask.ndim != 1 or valid_mask.numel() != sequence_rewards.numel():
++            raise ValueError(
++                "valid_mask must be one-dimensional and match sequence_rewards: "
++                f"got shape {tuple(valid_mask.shape)} for {sequence_rewards.numel()} rewards"
++            )
++        valid_mask = valid_mask.to(device=sequence_rewards.device, dtype=torch.bool)
++
++    weights = torch.zeros_like(sequence_rewards, dtype=torch.float32)
++    variances = torch.zeros_like(sequence_rewards, dtype=torch.float32)
++    uid_to_indices: dict[Any, list[int]] = defaultdict(list)
++    for index, sample_uid in enumerate(sample_uids.tolist()):
++        if valid_mask[index]:
++            uid_to_indices[sample_uid].append(index)
++
++    if not uid_to_indices:
++        raise ValueError("sequence_rewards contains no valid rows")
++
++    detached_rewards = sequence_rewards.detach().float()
++    prompt_weights = []
++    for indices in uid_to_indices.values():
++        index_tensor = torch.tensor(indices, device=sequence_rewards.device, dtype=torch.long)
++        prompt_rewards = detached_rewards[index_tensor]
++        prompt_variance = torch.var(prompt_rewards, correction=0)
++        variance_scale = torch.clamp(prompt_variance.pow(beta), min=w_min)
++        prompt_weight = variance_scale.reciprocal()
++        prompt_weights.append(prompt_weight)
++        weights[index_tensor] = prompt_weight
++        variances[index_tensor] = prompt_variance
++
++    weights /= torch.stack(prompt_weights).mean()
++    if w_max is not None:
++        weights.clamp_(max=w_max)
++    return weights, variances
++
++
++def overlong_flags(args, rollout_data) -> list[bool]:
++    """EasyPPO's criterion (response length reaches the rollout limit) or SGLang's finish_reason=length."""
++    limit = args.rollout_max_response_len
++    truncated = rollout_data.get("truncated")
++    flags = []
++    for i, response_length in enumerate(rollout_data["response_lengths"]):
++        hit = limit is not None and int(response_length) >= limit
++        if truncated is not None:
++            hit = hit or bool(int(truncated[i]))
++        flags.append(hit)
++    return flags
++
++
++def apply_actor_overlong_mask(args, rollout_data) -> int:
++    """Zero the actor loss masks of overlong responses in place (after advantages are computed); returns the count."""
++    flags = overlong_flags(args, rollout_data)
++    loss_masks = rollout_data["loss_masks"]
++    for i, hit in enumerate(flags):
++        if hit:
++            loss_masks[i] = torch.zeros_like(loss_masks[i])
++    return sum(flags)
+diff --git a/miles/backends/training_utils/loss_hub/losses.py b/miles/backends/training_utils/loss_hub/losses.py
+index 048dfdac2..a49ff7d0d 100644
+--- a/miles/backends/training_utils/loss_hub/losses.py
++++ b/miles/backends/training_utils/loss_hub/losses.py
+@@ -445,6 +445,14 @@ def value_loss_function(
+     surr1 = (values_clipped - returns) ** 2
+     surr2 = (values - returns) ** 2
+     loss = torch.max(surr1, surr2)
++    if getattr(args, "critic_variance_weighted_loss", False):
++        # EasyPPO compute_value_loss: per-response weights multiply the numerator; the token denominator is unchanged
++        weights = batch["critic_loss_weights"]
++        assert weights is not None, "--critic-variance-weighted-loss needs critic_loss_weights in the rollout data"
++        loss = loss * torch.cat(
++            [torch.full_like(v, float(w), dtype=loss.dtype) for v, w in zip(batch["values"], weights, strict=True)]
++        )
++    loss = loss * getattr(args, "value_loss_scale", 1.0)
+ 
+     loss = sum_of_sample_mean(loss)
+     values_clipfrac = sum_of_sample_mean(values_clipfrac.float())
+diff --git a/miles/ray/rollout/train_data_conversion.py b/miles/ray/rollout/train_data_conversion.py
+index 822140b1f..0a2559973 100644
+--- a/miles/ray/rollout/train_data_conversion.py
++++ b/miles/ray/rollout/train_data_conversion.py
+@@ -32,6 +32,7 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
+     "seq_witness_ids": ValueSpec(codec="ndarray", dtype="int64"),
+     "response_lengths": ValueSpec(codec="ndarray", dtype="int64"),
+     "rewards": ValueSpec(codec="ndarray", dtype="float32"),
++    "critic_loss_weights": ValueSpec(codec="ndarray", dtype="float32"),
+     "truncated": ValueSpec(codec="ndarray", dtype="int64"),
+     "round_number": ValueSpec(codec="ndarray", dtype="int64"),
+     "sample_indices": ValueSpec(codec="ndarray", dtype="int64"),
+@@ -103,6 +104,9 @@ def convert_samples_to_train_data(
+ 
+     train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
+ 
++    if getattr(args, "critic_variance_weighted_loss", False):
++        train_data["critic_loss_weights"] = _compute_critic_loss_weights(args, samples, raw_rewards, loss_masks)
++
+     # overwriting the raw reward
+     if samples[0].metadata and "raw_reward" in samples[0].metadata:
+         train_data["raw_reward"] = [sample.metadata["raw_reward"] for sample in samples]
+@@ -176,6 +180,31 @@ def convert_samples_to_train_data(
+     return train_data
+ 
+ 
++def _compute_critic_loss_weights(args, samples, raw_rewards, loss_masks) -> list[float]:
++    """EasyPPO noise-normalized critic weights over the whole rollout batch (EasyPPO v1 trainer_base
++    _compute_advantage: sequence rewards, prompt uid groups, rows with any response token valid)."""
++    from miles.backends.training_utils.loss_hub.easyppo import compute_prompt_variance_loss_weights
++
++    rewards = torch.tensor([float(r) for r in raw_rewards], dtype=torch.float32)
++    uids = [s.group_index for s in samples]
++    assert all(u is not None for u in uids), "critic variance weights need Sample.group_index (the prompt group)"
++    valid = torch.tensor([any(m) for m in loss_masks], dtype=torch.bool)
++    weights, variances = compute_prompt_variance_loss_weights(
++        sequence_rewards=rewards,
++        sample_uids=uids,
++        beta=args.critic_variance_weight_beta,
++        w_min=args.critic_variance_weight_min,
++        w_max=args.critic_variance_weight_max,
++        valid_mask=valid,
++    )
++    logger.info(
++        f"EasyPPO critic weights: prompts={len(set(uids))} reward_var mean={variances[valid].mean().item():.4f} "
++        f"max={variances[valid].max().item():.4f} weight min={weights[valid].min().item():.3f} "
++        f"max={weights[valid].max().item():.3f}"
++    )
++    return weights.tolist()
++
++
+ def _compute_rollout_mask_sums(rollout_ids: list[int], loss_masks: list[list[int]]) -> list[int]:
+     """Whole-rollout loss-mask total per sample: every sibling of one rollout carries
+     the sum over all of that rollout's samples, so the loss reducer reconstructs one
+@@ -306,6 +335,10 @@ def can_schedule_on_rollout_side(args, data: dict[str, Any], train_parallel_conf
+     """Whether the rollout side can precompute the full DP/mbs schedule."""
+     if not has_full_schedule_config(train_parallel_config):
+         return False
++    if getattr(args, "critic_global_batch_size", None) is not None:
++        # actor and critic step at different batch sizes; one shared rollout-side schedule cannot serve both,
++        # so each trainer schedules its equal-size DP shard locally
++        return False
+     if is_multi_lora_enabled(args):
+         return False
+     if "multimodal_train_inputs" in data:
+@@ -376,6 +409,7 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
+             "multimodal_train_inputs",
+             "response_lengths",
+             "rewards",
++            "critic_loss_weights",
+             "truncated",
+             "loss_masks",
+             "round_number",
+diff --git a/miles/utils/arguments.py b/miles/utils/arguments.py
+index 657b94f3b..46912d31c 100644
+--- a/miles/utils/arguments.py
++++ b/miles/utils/arguments.py
+@@ -1579,6 +1579,39 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
+                 help="number of iterations to linearly warmup for critic model.",
+             )
+ 
++            # EasyPPO (arXiv 2609.36802; miles/backends/training_utils/loss_hub/easyppo.py)
++            parser.add_argument(
++                "--critic-global-batch-size",
++                type=int,
++                default=None,
++                help="EasyPPO: the critic trainer's own global batch size (rollouts per critic optimizer step), e.g. "
++                "a quarter of the actor's for four critic steps per rollout. Default: the actor's --global-batch-size.",
++            )
++            parser.add_argument(
++                "--critic-variance-weighted-loss",
++                action="store_true",
++                default=False,
++                help="EasyPPO noise-normalized critic regression: multiply each response's clipped value loss by "
++                "1/max(var**beta, w_min) of its prompt group's rewards (population variance), normalized to mean 1 "
++                "over the batch's prompts.",
++            )
++            parser.add_argument("--critic-variance-weight-beta", type=float, default=0.5)
++            parser.add_argument("--critic-variance-weight-min", type=float, default=0.25)
++            parser.add_argument("--critic-variance-weight-max", type=float, default=None)
++            parser.add_argument(
++                "--actor-only-overlong-filter",
++                action="store_true",
++                default=False,
++                help="EasyPPO actor-only overlong filtering: responses that hit --rollout-max-response-len keep full "
++                "weight in GAE, advantage whitening and the critic update and are masked out of the actor loss only.",
++            )
++            parser.add_argument(
++                "--value-loss-scale",
++                type=float,
++                default=1.0,
++                help="Multiplier on the value loss (EasyPPO / verl compute_value_loss uses 0.5).",
++            )
++
+             parser.add_argument("--eps-clip", type=float, default=0.2, help="PPO clip range")
+             parser.add_argument("--eps-clip-high", type=float, default=None, help="PPO clip upper range")
+             parser.add_argument(
+@@ -3527,6 +3560,14 @@ def miles_validate_args(args):
+         args.critic_load = args.load
+     if args.critic_lr is None:
+         args.critic_lr = args.lr
++    if args.critic_global_batch_size is not None:
++        assert args.use_critic, "--critic-global-batch-size needs --advantage-estimator ppo"
++        assert args.global_batch_size is None or args.global_batch_size % args.critic_global_batch_size == 0, (
++            f"--critic-global-batch-size {args.critic_global_batch_size} must divide --global-batch-size "
++            f"{args.global_batch_size}"
++        )
++    if args.critic_variance_weighted_loss or args.actor_only_overlong_filter:
++        assert args.use_critic, "the EasyPPO critic options need --advantage-estimator ppo"
+     if args.critic_save is None and args.save is not None:
+         # a sibling dir, not args.save itself: sharing a dir would clobber the actor's iteration tracker
+         args.critic_save = args.save.rstrip("/") + "_critic"
+-- 
+2.52.0
+

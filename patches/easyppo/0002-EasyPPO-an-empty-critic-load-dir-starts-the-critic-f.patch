@@ -1,0 +1,42 @@
+From faa92a1962f9fc6e81cc1dbec07610edf2c62b23 Mon Sep 17 00:00:00 2001
+From: Wenhao Chai <reselfchai@gmail.com>
+Date: Thu, 1 Oct 2026 19:56:38 -0400
+Subject: [PATCH 2/2] EasyPPO: an empty --critic-load dir starts the critic
+ from the HF weights (bridge)
+
+Mirrors resolve_args_checkpoint_load for the actor's --load, so --critic-load = --critic-save
+works on the first segment of a resume chain (otherwise load_checkpoint asserts on the empty
+dir, and the default critic_load = --load would hand a resumed critic the actor's checkpoint).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01YBcVrDE1HspU5PgJLmxVZp
+---
+ miles/utils/arguments.py | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/miles/utils/arguments.py b/miles/utils/arguments.py
+index 46912d31c..c9b78fdc0 100644
+--- a/miles/utils/arguments.py
++++ b/miles/utils/arguments.py
+@@ -13,6 +13,7 @@ from miles.backends.megatron_utils.megatron_config import (
+     ACTOR_ROLE,
+     CRITIC_ROLE,
+     resolve_args_checkpoint_load,
++    _has_megatron_checkpoint,
+     resolve_megatron_config,
+ )
+ from miles.backends.sglang_utils.arguments import add_sglang_arguments, collect_eval_sglang_overrides
+@@ -3558,6 +3559,10 @@ def miles_validate_args(args):
+         args.critic_num_nodes = args.actor_num_nodes
+     if args.critic_load is None:
+         args.critic_load = args.load
++    elif args.megatron_to_hf_mode == "bridge" and not _has_megatron_checkpoint(args.critic_load):
++        # a fresh run's own critic dir (--critic-load = --critic-save, so the same command resumes): start from the
++        # HF weights through the bridge, as resolve_args_checkpoint_load does for the actor's --load
++        args.critic_load = args.ref_load or args.hf_checkpoint
+     if args.critic_lr is None:
+         args.critic_lr = args.lr
+     if args.critic_global_batch_size is not None:
+-- 
+2.52.0
+
