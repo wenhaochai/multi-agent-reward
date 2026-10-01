@@ -1,0 +1,25 @@
+# go-judge sandbox mounts on a RHEL9 host (go-judge's default set + testlib at /testlib)
+mount:
+  - {type: bind, source: /bin, target: bin, readonly: true}
+  - {type: bind, source: /lib, target: lib, readonly: true}
+  - {type: bind, source: /lib64, target: lib64, readonly: true}
+  - {type: bind, source: /usr, target: usr, readonly: true}
+  - {type: bind, source: /etc/ld.so.cache, target: etc/ld.so.cache, readonly: true}
+  - {type: bind, source: /etc/alternatives, target: etc/alternatives, readonly: true}
+  - {type: bind, source: /scratch/gpfs/GROUP/USER/project/gojudge/testlib, target: testlib, readonly: true}
+  - {type: bind, source: /dev/null, target: dev/null}
+  - {type: bind, source: /dev/urandom, target: dev/urandom}
+  - {type: bind, source: /dev/random, target: dev/random}
+  - {type: bind, source: /dev/zero, target: dev/zero}
+  - {type: bind, source: /dev/full, target: dev/full}
+  - {type: tmpfs, target: w, data: "size=512m,nr_inodes=8k"}
+  - {type: tmpfs, target: tmp, data: "size=512m,nr_inodes=8k"}
+symLink:
+  - {linkPath: dev/fd, target: /proc/self/fd}
+  - {linkPath: dev/stdin, target: /proc/self/fd/0}
+  - {linkPath: dev/stdout, target: /proc/self/fd/1}
+  - {linkPath: dev/stderr, target: /proc/self/fd/2}
+workDir: /w
+hostName: executor_server
+domainName: executor_server
+proc: true

@@ -153,14 +153,14 @@ def _case_classic(prob, sol: Path, chk: Path, case, work: Path) -> float:
                              preexec_fn=_limits(tl, ml))
         code, cpu, killed = _wait(p, 2 * tl)
     if killed or code != 0 or cpu > tl or out.stat().st_size > STDOUT_MAX:
-        return 0.0
+        return 0.0, f"run: code={code} cpu={cpu:.2f}/{tl} killed={killed}"
     ans = td / outp if (td / outp).exists() else td / outp.replace(".ans", ".out")
     r = subprocess.run([str(chk), str(td / inp), str(out), str(ans)], capture_output=True, text=True,
                        errors="replace", preexec_fn=_limits(10, 256 << 20), timeout=20)
     ok = r.returncode == OK_EXIT
     msg = r.stdout or r.stderr or ""
     m = _RATIO.search(msg) if r.returncode in (OK_EXIT, POINTS_EXIT) else None
-    return float(m.group(1)) if m else (1.0 if ok else 0.0)
+    return (float(m.group(1)) if m else (1.0 if ok else 0.0)), f"chk={r.returncode} cpu={cpu:.2f}/{tl} {msg.strip()[:120]}"
 
 
 def _case_interactive(prob, sol: Path, inter: Path, case, work: Path) -> float:
@@ -185,11 +185,12 @@ def _case_interactive(prob, sol: Path, inter: Path, case, work: Path) -> float:
     sub_ok = not skilled and scode == 0 and scpu <= tl
     inter_scoring = not ikilled and icode in (OK_EXIT, POINTS_EXIT)
     judge_msg = imsg if inter_scoring else ""
+    info = f"sol code={scode} cpu={scpu:.2f}/{tl} killed={skilled}; inter code={icode} killed={ikilled} {imsg.strip()[:120]}"
     if not sub_ok:
-        return 0.0                                    # the run itself failed: no credit
+        return 0.0, info                              # the run itself failed: no credit
     ok = icode == OK_EXIT and not ikilled
     m = _RATIO.search(judge_msg)
-    return float(m.group(1)) if m else (1.0 if ok else 0.0)
+    return (float(m.group(1)) if m else (1.0 if ok else 0.0)), info
 
 
 def judge(problem_dir, source: str, case_workers: int = CASE_WORKERS) -> dict:
@@ -207,14 +208,16 @@ def judge(problem_dir, source: str, case_workers: int = CASE_WORKERS) -> dict:
         helper = _compile_helper(prob["dir"], prob["interactor"] if prob["interactive"] else prob["checker"])
         fn = _case_interactive if prob["interactive"] else _case_classic
         with ThreadPoolExecutor(max_workers=max(1, case_workers)) as ex:
-            ratios = list(ex.map(lambda c: _safe(fn, prob, sol, helper, c, work), prob["cases"]))
-        return {"score": 100.0 * sum(ratios) / len(ratios), "status": "done", "cases": ratios}
+            res = list(ex.map(lambda c: _safe(fn, prob, sol, helper, c, work), prob["cases"]))
+        ratios = [r for r, _ in res]
+        return {"score": 100.0 * sum(ratios) / len(ratios), "status": "done", "cases": ratios,
+                "case_info": [i for _, i in res]}
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
-def _safe(fn, *a) -> float:
+def _safe(fn, *a):
     try:
         return fn(*a)
-    except Exception:
-        return 0.0
+    except Exception as e:
+        return 0.0, f"exception: {e}"[:200]
