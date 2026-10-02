@@ -24,7 +24,8 @@ role 0 = lead, 1 = teammate (the K teammates are exchangeable, so they share one
 sample of an episode shares the episode's rollout_id; with --calculate-per-token-loss the loss is a token mean over
 all samples, so the team's tokens weigh the same as solo tokens.
 
-Eval: sample.metadata["ft_mode"] == "solo" plays one agent on the solo prompt (reward s: the weights as a single
+Eval: MA_FT_EVAL_MATES teammates (default MA_FT_MATES; a solo-trained run sets 3 to score its weights in the game);
+sample.metadata["ft_mode"] == "solo" plays one agent on the solo prompt (reward s: the weights as a single
 agent); otherwise the full game, returning the lead's sample with reward S. Episode stats (ft_*) ride on the lead's
 sample metadata; log_rollout / log_eval average them into rollout/ft_* and eval/<set>/ft_*.
 """
@@ -45,6 +46,7 @@ from .fcs_rm import extract_cpp, judge_code, strip_think
 from .team_rollout import Aborted, Session, _pad_sample
 
 MATES = int(os.environ.get("MA_FT_MATES", "3"))
+EVAL_MATES = int(os.environ.get("MA_FT_EVAL_MATES", str(MATES)))  # team eval of solo-trained weights: set 3 with MATES=0
 MATE_BUDGET = int(os.environ.get("MA_FT_MATE_BUDGET", "16384"))
 LEAD_BUDGET = int(os.environ.get("MA_FT_LEAD_BUDGET", "16384"))
 CODE_CHARS = int(os.environ.get("MA_FT_CODE_CHARS", "12000"))
@@ -170,7 +172,7 @@ async def _play(input: GenerateFnInput) -> GenerateFnOutput:
     assert messages, "fcs_team needs the raw chat in sample.metadata['messages'] (tools/make_fcs_team_data.py)"
     label = input.sample.label
     solo_eval = input.evaluation and meta.get("ft_mode") == "solo"
-    k = 0 if solo_eval else MATES
+    k = 0 if solo_eval else (EVAL_MATES if input.evaluation else MATES)
 
     if k == 0:  # plain solo: one agent on the solo prompt
         sess, text, cut = await _agent(input, "solo", messages, LEAD_BUDGET)
