@@ -1,0 +1,145 @@
+From 1964dbb4c99ade509b6a6f669b2bc83ad617252b Mon Sep 17 00:00:00 2001
+From: Wenhao Chai <reselfchai@gmail.com>
+Date: Thu, 1 Oct 2026 21:06:54 -0400
+Subject: [PATCH 4/4] --megatron-hf-checkpoint: the Megatron side reads its own
+ HF checkpoint
+
+Bridge model build, HF weight load (actor --load fallback, critic), weight export to sglang,
+save_hf and hf_config read --megatron-hf-checkpoint (default --hf-checkpoint); sglang and the
+tokenizer keep --hf-checkpoint. Lets text-only RL train a Qwen3_5ForCausalLM (GPTModel, no
+vision tower) while sglang serves Qwen3_5ForConditionalGeneration with language_model_only;
+the exported model.layers.* names load into it unchanged.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01YBcVrDE1HspU5PgJLmxVZp
+---
+ miles/backends/megatron_utils/actor.py            |  2 +-
+ miles/backends/megatron_utils/hf_export.py        |  2 +-
+ miles/backends/megatron_utils/lora/bridge.py      |  2 +-
+ miles/backends/megatron_utils/megatron_config.py  |  2 +-
+ miles/backends/megatron_utils/model_provider.py   |  2 +-
+ .../update_weight/hf_weight_iterator_bridge.py    |  2 +-
+ miles/utils/arguments.py                          | 15 ++++++++++++++-
+ 7 files changed, 20 insertions(+), 7 deletions(-)
+
+diff --git a/miles/backends/megatron_utils/actor.py b/miles/backends/megatron_utils/actor.py
+index 3e9f0488e..f16b58b9e 100644
+--- a/miles/backends/megatron_utils/actor.py
++++ b/miles/backends/megatron_utils/actor.py
+@@ -159,7 +159,7 @@ class MegatronTrainRayActor(TrainRayActor):
+         # read config and tokenizer serialized to prevent concurrent writing bug.
+         for i in range(dist.get_world_size()):
+             if i == dist.get_rank():
+-                self.hf_config = load_hf_config(args.hf_checkpoint)
++                self.hf_config = load_hf_config(args.megatron_hf_checkpoint)
+                 self.tokenizer = load_tokenizer(
+                     self.args.hf_checkpoint, chat_template_path=self.args.chat_template_path, trust_remote_code=True
+                 )
+diff --git a/miles/backends/megatron_utils/hf_export.py b/miles/backends/megatron_utils/hf_export.py
+index ff0517fc4..2a4940053 100644
+--- a/miles/backends/megatron_utils/hf_export.py
++++ b/miles/backends/megatron_utils/hf_export.py
+@@ -54,7 +54,7 @@ def save_hf_model(
+                 hf_checkpoint=args.hf_checkpoint,
+             )
+         else:
+-            bridge = _get_hf_bridge(args.hf_checkpoint)
++            bridge = _get_hf_bridge(args.megatron_hf_checkpoint)
+             with patch_megatron_model(model):
+                 bridge.save_hf_pretrained(model, path=checkpoint_dir)
+             torch.distributed.barrier(group=get_gloo_group())
+diff --git a/miles/backends/megatron_utils/lora/bridge.py b/miles/backends/megatron_utils/lora/bridge.py
+index 370a4596d..87b684a2a 100644
+--- a/miles/backends/megatron_utils/lora/bridge.py
++++ b/miles/backends/megatron_utils/lora/bridge.py
+@@ -141,7 +141,7 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
+     from megatron.bridge.utils.fusions import validate_rope_fusion_compatibility
+ 
+     hf_config = load_hf_config(args.hf_checkpoint)
+-    bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
++    bridge = AutoBridge.from_hf_pretrained(args.megatron_hf_checkpoint, trust_remote_code=True)
+     provider = bridge.to_megatron_provider(load_weights=False)
+ 
+     provider.tensor_model_parallel_size = args.tensor_model_parallel_size
+diff --git a/miles/backends/megatron_utils/megatron_config.py b/miles/backends/megatron_utils/megatron_config.py
+index dc3cec8b1..e05dc2460 100644
+--- a/miles/backends/megatron_utils/megatron_config.py
++++ b/miles/backends/megatron_utils/megatron_config.py
+@@ -370,7 +370,7 @@ def resolve_args_checkpoint_load(args: Namespace) -> None:
+         # weights (loaded via the HF bridge) instead of asserting in load_checkpoint.
+         # Mirrors the non-bridge branch below.
+         if not _has_megatron_checkpoint(args.load):
+-            args.load = args.ref_load or args.hf_checkpoint
++            args.load = args.ref_load or args.megatron_hf_checkpoint
+             args.start_rollout_id = 0
+     else:
+         if not _has_megatron_checkpoint(args.load):
+diff --git a/miles/backends/megatron_utils/model_provider.py b/miles/backends/megatron_utils/model_provider.py
+index bde4c8cbf..40117ab2f 100644
+--- a/miles/backends/megatron_utils/model_provider.py
++++ b/miles/backends/megatron_utils/model_provider.py
+@@ -170,7 +170,7 @@ def get_model_provider_func(
+     if args.megatron_to_hf_mode == "bridge":
+         from megatron.bridge import AutoBridge
+ 
+-        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
++        bridge = AutoBridge.from_hf_pretrained(args.megatron_hf_checkpoint, trust_remote_code=True)
+         provider = bridge.to_megatron_provider(load_weights=False)
+         _apply_bridge_runtime_config(provider, args)
+         if role == "critic":
+diff --git a/miles/backends/megatron_utils/update_weight/hf_weight_iterator_bridge.py b/miles/backends/megatron_utils/update_weight/hf_weight_iterator_bridge.py
+index 5c478b45b..416d03868 100644
+--- a/miles/backends/megatron_utils/update_weight/hf_weight_iterator_bridge.py
++++ b/miles/backends/megatron_utils/update_weight/hf_weight_iterator_bridge.py
+@@ -20,7 +20,7 @@ class HfWeightIteratorBridge(MegatronHfWeightIteratorBase):
+ 
+         from megatron.bridge import AutoBridge
+ 
+-        self._bridge = AutoBridge.from_hf_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
++        self._bridge = AutoBridge.from_hf_pretrained(self.args.megatron_hf_checkpoint, trust_remote_code=True)
+ 
+     def _iter_hf_param_units(self, weights, *, materialize):
+         renamed_megatron_local_weights = {strip_param_name_prefix(k): v for k, v in weights.items()}
+diff --git a/miles/utils/arguments.py b/miles/utils/arguments.py
+index c9b78fdc0..fc50ef3f8 100644
+--- a/miles/utils/arguments.py
++++ b/miles/utils/arguments.py
+@@ -626,6 +626,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
+                     "It doesn't necessary need to contain the most up-to-date parameters."
+                 ),
+             )
++            parser.add_argument(
++                "--megatron-hf-checkpoint",
++                type=str,
++                default=None,
++                help=(
++                    "The HF checkpoint the Megatron side (bridge model build, HF weight load, weight export to "
++                    "sglang, save_hf) reads, when it differs from --hf-checkpoint (which sglang loads). E.g. a "
++                    "text-only Qwen3_5ForCausalLM for training while sglang serves Qwen3_5ForConditionalGeneration "
++                    "with language_model_only. Defaults to --hf-checkpoint."
++                ),
++            )
+             parser.add_argument(
+                 "--model-name",
+                 type=str,
+@@ -3541,6 +3552,8 @@ def miles_validate_args(args):
+             "stay alive; it cannot be combined with --load-debug-rollout-data (debug_train_only)."
+         )
+ 
++    if getattr(args, "megatron_hf_checkpoint", None) is None:
++        args.megatron_hf_checkpoint = args.hf_checkpoint
+     args.use_critic = args.advantage_estimator == "ppo"
+     if args.use_critic:
+         assert not args.indep_dp, (
+@@ -3562,7 +3575,7 @@ def miles_validate_args(args):
+     elif args.megatron_to_hf_mode == "bridge" and not _has_megatron_checkpoint(args.critic_load):
+         # a fresh run's own critic dir (--critic-load = --critic-save, so the same command resumes): start from the
+         # HF weights through the bridge, as resolve_args_checkpoint_load does for the actor's --load
+-        args.critic_load = args.ref_load or args.hf_checkpoint
++        args.critic_load = args.ref_load or args.megatron_hf_checkpoint
+     if args.critic_lr is None:
+         args.critic_lr = args.lr
+     if args.critic_global_batch_size is not None:
+-- 
+2.52.0
+

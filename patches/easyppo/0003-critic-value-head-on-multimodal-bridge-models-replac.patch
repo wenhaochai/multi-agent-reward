@@ -1,7 +1,7 @@
 From 2a18ed587a496992203ec830533d23f732880a63 Mon Sep 17 00:00:00 2001
 From: Wenhao Chai <reselfchai@gmail.com>
 Date: Thu, 1 Oct 2026 20:18:43 -0400
-Subject: [PATCH 3/3] critic value head on multimodal bridge models: replace
+Subject: [PATCH 3/4] critic value head on multimodal bridge models: replace
  and hide language_model.output_layer
 
 Qwen3.5 comes out of the bridge as Qwen3_5ForConditionalGeneration; its LM head is

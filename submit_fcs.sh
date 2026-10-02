@@ -26,6 +26,10 @@ W=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace
 D=$B/data
 MILES_SRC=/scratch/gpfs/GROUP/USER/project/miles-easyppo
 MODEL=${MODEL:-$W/models/Qwen3.5-9B}
+# text-only: no vision tower anywhere (tools/make_qwen35_text_ckpts.py MODEL builds both). Megatron trains
+# MODEL-text (Qwen3_5ForCausalLM -> GPTModel); sglang serves MODEL-lm (language_model_only, no vision weights).
+MG=$MODEL-text; SG=$MODEL-lm
+for d in $MG $SG; do [ -f $d/config.json ] || { echo "missing $d: run tools/make_qwen35_text_ckpts.py $MODEL" >&2; exit 1; }; done
 SEED=${SEED:-42}
 if [ -n "${SMOKE:-}" ]; then
   R=fcs_easyppo_smoke; NR=${NUM_ROLLOUT:-3}; RB=4; NS=8; GBS=32; CGBS=8; LEN=4096; CO=1; WU=1; EV=${EVAL_EVERY:-$NR}; EN=1
@@ -38,8 +42,8 @@ else
          --wandb-group easyppo --disable-wandb-random-suffix)
 fi
 CK=$B/runs/$R/ckpt
-args=(--hf-checkpoint $MODEL --megatron-to-hf-mode bridge
-  --ref-load $MODEL --load $CK --save $CK --critic-load ${CK}_critic --critic-save ${CK}_critic --save-interval $EV
+args=(--hf-checkpoint $SG --megatron-hf-checkpoint $MG --megatron-to-hf-mode bridge
+  --ref-load $MG --load $CK --save $CK --critic-load ${CK}_critic --critic-save ${CK}_critic --save-interval $EV
   --prompt-data $D/fcs_train200.jsonl --input-key prompt --label-key label --apply-chat-template --rollout-shuffle
   --custom-rm-path miles_team.fcs_rm.fcs_rm
   --num-rollout $NR --rollout-batch-size $RB --n-samples-per-prompt $NS --global-batch-size $GBS
