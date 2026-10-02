@@ -1,0 +1,59 @@
+From 2a18ed587a496992203ec830533d23f732880a63 Mon Sep 17 00:00:00 2001
+From: Wenhao Chai <reselfchai@gmail.com>
+Date: Thu, 1 Oct 2026 20:18:43 -0400
+Subject: [PATCH 3/3] critic value head on multimodal bridge models: replace
+ and hide language_model.output_layer
+
+Qwen3.5 comes out of the bridge as Qwen3_5ForConditionalGeneration; its LM head is
+model.language_model.output_layer, so the critic kept the vocab head (EasyPPO smoke
+14850574: get_values got [4096, 124160]). The HF-load hide helper now finds value heads at
+any depth.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01YBcVrDE1HspU5PgJLmxVZp
+---
+ miles/backends/megatron_utils/checkpoint.py     | 6 ++++--
+ miles/backends/megatron_utils/model_provider.py | 8 ++++++--
+ 2 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/miles/backends/megatron_utils/checkpoint.py b/miles/backends/megatron_utils/checkpoint.py
+index fcb646f19..caf7c157b 100644
+--- a/miles/backends/megatron_utils/checkpoint.py
++++ b/miles/backends/megatron_utils/checkpoint.py
+@@ -193,10 +193,12 @@ def _is_megatron_checkpoint(path: str | Path) -> bool:
+ 
+ @contextmanager
+ def _hide_critic_value_head_from_hf_load(ddp_model):
++    # the head may sit below the chunk (a multimodal wrapper's .language_model.output_layer)
+     value_heads = [
+-        (chunk, name, head)
++        (owner, name, head)
+         for chunk in unwrap_model(ddp_model)
+-        for name, head in chunk.named_children()
++        for owner in chunk.modules()
++        for name, head in owner.named_children()
+         if isinstance(head, LinearForLastLayer)
+     ]
+     for chunk, name, _ in value_heads:
+diff --git a/miles/backends/megatron_utils/model_provider.py b/miles/backends/megatron_utils/model_provider.py
+index 1ee603cdb..bde4c8cbf 100644
+--- a/miles/backends/megatron_utils/model_provider.py
++++ b/miles/backends/megatron_utils/model_provider.py
+@@ -192,8 +192,12 @@ def get_model_provider_func(
+                 provider._pg_collection = pg_collection
+             model = provider.provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+             if post_process and role == "critic":
+-                model.output_layer = LinearForLastLayer(
+-                    input_size=model.config.hidden_size, output_size=1, config=model.config
++                # multimodal wrappers (e.g. Qwen3_5ForConditionalGeneration) keep the LM head on .language_model;
++                # replacing the wrapper's attribute leaves the vocab head in place (smoke 14850574: values [T, 124160])
++                owner = getattr(model, "language_model", None) or model
++                assert hasattr(owner, "output_layer"), f"no output_layer on {type(owner).__name__}"
++                owner.output_layer = LinearForLastLayer(
++                    input_size=owner.config.hidden_size, output_size=1, config=owner.config
+                 )
+             assert not getattr(args, "enable_witness", False), "Witness is not supported yet in this mode"
+             # Gemma-4 forward returns (logits, loss_mask); keep logits only.
+-- 
+2.52.0
+
