@@ -1,5 +1,5 @@
 """Difficulty probe of a model on the Frontier-CS study data: sample with SGLang (EasyPPO's eval settings: T 1.0,
-top-p 1.0, 32768 new tokens, default chat template), score each response with miles_team.fcs_judge, write every record
+top-p 1.0, 32768 new tokens, default chat template; THINKING=0 turns thinking off), score each response with miles_team.fcs_judge, write every record
 incrementally (gen.jsonl, scores.jsonl; a rerun skips what is done) and a summary.
 usage: python fcs_probe.py MODEL OUTDIR SPEC... where SPEC = name:path.jsonl:n_samples"""
 import json, os, sys, time
@@ -57,7 +57,8 @@ def main():
         with open(gen_f, 'a') as gf:
             for c in range(0, len(rest), CHUNK):
                 part, t0 = rest[c:c + CHUNK], time.time()
-                texts = [tok.apply_chat_template(t['prompt'], tokenize=False, add_generation_prompt=True) for t in part]
+                texts = [tok.apply_chat_template(t['prompt'], tokenize=False, add_generation_prompt=True,
+                                                 enable_thinking=os.environ.get('THINKING', '1') == '1') for t in part]
                 res = eng.generate(prompt=texts, sampling_params=sp)
                 ntok = 0
                 for t, r in zip(part, res):
