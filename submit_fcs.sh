@@ -46,6 +46,7 @@ fi
 CK=$B/runs/$R/ckpt
 args=(--hf-checkpoint $SG --megatron-hf-checkpoint $MG --megatron-to-hf-mode bridge
   --ref-load $MG --load $CK --save $CK --critic-load ${CK}_critic --critic-save ${CK}_critic --save-interval $EV
+  --custom-megatron-post-save-hook-path miles_team.ckpt_rotate.keep_latest
   --prompt-data $D/fcs_train200.jsonl --input-key prompt --label-key label --apply-chat-template --rollout-shuffle
   --custom-rm-path miles_team.fcs_rm.fcs_rm
   --num-rollout $NR --rollout-batch-size $RB --n-samples-per-prompt $NS --global-batch-size $GBS
