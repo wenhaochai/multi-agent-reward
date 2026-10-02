@@ -27,8 +27,9 @@ nvidia-smi --query-gpu=index,name,memory.used --format=csv,noheader
 python3 -c "import torch, sglang; print('torch', torch.__version__, 'sglang', sglang.__version__)"
 
 # job-private Ray: a 10-port block below the ephemeral range, keyed by the job id
-P=$((20000 + (SLURM_JOB_ID % 1270) * 10))
-RAY_TMP=/tmp/ray_$SLURM_JOB_ID
+# QTASK (queue worker: several tasks in one job, one after another) gives each task its own port block and Ray dir
+P=$((20000 + ((SLURM_JOB_ID + 97 * ${QTASK:-0}) % 1270) * 10))
+RAY_TMP=/tmp/ray_$SLURM_JOB_ID${QTASK:+_q$QTASK}
 ray start --head --node-ip-address 127.0.0.1 --num-gpus "${GPUS:-8}" --port=$P --dashboard-port=$((P + 1)) \
   --dashboard-agent-listen-port=$((P + 2)) --dashboard-agent-grpc-port=$((P + 3)) --metrics-export-port=$((P + 4)) \
   --ray-client-server-port=$((P + 5)) --runtime-env-agent-port=$((P + 6)) --node-manager-port=$((P + 7)) \

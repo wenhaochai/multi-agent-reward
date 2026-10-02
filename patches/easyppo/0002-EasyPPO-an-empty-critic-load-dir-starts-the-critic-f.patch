@@ -1,7 +1,7 @@
 From faa92a1962f9fc6e81cc1dbec07610edf2c62b23 Mon Sep 17 00:00:00 2001
 From: Wenhao Chai <reselfchai@gmail.com>
 Date: Thu, 1 Oct 2026 19:56:38 -0400
-Subject: [PATCH 2/4] EasyPPO: an empty --critic-load dir starts the critic
+Subject: [PATCH 2/5] EasyPPO: an empty --critic-load dir starts the critic
  from the HF weights (bridge)
 
 Mirrors resolve_args_checkpoint_load for the actor's --load, so --critic-load = --critic-save

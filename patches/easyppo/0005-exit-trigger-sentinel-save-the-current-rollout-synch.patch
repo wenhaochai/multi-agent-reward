@@ -1,0 +1,67 @@
+From f09a5be85d1c3571a7bcc65dcf5ccc99aa9340be Mon Sep 17 00:00:00 2001
+From: Wenhao Chai <reselfchai@gmail.com>
+Date: Fri, 2 Oct 2026 13:33:25 -0400
+Subject: [PATCH 5/5] --exit-trigger-sentinel: save the current rollout
+ synchronously and leave the train loop
+
+A queue worker nearing its wall time asks a resumable run to stop cleanly instead of being killed
+mid-rollout (losing everything since the last periodic save).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01YBcVrDE1HspU5PgJLmxVZp
+---
+ miles/utils/arguments.py | 10 ++++++++++
+ train.py                 | 12 ++++++++++--
+ 2 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/miles/utils/arguments.py b/miles/utils/arguments.py
+index fc50ef3f8..0c430dfaa 100644
+--- a/miles/utils/arguments.py
++++ b/miles/utils/arguments.py
+@@ -1553,6 +1553,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
+                     "exists at an iteration's save point, a checkpoint is saved and the file is removed."
+                 ),
+             )
++            parser.add_argument(
++                "--exit-trigger-sentinel",
++                type=str,
++                default=None,
++                help=(
++                    "Path polled after every rollout: when the file exists, save that rollout's checkpoint "
++                    "synchronously, delete the file and exit the train loop (a queue worker asks a resumable run "
++                    "to stop before its allocation ends)."
++                ),
++            )
+             parser.add_argument(
+                 "--custom-megatron-post-save-hook-path",
+                 type=str,
+diff --git a/train.py b/train.py
+index b9446037d..ac29ac5fd 100644
+--- a/train.py
++++ b/train.py
+@@ -130,12 +130,20 @@ async def train(args, *, disposer: Disposer):
+         remove_rollout_data_refs(args, rollout_data_pack)
+ 
+         external_save = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
+-        if external_save or should_run_periodic_action(
++        # exit sentinel (a queue worker nearing its wall time): save this rollout synchronously, then stop cleanly
++        external_exit = getattr(args, "exit_trigger_sentinel", None) is not None and os.path.exists(
++            args.exit_trigger_sentinel
++        )
++        if external_save or external_exit or should_run_periodic_action(
+             rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
+         ):
+-            await save(rollout_id, force_sync=external_save)
++            await save(rollout_id, force_sync=external_save or external_exit)
+             if external_save:
+                 os.remove(args.save_trigger_sentinel)
++        if external_exit:
++            logger.info("exit sentinel %s found: saved rollout %d, exiting", args.exit_trigger_sentinel, rollout_id)
++            os.remove(args.exit_trigger_sentinel)
++            break
+ 
+         # One predicate for both blocks: the handoff below exists to feed this eval on the last rollout.
+         eval_due = should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch, args.num_rollout)
+-- 
+2.52.0
+
