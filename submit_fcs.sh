@@ -31,12 +31,14 @@ MODEL=${MODEL:-$W/models/Qwen3.5-9B}
 MG=$MODEL-text; SG=$MODEL-lm
 for d in $MG $SG; do [ -f $d/config.json ] || { echo "missing $d: run tools/make_qwen35_text_ckpts.py $MODEL" >&2; exit 1; }; done
 SEED=${SEED:-42}
+# the run name carries the init (--load = --save resumes): a base-model run's checkpoint must never seed an SFT run
+TAG=$(basename $MODEL | tr 'A-Z.' 'a-z_' | sed 's/^qwen3_5-9b/q9b/')
 if [ -n "${SMOKE:-}" ]; then
-  R=fcs_easyppo_smoke; NR=${NUM_ROLLOUT:-3}; RB=4; NS=8; GBS=32; CGBS=8; LEN=4096; CO=1; WU=1; EV=${EVAL_EVERY:-$NR}; EN=1
+  R=fcs_easyppo_smoke_$TAG; NR=${NUM_ROLLOUT:-3}; RB=4; NS=8; GBS=32; CGBS=8; LEN=4096; CO=1; WU=1; EV=${EVAL_EVERY:-$NR}; EN=1
   QOS=${QOS:-pli-cp}; TIME=${TIME:-01:30:00}
   extra=(--skip-eval-before-train)
 else
-  R=fcs_easyppo_qwen35_9b_s$SEED; NR=${NUM_ROLLOUT:-200}; RB=16; NS=32; GBS=512; CGBS=128; LEN=32768; CO=30; WU=20
+  R=fcs_easyppo_${TAG}_s$SEED; NR=${NUM_ROLLOUT:-200}; RB=16; NS=32; GBS=512; CGBS=128; LEN=32768; CO=30; WU=20
   EV=${EVAL_EVERY:-10}; EN=5; QOS=${QOS:-pli-short}; TIME=${TIME:-24:00:00}
   extra=(--use-wandb --wandb-mode offline --wandb-dir $B/runs/$R --wandb-project fcs_easyppo
          --wandb-group easyppo --disable-wandb-random-suffix)
