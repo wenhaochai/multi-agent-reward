@@ -63,13 +63,41 @@ def score(response: str, problem_dir: str) -> float:
         return 0.0
 
 
-async def _one(sample) -> float:
+def _sem():
     global _SEM
     if _SEM is None:
         n = int(os.environ.get("FCS_RM_CONCURRENCY", max(1, (os.cpu_count() or 8) // CASE_WORKERS)))
         _SEM = asyncio.Semaphore(n)
-    async with _SEM:
+    return _SEM
+
+
+async def _one(sample) -> float:
+    async with _sem():
         return await asyncio.to_thread(score, sample.response or "", sample.label)
+
+
+def judge_full(problem_dir: str, code: str) -> dict:
+    """Judge already-extracted code: {"score": [0, 1], "cases": per-case ratios (zeros when nothing ran),
+    "status": ..., "infra_error": bool}. Infrastructure failures are logged and flagged, never a silent 0."""
+    from miles_team.fcs_judge import load_problem
+    from pathlib import Path
+    n = len(load_problem(Path(problem_dir))["cases"])
+    if not code:
+        return {"score": 0.0, "cases": [0.0] * n, "status": "no code", "infra_error": False}
+    try:
+        r = judge(problem_dir, code)
+    except Exception as e:
+        print(f"[fcs_rm] JUDGE-ERROR {problem_dir}: {e}"[:500], file=sys.stderr, flush=True)
+        return {"score": 0.0, "cases": [0.0] * n, "status": "judge error", "infra_error": True}
+    cases = r.get("cases") or [0.0] * n
+    return {"score": r["score"] / 100.0, "cases": [float(c) for c in cases], "status": r["status"],
+            "infra_error": False}
+
+
+async def judge_code(problem_dir: str, code: str) -> dict:
+    """judge_full in a thread under the shared FCS_RM_CONCURRENCY semaphore."""
+    async with _sem():
+        return await asyncio.to_thread(judge_full, problem_dir, code)
 
 
 async def fcs_rm(args, sample, **kwargs):

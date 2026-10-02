@@ -48,8 +48,9 @@ class Aborted(Exception):
 class Session:
     """One agent's chat session, recorded as token segments exactly as molt's chat server records it."""
 
-    def __init__(self, input: GenerateFnInput, name: str, think: bool):
+    def __init__(self, input: GenerateFnInput, name: str, think: bool, max_len: int | None = None):
         self.input, self.args, self.tok = input, input.args, input.state.tokenizer
+        self.max_len = max_len or MAX_LEN  # context cap of this session (default: MA_TM_MAX_LEN)
         self.name, self.think = name, think
         self.kw = {} if think else {"enable_thinking": False}
         self.segments: list[Sample] = []
@@ -82,7 +83,7 @@ class Session:
         else:
             delta_ids = None
             gen_tokens = self.tok.encode(full, add_special_tokens=False)
-        remaining = MAX_LEN - len(gen_tokens)
+        remaining = self.max_len - len(gen_tokens)
         if remaining <= 0:  # the context is full: nothing generated, the session ends truncated
             if extends:
                 seg.status = Sample.Status.TRUNCATED
