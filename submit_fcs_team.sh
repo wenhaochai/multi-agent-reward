@@ -14,9 +14,10 @@
 #   (default 4: 172 x 4). solocm also plays the game at eval (MA_FT_EVAL_MATES=3). The step-0 policy is the same for
 #   every arm, so only ARM=shared and ARM=solocm evaluate before training.
 # Usage: ARM=... [SEED=42] [NUM_ROLLOUT=60] [EVAL_EVERY=20] [N_EVAL=4] [BUDGET=32768] [MODEL=<hf dir>] [SMOKE=1]
-#        [EMIT=<queue dir> [PRIO=n]] [QOS] [TIME] [DEP] [NICE] [DRY=1] bash submit_fcs_team.sh
+#        [QOS] [TIME] [DEP] [NICE] [DRY=1] bash submit_fcs_team.sh
 #   SMOKE=1: 3 rollouts of 2 prompts x 2 episodes, 4096-token turns, 16-problem val sets at the end, pli-cp.
-#   EMIT: queue a resumable worker2 task (labs-molt _workspace/queue/worker2.py) instead of sbatch.
+#   Plain sbatch only (user 2026-10-02: no queue workers); runs longer than TIME chain with DEP (afterany), each
+#   segment resuming from --load = --save.
 set -euo pipefail
 B=/scratch/gpfs/GROUP/USER/project/miles-q38-build
 W=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace
@@ -94,23 +95,6 @@ sb=(); [ -n "${NICE:-}" ] && sb=(--nice="$NICE")
 echo "$R: arm=$ARM ${ft[*]} rb=$RB ns=$NS gbs=$GBS miles=$(git -C $MILES_SRC rev-parse --short HEAD) repo=$(git -C $B rev-parse --short HEAD)"
 [ -n "${DRY:-}" ] && { echo "  ${args[*]}"; exit 0; }
 mkdir -p $B/runs/$R
-if [ -n "${EMIT:-}" ]; then   # EMIT=<queue dir>: a resumable task of the queue worker (labs-molt _workspace/queue/worker2.py)
-  S=$B/runs/$R/EXIT_NOW
-  python3 - "$EMIT" "$R" "$S" "${PRIO:-50}" "${envs[@]}" -- "${args[@]}" --exit-trigger-sentinel "$S" <<'PY'
-import json, os, sys, time
-q, name, sentinel, prio = sys.argv[1:5]
-rest = sys.argv[5:]; k = rest.index('--')
-t = {'name': name, 'launcher': 'miles', 'env': dict(kv.split('=', 1) for kv in rest[:k]), 'args': rest[k + 1:],
-     'resumable': True, 'exit_sentinel': sentinel, 'est_min': 0, 'prio': int(prio),
-     'created': time.strftime('%FT%TZ', time.gmtime())}
-for d in ('pending', 'running', 'done', 'failed'):
-    os.makedirs(f'{q}/{d}', exist_ok=True)
-path = f'{q}/pending/{time.strftime("%Y%m%d%H%M%S")}_{name}.json'
-json.dump(t, open(path + '.new', 'w'), indent=1); os.replace(path + '.new', path)
-print(f'  queued: {path}')
-PY
-  exit 0
-fi
 unset $(compgen -e | grep '^MA_' || true)   # only this arm's MA_* reach the job
 jid=$(env "${envs[@]}" sbatch --parsable --partition=pli-c --account=group --qos=$QOS --time=$TIME "${sb[@]}" \
   --gres=gpu:8 --cpus-per-task=64 --mem=640G --job-name="miles-$R" $B/sbatch_miles.sh "${args[@]}")
