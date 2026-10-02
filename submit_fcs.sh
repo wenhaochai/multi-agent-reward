@@ -14,7 +14,6 @@
 #     step; truncated responses masked from the actor only.
 #   miles units: --lr-warmup-iters counts optimizer steps of the trainer's own global batch, so the actor (one step per
 #     rollout) takes 20 and the critic (four steps per rollout) 80; both warm up over 20 rollouts as in EasyPPO.
-# EMIT=<queue dir> [PRIO=n]: queue the run as a resumable worker task instead of sbatch (QOS/TIME/DEP/NICE unused).
 # Usage: [SMOKE=1] [SEED=42] [NUM_ROLLOUT] [EVAL_EVERY] [QOS] [TIME] [NICE] [DEP=<jid>] [MODEL=<hf dir>] [DRY=1] bash submit_fcs.sh
 #   SMOKE=1: 3 rollouts of 4 prompts x 8 samples (rollout 0 critic-only), 1-rollout lr warmup (Megatron asserts
 #     warmup < total steps; smoke 14850360 died on 20 > 3), 4096-token answers, then a val eval
@@ -78,23 +77,6 @@ sb=(); [ -n "${NICE:-}" ] && sb=(--nice="$NICE")
 echo "$R: miles=$(git -C $MILES_SRC rev-parse --short HEAD) repo=$(git -C $B rev-parse --short HEAD) qos=$QOS time=$TIME"
 [ -n "${DRY:-}" ] && { echo "  ${args[*]}"; exit 0; }
 mkdir -p $B/runs/$R
-if [ -n "${EMIT:-}" ]; then   # EMIT=<queue dir>: a resumable task of the queue worker (labs-molt _workspace/queue/worker2.py)
-  S=$B/runs/$R/EXIT_NOW
-  python3 - "$EMIT" "$R" "$S" "${PRIO:-50}" FCS_RM_CONCURRENCY=8 FCS_CASE_WORKERS=8 MILES_SRC=$MILES_SRC RUN_NAME=$R \
-    GPUS=8 MILES_MODEL_TYPE=qwen3.5-9B -- "${args[@]}" --exit-trigger-sentinel "$S" <<'PY'
-import json, os, sys, time
-q, name, sentinel, prio = sys.argv[1:5]
-rest = sys.argv[5:]; k = rest.index('--')
-t = {'name': name, 'launcher': 'miles', 'env': dict(kv.split('=', 1) for kv in rest[:k]), 'args': rest[k + 1:],
-     'resumable': True, 'exit_sentinel': sentinel, 'est_min': 0, 'prio': int(prio),
-     'created': time.strftime('%FT%TZ', time.gmtime())}
-os.makedirs(f'{q}/pending', exist_ok=True)
-path = f'{q}/pending/{time.strftime("%Y%m%d%H%M%S")}_{name}.json'
-json.dump(t, open(path + '.new', 'w'), indent=1); os.replace(path + '.new', path)
-print(f'  queued: {path}')
-PY
-  exit 0
-fi
 jid=$(env FCS_RM_CONCURRENCY=8 FCS_CASE_WORKERS=8 MILES_SRC=$MILES_SRC RUN_NAME=$R GPUS=8 MILES_MODEL_TYPE=qwen3.5-9B \
   sbatch --parsable --partition=pli-c --account=group --qos=$QOS --time=$TIME "${sb[@]}" --gres=gpu:8 \
   --cpus-per-task=64 --mem=640G --job-name="miles-$R" $B/sbatch_miles.sh "${args[@]}")
