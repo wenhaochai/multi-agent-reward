@@ -81,6 +81,8 @@ args=(--hf-checkpoint $SG --megatron-hf-checkpoint $MG --megatron-to-hf-mode bri
   --critic-variance-weighted-loss --critic-variance-weight-beta 0.5 --critic-variance-weight-min 0.25
   --actor-only-overlong-filter --value-clip 0.2 --value-loss-scale 0.5
   --optimizer adam --lr 1e-6 --critic-lr 2e-6 --lr-decay-style constant --lr-warmup-iters $WU
+  # one actor step per rollout; miles' default train_iters counts RB*NS samples, not the 1+K per episode (0 in the smoke)
+  --lr-decay-iters $NR
   --critic-lr-warmup-iters $((WU * GBS / CGBS)) --weight-decay 0.01 --adam-beta1 0.9 --adam-beta2 0.999 --clip-grad 1.0
   # parallelism: 8x H100, colocated Megatron TP2 x DP4 (actor and critic in turn) + 8 SGLang engines
   --tensor-model-parallel-size 2 --sequence-parallel --pipeline-model-parallel-size 1 --context-parallel-size 1
