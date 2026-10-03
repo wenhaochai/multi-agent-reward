@@ -179,4 +179,75 @@ print("[ok] solo reduction")
 m = F._ft_means(play(MATES3, (cpp("int main(){D;}"), "stop")))
 assert close(m["ft_lead_score"], 1.0) and not math.isnan(m.get("ft_mate_corr", 0.0))
 print("[ok] metrics", {k: round(v, 3) for k, v in m.items()})
+
+# 9) mixed team sizes (K_SET 0,1,3): K from sample.index, always 1 + MATES samples, groups split by K, fc_* metadata
+import miles_team.fcs_cost as FC  # noqa: E402
+
+F.K_SET = [0, 1, 3]
+eps = []
+for idx, mates, lead in [(12, [MATES3[2]], ("unused", "stop")),            # 12 % 3 = 0 -> K = 0
+                         (13, MATES3[:1], (cpp("int main(){D;}"), "stop")),  # K = 1
+                         (14, MATES3, (cpp("int main(){D;}"), "stop"))]:     # K = 3
+    MATE_REPLIES[:] = list(mates)
+    LEAD_REPLY[0] = lead
+    sample = Sample(index=idx, group_index=5, prompt="(templated)", label="/nonexistent/problem",
+                    metadata={"messages": PROBLEM, "pid": "t"})
+    inp = GenerateFnInput(state=SimpleNamespace(args=args, tokenizer=tok), sample=sample,
+                          sampling_params={"temperature": 1.0, "top_p": 1.0, "max_new_tokens": 4096}, evaluation=False)
+    eps.append(asyncio.run(F.generate(inp)).samples)
+k0, k1, k3 = eps
+assert [len(e) for e in eps] == [4, 4, 4]
+assert [o.metadata["ft_role"] for o in k0] == ["lead", "pad", "pad", "pad"]
+assert [o.metadata["ft_role"] for o in k1] == ["lead", "mate1", "pad", "pad"]
+assert [o.group_index for o in k0] == [40, 47, 47, 47] and [o.group_index for o in k1] == [41, 44, 47, 47]
+assert [o.group_index for o in k3] == [42, 45, 45, 45], [o.group_index for o in k3]
+assert all(o.remove_sample and not any(o.loss_mask) and o.metadata.get("fc_pad") for e in eps for o in e
+           if o.metadata["ft_role"] == "pad")
+assert k0[0].metadata["ft_solo"] == 1.0 and close(k0[0].reward, sC) and k0[0].metadata["fc_k"] == 0
+assert all(not any(key.startswith("fc_") and key != "fc_pad" for key in o.metadata) for o in k0[1:])
+assert k3[0].metadata["fc_lead"] and not k3[1].metadata["fc_lead"] and k3[1].metadata["fc_cost"] == k3[0].metadata["ft_tokens"]
+flat = [o for e in eps for o in e]
+assert sorted(FC.episodes(flat)) == sorted([(0, sC, float(k0[0].metadata["ft_tokens"])),
+                                            (1, 1.0, float(k1[0].metadata["ft_tokens"])),
+                                            (3, 1.0, float(k3[0].metadata["ft_tokens"]))])
+F.K_SET = []
+print("[ok] mixed K: 4 samples each, groups", [[o.group_index for o in e] for e in eps])
+
+# 10) lambda replay: pi_0 from critic-only rollouts; alpha = 1 raises lambda when the cost rises, lowers it when it falls
+obs = {0: {3: [1.0, 1000.0, 10]}, 1: {3: [1.0, 1000.0, 10]},     # pi_0: s0 = 0.1, c0 = 100
+       2: {3: [1.0, 2000.0, 10]}}                                # cost doubles
+r = FC.replay(obs, 1, critic_only=2, alpha=1.0, eta=0.5, lam0=0.02, ema=0.0)
+assert r["lam"][3] == 0.02 and close(r["s0"][3], 0.1) and close(r["c0"][3], 100.0) and not r["uv"]
+r = FC.replay(obs, 2, critic_only=2, alpha=1.0, eta=0.5, lam0=0.02, ema=0.0)
+assert close(r["uv"][3][1], -1.0) and close(r["lam"][3], 0.02 * math.exp(0.5)), r
+r = FC.replay({**obs, 2: {3: [1.0, 500.0, 10]}}, 2, critic_only=2, alpha=1.0, eta=0.5, lam0=0.02, ema=0.0)
+assert close(r["lam"][3], 0.02 * math.exp(-0.25))
+# alpha = 0.5: a score gain of +50% with the cost unchanged raises lambda by exp(0.5 * 0.5 * 0.5)
+r = FC.replay({**obs, 2: {3: [1.5, 1000.0, 10]}}, 2, critic_only=2, alpha=0.5, eta=0.5, lam0=0.02, ema=0.0)
+assert close(r["lam"][3], 0.02 * math.exp(0.125)), r
+r = FC.replay({0: {3: [1.0, 1000.0, 10]}, 1: {3: [1.0, 1e6, 10]}}, 1, critic_only=1, alpha=1.0, eta=50, lam0=0.02,
+              ema=0.0)
+assert r["lam"][3] == FC.LAM_MAX
+print("[ok] lambda replay")
+
+# 11) observe + post_process: cost term on real samples only; a resumed rollout overwrites its stale sums
+FC._obs.clear()
+FC.STATE = ""
+a = Args(num_critic_only_steps=1, reward_key=None)
+FC.observe(0, a, flat)
+FC.observe(5, a, flat)
+FC.observe(1, a, flat)  # resumed at rollout 1: rollout 5's sums are dropped
+assert sorted(FC._obs) == [0, 1]
+FC.ON = True
+raw, rew = FC.post_process(a, flat)
+for o, x in zip(flat, rew):
+    if o.metadata.get("fc_pad"):
+        assert x == o.reward
+    else:
+        k = o.metadata["fc_k"]
+        assert close(x, o.reward - FC._cur["lam"][k] * o.metadata["fc_cost"] / FC._cur["c0"][k]), (x, o.reward)
+assert raw == rew
+FC.ON = False
+assert FC.post_process(a, flat)[0] == [o.reward for o in flat]
+print("[ok] observe / post_process")
 print("ALL OK")

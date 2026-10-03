@@ -5,6 +5,8 @@
 #
 # ARM: shared | indiv | mix | unique | adopt | synth  (MA_FT_REWARD; ALPHA for mix/synth, default 0.5; BETA for unique,
 #      default 0) | solocm (single agent through the same code path, MA_FT_MATES=0)
+#      | mixk (team size K in {0,1,3} per episode, shared reward, no cost term: the control for cost)
+#      | cost (mixk + the cost-steered reward of miles_team/fcs_cost.py, alpha = ALPHA: 1 -> cost100, 0.5 -> cost50)
 # Batch: team = 16 prompts x 8 episodes x 4 agents = 512 samples per step; solocm = 16 x 32 x 1 = 512 samples. Every
 #   agent turn may generate up to BUDGET (32768) tokens, so both take at most 512 x 32768 generated tokens per step
 #   and as many samples: solocm is the solo EasyPPO run's shape (16 x 32, 32k) - the compute-matched baseline.
@@ -28,13 +30,16 @@ MG=$MODEL-text; SG=$MODEL-lm
 for d in $MG $SG; do [ -f $d/config.json ] || { echo "missing $d: run tools/make_qwen35_text_ckpts.py $MODEL" >&2; exit 1; }; done
 for f in fcs_train200_team fcs_val172_team fcs_val172_solo fcs_val16_team fcs_val16_solo; do
   [ -f $D/$f.jsonl ] || { echo "missing data/$f.jsonl: python3 tools/make_fcs_team_data.py" >&2; exit 1; }; done
-: "${ARM:?ARM=shared|indiv|mix|unique|adopt|synth|solocm}"
+: "${ARM:?ARM=shared|indiv|mix|unique|adopt|synth|solocm|mixk|cost}"
 SEED=${SEED:-42}; ALPHA=${ALPHA:-0.5}; BETA=${BETA:-0}
 TAG=$(basename $MODEL | tr 'A-Z.' 'a-z_' | sed 's/^qwen3_5-9b/q9b/')
 case $ARM in
   shared|indiv|adopt) ft=(MA_FT_MATES=3 MA_FT_REWARD=$ARM); AN=$ARM ;;
   mix|synth) ft=(MA_FT_MATES=3 MA_FT_REWARD=$ARM MA_FT_ALPHA=$ALPHA); AN=$ARM$(python3 -c "print(round($ALPHA*100))") ;;
   unique) ft=(MA_FT_MATES=3 MA_FT_REWARD=unique MA_FT_BETA=$BETA); AN=unique$(python3 -c "print(round($BETA*100))") ;;
+  mixk) ft=(MA_FT_MATES=3 MA_FT_K_SET=0,1,3 MA_FT_REWARD=shared MA_FC_ON=0); AN=mixk ;;
+  cost) ft=(MA_FT_MATES=3 MA_FT_K_SET=0,1,3 MA_FT_REWARD=shared MA_FC_ON=1 MA_FC_ALPHA=$ALPHA)
+    AN=cost$(python3 -c "print(round($ALPHA*100))") ;;
   solocm) ft=(MA_FT_MATES=0 MA_FT_EVAL_MATES=3 MA_FT_REWARD=shared); AN=solocm ;;
   *) echo "unknown ARM $ARM" >&2; exit 1 ;;
 esac
@@ -95,6 +100,9 @@ args=(--hf-checkpoint $SG --megatron-hf-checkpoint $MG --megatron-to-hf-mode bri
   # --seed sets Megatron and the SGLang engines (engine i gets SEED + i, so replicate seeds sit >= 8 apart); the prompt
   # order comes from --rollout-seed (miles default 42), so a replicate changes it too
   --rollout-seed $SEED)
+case $ARM in mixk|cost)
+  envs+=(MA_FC_STATE=$B/runs/$R/fc_state.json); args+=(--custom-reward-post-process-path miles_team.fcs_cost.post_process) ;;
+esac
 sb=(); [ -n "${NICE:-}" ] && sb=(--nice="$NICE")
 [ -n "${DEP:-}" ] && sb+=(--dependency=afterany:"$DEP")
 echo "$R: arm=$ARM ${ft[*]} rb=$RB ns=$NS gbs=$GBS miles=$(git -C $MILES_SRC rev-parse --short HEAD) repo=$(git -C $B rev-parse --short HEAD)"
