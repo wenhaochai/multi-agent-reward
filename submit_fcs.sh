@@ -64,8 +64,10 @@ args=(--hf-checkpoint $SG --megatron-hf-checkpoint $MG --megatron-to-hf-mode bri
   --actor-only-overlong-filter --value-clip 0.2 --value-loss-scale 0.5
   --optimizer adam --lr 1e-6 --critic-lr 2e-6 --lr-decay-style constant --lr-warmup-iters $WU
   --critic-lr-warmup-iters $((WU * GBS / CGBS)) --weight-decay 0.01 --adam-beta1 0.9 --adam-beta2 0.999 --clip-grad 1.0
-  # parallelism: 8x H100, colocated Megatron TP2 x DP4 (actor and critic in turn) + 8 SGLang engines
-  --tensor-model-parallel-size 2 --sequence-parallel --pipeline-model-parallel-size 1 --context-parallel-size 1
+  # parallelism: 8x H100, colocated Megatron TP4 x DP2 (actor and critic in turn) + 8 SGLang engines. TP2 OOMed at the
+  # first actor step (s42 14869367: the 40960-token micro-batch's vocab-parallel logits, 9.44 GiB per rank, with 5.2 GiB
+  # free); TP4 halves the logits and the per-rank weights, grads and optimizer shards
+  --tensor-model-parallel-size 4 --sequence-parallel --pipeline-model-parallel-size 1 --context-parallel-size 1
   --use-distributed-optimizer --balance-data
   --recompute-granularity full --recompute-method uniform --recompute-num-layers 1 --qkv-format bshd
   --micro-batch-size 1 --max-tokens-per-gpu $((LEN + 8192))

@@ -41,4 +41,9 @@ cd "$MILES"
 MODEL_ARGS=$(python3 -c "from miles.utils.external_utils.model_args_utils import shell_safe_model_args; print(shell_safe_model_args('$MILES_MODEL_TYPE'))")
 echo "[miles-run] model args: $MODEL_ARGS"
 echo "[miles-run] train args: $*"
-eval "python3 train.py $MODEL_ARGS \"\$@\""
+# per-run overrides for jobs already queued (their args are fixed at submit; this script is read at job start):
+# runs/<run>/extra_args, whitespace-separated flags, '#' lines ignored, appended last (argparse: the last flag wins)
+EXTRA=()
+[ -f "$RUN_DIR/extra_args" ] && read -r -a EXTRA <<< "$(grep -v '^#' "$RUN_DIR/extra_args" | tr '\n' ' ')"
+echo "[miles-run] extra args: ${EXTRA[*]:-none}"
+eval "python3 train.py $MODEL_ARGS \"\$@\" \"\${EXTRA[@]}\""
