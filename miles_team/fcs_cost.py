@@ -12,9 +12,9 @@ alpha = 1 raises the score with the cost held at pi_0's level; alpha = 0 cuts th
 Hooks (both run in miles' RolloutExecutor, in this order, once per training rollout):
   observe(rollout_id, args, samples)  from fcs_team.log_rollout: stores this rollout's per-K sums and returns the
                                       fc/* metrics.
-  post_process(args, samples)         --custom-reward-post-process-path: returns (rewards, rewards) with the cost
-                                      term (MA_FC_ON=1) or the arm's rewards unchanged (MA_FC_ON=0: the mixed-K
-                                      control, which still logs fc/*).
+  apply_cost(samples, rewards)        from fcs_team.post_process (--custom-reward-post-process-path), after the arm's
+                                      relabel: the cost term (MA_FC_ON=1) or the rewards unchanged (MA_FC_ON=0: the
+                                      mixed-K control, which still logs fc/*).
 lambda is never stored: it is replayed from the per-rollout sums (MA_FC_STATE json), so a run resumed from an older
 checkpoint recomputes exactly the lambdas its rollouts used (sums of rollouts it regenerates are overwritten).
 """
@@ -113,15 +113,20 @@ def observe(rollout_id: int, args, samples) -> dict:
     return m
 
 
-def post_process(args, samples):
-    """--custom-reward-post-process-path: (raw, rewards) per sample; the cost term on every real sample if ON."""
-    rewards = []
-    for s in samples:
-        r = float(s.get_reward_value(args))
+def apply_cost(samples, rewards: list[float]) -> list[float]:
+    """rewards (the arm's, per sample) with the cost term on every real sample if ON (fcs_team.post_process)."""
+    out = []
+    for s, r in zip(samples, rewards):
         m = s.metadata or {}
         if ON and not m.get("fc_pad") and "fc_k" in m:
             assert _cur is not None, "fcs_cost.observe must run first (fcs_team.log_rollout)"
             k = int(m["fc_k"])
             r -= _cur["lam"][k] * float(m["fc_cost"]) / _cur["c0"][k]
-        rewards.append(r)
-    return rewards, list(rewards)
+        out.append(r)
+    return out
+
+
+def post_process(args, samples):
+    """(raw, rewards) with the cost term, without relabeling (kept for direct use; runs use fcs_team.post_process)."""
+    out = apply_cost(samples, [float(s.get_reward_value(args)) for s in samples])
+    return out, list(out)

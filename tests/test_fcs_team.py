@@ -250,4 +250,48 @@ assert raw == rew
 FC.ON = False
 assert FC.post_process(a, flat)[0] == [o.reward for o in flat]
 print("[ok] observe / post_process")
+
+# 12) relabel (value pretraining shared across arms): an episode generated under one arm, relabeled for every arm,
+#     gets exactly the rewards that arm computes; post_process relabels real samples and leaves padding alone
+F.REWARD = "shared"
+ep = play(MATES3, ("hmm\n</think>\n\n<adopt 2/>", "stop"))  # adopted teammate 2
+fr0 = ep[0].metadata["fr"]
+assert [o.metadata["fr"]["role"] for o in ep] == [0, 1, 2, 3] and fr0["adopted"] == 2
+for arm in F.REWARDS:
+    lr, mr = F.rewards(arm, fr0["S"], fr0["s"], fr0["cases"], fr0["adopted"])
+    assert [F.relabel(o.metadata["fr"], arm) for o in ep] == [lr] + mr, arm
+F.REWARD = "adopt"
+raw, rew = F.post_process(a, ep)
+assert rew == [fr0["S"], 0.0, fr0["S"], 0.0] and raw == rew, rew
+F.REWARD = "shared"
+assert F.post_process(a, ep)[1] == [o.reward for o in ep]  # live rollout: reproduces generate()'s rewards
+F.K_SET = [0, 1, 3]
+FC.ON = False
+mixed = [o for e in eps for o in e]
+F.REWARD = "indiv"
+raw, rew = F.post_process(a, mixed)
+for o, x in zip(mixed, rew):
+    if o.metadata.get("fc_pad"):
+        assert x == o.reward and "fr" not in o.metadata
+    else:
+        assert x == F.relabel(o.metadata["fr"], "indiv")
+F.K_SET = []
+F.REWARD = "shared"
+print("[ok] relabel across arms and post_process")
+
+# 13) miles' dump / replay round trip keeps the relabel metadata (save_debug_rollout_data -> load_replay_rollout_data)
+import tempfile  # noqa: E402
+
+from miles.ray.rollout.debug_data import load_replay_rollout_data, save_debug_rollout_data  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td:
+    da = Args(save_debug_rollout_data=td + "/rollout_data/{rollout_id}.pt", save_debug_trajectory_data=None,
+              replay_rollout_data=td + "/rollout_data/{rollout_id}.pt")
+    save_debug_rollout_data(da, ep, rollout_id=3, evaluation=False, metadata={"x": 1})
+    back, md = load_replay_rollout_data(da, rollout_id=3)
+assert md == {"x": 1} and len(back) == len(ep)
+assert [b.metadata["fr"] for b in back] == [o.metadata["fr"] for o in ep]
+assert [b.tokens for b in back] == [o.tokens for o in ep] and [b.loss_mask for b in back] == [o.loss_mask for o in ep]
+assert F.post_process(a, back) == F.post_process(a, ep)
+print("[ok] dump / replay round trip")
 print("ALL OK")

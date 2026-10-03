@@ -1,7 +1,7 @@
 From ddaf3453e57ebfd353ab83abc924cc30dbe455c8 Mon Sep 17 00:00:00 2001
 From: Wenhao Chai <reselfchai@gmail.com>
 Date: Thu, 1 Oct 2026 19:48:41 -0400
-Subject: [PATCH 1/5] EasyPPO for PPO: actor-only overlong filter,
+Subject: [PATCH 1/6] EasyPPO for PPO: actor-only overlong filter,
  noise-normalized critic loss, critic mini-batches
 
 Opt-in flags porting EasyPPO (arXiv 2609.36802, github.com/EasyPPO/EasyPPO 85bde92):

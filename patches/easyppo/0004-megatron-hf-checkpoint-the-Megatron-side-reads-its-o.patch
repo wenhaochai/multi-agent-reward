@@ -1,7 +1,7 @@
 From 1964dbb4c99ade509b6a6f669b2bc83ad617252b Mon Sep 17 00:00:00 2001
 From: Wenhao Chai <reselfchai@gmail.com>
 Date: Thu, 1 Oct 2026 21:06:54 -0400
-Subject: [PATCH 4/5] --megatron-hf-checkpoint: the Megatron side reads its own
+Subject: [PATCH 4/6] --megatron-hf-checkpoint: the Megatron side reads its own
  HF checkpoint
 
 Bridge model build, HF weight load (actor --load fallback, critic), weight export to sglang,

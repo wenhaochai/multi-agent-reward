@@ -18,6 +18,11 @@
 # Usage: ARM=... [SEED=42] [NUM_ROLLOUT=60] [EVAL_EVERY=20] [N_EVAL=4] [BUDGET=32768] [MODEL=<hf dir>] [SMOKE=1]
 #        [QOS] [TIME] [DEP] [NICE] [DRY=1] bash submit_fcs_team.sh
 #   SMOKE=1: 3 rollouts of 2 prompts x 2 episodes, 4096-token turns, 16-problem val sets at the end, pli-cp.
+#   PRETRAIN=1: the shared value-pretraining producer of this arm's game (solo | team3 | mixk) and seed: only the CO
+#     critic-only rollouts (actor frozen), saved with --save-debug-rollout-data to runs/fcs_vp_<game>_<tag>_s<seed>,
+#     step-0 eval included. Its reward arm does not matter (the arms relabel).
+#   VP=1 VP_DEP=<producer jid>: replay the producer's CO rollouts (miles --replay-rollout-data, afterok), relabeled with
+#     this arm's reward (fcs_team.post_process), then generate live from rollout CO; no step-0 eval (the producer's).
 #   Plain sbatch only (user 2026-10-02: no queue workers); runs longer than TIME chain with DEP (afterany), each
 #   segment resuming from --load = --save.
 set -euo pipefail
@@ -44,6 +49,7 @@ case $ARM in
   *) echo "unknown ARM $ARM" >&2; exit 1 ;;
 esac
 if [ "$ARM" = solocm ]; then NS_TEAM=32; PER=1; else NS_TEAM=8; PER=4; fi
+case $ARM in solocm) GAME=solo ;; mixk|cost) GAME=mixk ;; *) GAME=team3 ;; esac
 if [ -n "${SMOKE:-}" ]; then
   R=fcs_team_smoke_${AN}_$TAG; NR=${NUM_ROLLOUT:-3}; RB=2; NS=$([ "$ARM" = solocm ] && echo 8 || echo 2)
   BUDGET=${BUDGET:-4096}; CO=1; WU=1; EV=${EVAL_EVERY:-$NR}; EN=${N_EVAL:-1}; CGBS=8
@@ -56,6 +62,16 @@ else
   extra=(--use-wandb --wandb-mode offline --wandb-dir $B/runs/$R --wandb-project fcs_easyppo
          --wandb-group fcs_team --disable-wandb-random-suffix)
   case $ARM in shared|solocm) ;; *) extra+=(--skip-eval-before-train) ;; esac
+fi
+VPR=fcs_vp_${GAME}_${TAG}_s$SEED; [ -n "${SMOKE:-}" ] && VPR=fcs_vp_smoke_${GAME}_$TAG
+if [ -n "${PRETRAIN:-}" ]; then  # the producer: CO critic-only rollouts, saved; step-0 eval
+  R=$VPR; NR=$CO; EV=1000000
+  extra=(--save-debug-rollout-data $B/runs/$R/rollout_data/{rollout_id}.pt)
+  [ -n "${SMOKE:-}" ] || extra+=(--use-wandb --wandb-mode offline --wandb-dir $B/runs/$R --wandb-project fcs_easyppo
+                                 --wandb-group fcs_team --disable-wandb-random-suffix)
+elif [ -n "${VP:-}" ]; then
+  extra+=(--replay-rollout-data $B/runs/$VPR/rollout_data/{rollout_id}.pt --replay-rollout-until $CO)
+  case " ${extra[*]} " in *" --skip-eval-before-train "*) ;; *) extra+=(--skip-eval-before-train) ;; esac
 fi
 GBS=$((RB * NS * PER))
 ft+=(MA_FT_MATE_BUDGET=$BUDGET MA_FT_LEAD_BUDGET=$BUDGET MA_FT_MAX_LEN=65536 MA_FT_TRACE_DIR=$B/runs/$R/traces
@@ -102,11 +118,15 @@ args=(--hf-checkpoint $SG --megatron-hf-checkpoint $MG --megatron-to-hf-mode bri
   # --seed sets Megatron and the SGLang engines (engine i gets SEED + i, so replicate seeds sit >= 8 apart); the prompt
   # order comes from --rollout-seed (miles default 42), so a replicate changes it too
   --rollout-seed $SEED)
-case $ARM in mixk|cost)
-  envs+=(MA_FC_STATE=$B/runs/$R/fc_state.json); args+=(--custom-reward-post-process-path miles_team.fcs_cost.post_process) ;;
-esac
+# every arm: the arm's reward recomputed from each sample's episode record (identity on live rollouts; relabels replayed
+# ones), plus the cost term for the mixed-K arms
+args+=(--custom-reward-post-process-path miles_team.fcs_team.post_process)
+case $ARM in mixk|cost) envs+=(MA_FC_STATE=$B/runs/$R/fc_state.json) ;; esac
 sb=(); [ -n "${NICE:-}" ] && sb=(--nice="$NICE")
-[ -n "${DEP:-}" ] && sb+=(--dependency=afterany:"$DEP")
+dep=(); [ -n "${DEP:-}" ] && dep+=(afterany:"$DEP"); [ -n "${VP_DEP:-}" ] && dep+=(afterok:"$VP_DEP")
+[ ${#dep[@]} -gt 0 ] && sb+=(--dependency=$(IFS=,; echo "${dep[*]}"))
+[ -n "${VP:-}" ] && [ -z "${VP_DEP:-}" ] && [ ! -f $B/runs/$VPR/rollout_data/$((CO - 1)).pt ] && {
+  echo "VP=1: $VPR has no rollout $((CO - 1)) dump yet; pass VP_DEP=<its jid>" >&2; exit 1; }
 echo "$R: arm=$ARM ${ft[*]} rb=$RB ns=$NS gbs=$GBS miles=$(git -C $MILES_SRC rev-parse --short HEAD) repo=$(git -C $B rev-parse --short HEAD)"
 [ -n "${DRY:-}" ] && { echo "  ${args[*]}"; exit 0; }
 mkdir -p $B/runs/$R

@@ -30,6 +30,11 @@ stand-ins to 1 + MA_FT_MATES samples, and the critic groups split by K (8 g + K 
 for teammates, 8 g + 7 for padding). Every real sample carries fc_k, fc_cost (episode tokens) and fc_score (S) for the
 cost-steered reward (fcs_cost.py), and log_rollout feeds fcs_cost.observe.
 
+Value pretraining shared across arms (miles --replay-rollout-data): every training sample carries fr = the episode's
+S, s_j, per-case ratios, adoption and its role, so post_process (--custom-reward-post-process-path) recomputes the
+arm's reward (rewards()) for rollouts replayed from another arm's dump; on live rollouts it reproduces the reward
+generate() set. With MA_FT_K_SET it then adds the cost term (fcs_cost.apply_cost).
+
 Eval: MA_FT_EVAL_MATES teammates (default MA_FT_MATES; a solo-trained run sets 3 to score its weights in the game);
 sample.metadata["ft_mode"] == "solo" plays one agent on the solo prompt (reward s: the weights as a single
 agent); otherwise the full game, returning the lead's sample with reward S. Episode stats (ft_*) ride on the lead's
@@ -192,7 +197,7 @@ async def _play(input: GenerateFnInput) -> GenerateFnOutput:
                 "ft_tokens": sum(sg.response_length for sg in sess.segments), "ft_judge_infra_error": float(res["infra_error"])}
         if input.evaluation or not K_SET:
             return _single(input, sess, res["score"], info)
-        return _pack(input, [(sess, res["score"])], info, 0)
+        return _pack(input, [(sess, res["score"])], info, 0, fr={"S": res["score"], "s": [], "cases": [], "adopted": None})
 
     mate_msgs = messages
     mate_runs = await asyncio.gather(*[_agent(input, f"mate{j + 1}", mate_msgs, MATE_BUDGET) for j in range(k)])
@@ -240,7 +245,8 @@ async def _play(input: GenerateFnInput) -> GenerateFnOutput:
 
     if input.evaluation:
         return _single(input, lead, S, info)
-    return _pack(input, [(lead, r_lead)] + [(m, rm) for (m, _, _), rm in zip(mate_runs, r_mates)], info, k)
+    return _pack(input, [(lead, r_lead)] + [(m, rm) for (m, _, _), rm in zip(mate_runs, r_mates)], info, k,
+                 fr={"S": S, "s": s, "cases": cases, "adopted": adopted})
 
 
 def _group(g: int, role: int | None, k: int) -> int:
@@ -252,7 +258,7 @@ def _group(g: int, role: int | None, k: int) -> int:
     return 8 * g + (0 if role == 0 else 3) + K_SET.index(k)
 
 
-def _pack(input, agents: list, info: dict, k: int) -> GenerateFnOutput:
+def _pack(input, agents: list, info: dict, k: int, fr: dict) -> GenerateFnOutput:
     """One training sample per agent (lead first; a session has one turn), padded to 1 + MATES samples."""
     rollout_id = input.sample.rollout_id if input.sample.rollout_id is not None else input.sample.index
     g = input.sample.group_index if input.sample.group_index is not None else input.sample.index
@@ -266,18 +272,38 @@ def _pack(input, agents: list, info: dict, k: int) -> GenerateFnOutput:
         seg = segs[-1] if segs else _pad_sample(real[0])
         seg.reward, seg.rollout_id = float(r), rollout_id
         seg.group_index = _group(g, role, k)
-        seg.metadata = {**(seg.metadata or {}), "ft_role": "lead" if role == 0 else f"mate{role}"}
+        seg.metadata = {**(seg.metadata or {}), "ft_role": "lead" if role == 0 else f"mate{role}", "fr": {**fr, "role": role}}
         if K_SET:
             seg.metadata |= {**fc, "fc_lead": role == 0}
         samples.append(seg)
     while len(samples) < 1 + MATES:  # K < MATES: masked stand-ins keep the samples per episode fixed
         p = _pad_sample(real[0])
         p.reward, p.rollout_id, p.group_index = 0.0, rollout_id, _group(g, None, k)
-        p.metadata = {key: v for key, v in p.metadata.items() if not key.startswith(("ft_", "fc_"))}
+        p.metadata = {key: v for key, v in p.metadata.items() if not key.startswith(("ft_", "fc_", "fr"))}
         p.metadata |= {"ft_role": "pad", "fc_pad": True}
         samples.append(p)
     samples[0].metadata = {**samples[0].metadata, **info, "ft_k": float(k)}
     return GenerateFnOutput(samples=samples)
+
+
+def relabel(fr: dict, arm: str = None) -> float:
+    """The arm's reward for one agent of a stored episode (fr: S, s, cases, adopted, role)."""
+    r_lead, r_mates = rewards(arm or REWARD, fr["S"], fr["s"], fr["cases"], fr["adopted"])
+    return r_lead if fr["role"] == 0 else r_mates[fr["role"] - 1]
+
+
+def post_process(args, samples):
+    """--custom-reward-post-process-path: (raw, rewards). Relabel every real sample with this arm's reward (replayed
+    rollouts came from another arm), then the cost term for MA_FT_K_SET arms."""
+    out = []
+    for s in samples:
+        fr = (s.metadata or {}).get("fr")
+        out.append(relabel(fr) if fr is not None else float(s.get_reward_value(args)))
+    if K_SET:
+        from . import fcs_cost
+
+        out = fcs_cost.apply_cost(samples, out)
+    return out, list(out)
 
 
 def _single(input, sess: Session, reward: float, info: dict) -> GenerateFnOutput:
