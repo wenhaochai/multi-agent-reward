@@ -91,7 +91,10 @@ args=(--hf-checkpoint $SG --megatron-hf-checkpoint $MG --megatron-to-hf-mode bri
   --micro-batch-size 1 --max-tokens-per-gpu $MAXTOK
   --rollout-num-gpus-per-engine 1 --sglang-mem-fraction-static 0.7 --sglang-dtype bfloat16
   --attention-dropout 0.0 --hidden-dropout 0.0 --update-weight-buffer-size 536870912
-  --actor-num-nodes 1 --actor-num-gpus-per-node 8 --colocate --seed $SEED)
+  --actor-num-nodes 1 --actor-num-gpus-per-node 8 --colocate --seed $SEED
+  # --seed sets Megatron and the SGLang engines (engine i gets SEED + i, so replicate seeds sit >= 8 apart); the prompt
+  # order comes from --rollout-seed (miles default 42), so a replicate changes it too
+  --rollout-seed $SEED)
 sb=(); [ -n "${NICE:-}" ] && sb=(--nice="$NICE")
 [ -n "${DEP:-}" ] && sb+=(--dependency=afterany:"$DEP")
 echo "$R: arm=$ARM ${ft[*]} rb=$RB ns=$NS gbs=$GBS miles=$(git -C $MILES_SRC rev-parse --short HEAD) repo=$(git -C $B rev-parse --short HEAD)"
