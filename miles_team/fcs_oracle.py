@@ -1,35 +1,38 @@
-"""Frontier-CS games with an oracle (labs-molt-docs docs/fcs_multiagent_reward.md, user decisions 2026-10-03):
-every submission is judged and its total score (0-100) and per-test-case scores come back to the agent that submitted
-it or to its lead. An episode keeps its best submission: V = max over its submissions.
+"""Frontier-CS games with an oracle (labs-molt-docs docs/fcs_multiagent_reward.md, user decisions 2026-10-03/04):
+every submitted program is judged and its total score (0-100), per-test-case scores and compiler errors come back.
+The judged program of a reply is its LAST ```cpp block; every prompt says so.
 --custom-generate-function-path miles_team.fcs_oracle.generate
 
-Games (MA_FO_GAME for training; an eval set picks its game with metadata.fo_game), each with 5 submissions:
+Games (MA_FO_GAME for training; an eval set picks its game with metadata.fo_game):
   team  1 lead + 4 subagents, after DeepSeek-V4.1-Flash's Agent Team mode (arXiv 2609.19969 sec. 5.3.5: the lead
-        delegates a task to each teammate, teammates start fresh, the lead reviews the work and produces the final
-        answer). Turn 1: the lead reads the problem and writes one task per subagent (<task j>...</task>, at most
-        MA_FO_PLAN_BUDGET tokens). The subagents (fresh sessions: the problem plus their task) each submit a program.
-        Turn 2: the lead sees every subagent's task, code, total and per-case scores, and submits the final program
-        (or <adopt j/>). Submissions: 4 subagents + the lead's final.
-  seq   one agent, MA_FO_ROUNDS rounds in one chat: round t sees its earlier programs with their scores and submits
-        a new one (sequential self-revision with the same feedback).
-  par   MA_FO_ROUNDS independent solo attempts (best-of-n).
+        delegates a task to each teammate, teammates start fresh, the lead reviews their work and produces the final
+        answer). Turn 1: the lead writes one task per subagent (<task j>...</task>). Each subagent (a fresh session:
+        the problem plus its task) is a helper, not a forced submitter: it may test up to MA_FO_SUB_TESTS programs
+        against the judge, seeing each result, and then reports to the lead (<report>...</report>; a reply without a
+        ```cpp block also ends its work and is its report). Turn 2: the lead reads every subagent's task, tested
+        programs with their results, and report, and submits the final program (or <adopt j/> for subagent j's last
+        tested program). The team's outcome is the lead's final submission only: V = S.
+  seq   one agent, MA_FO_ROUNDS rounds in one chat, each round seeing its earlier programs and their results; the
+        outcome is the last round's submission: V = s_last.
+  par   MA_FO_ROUNDS independent solo attempts; the outcome is the best of them (an oracle-selected reference).
 
-Rewards (MA_FO_REWARD; s = a submission's score in [0, 1], V = the episode's best):
-          team: plan / final / subagent j                     seq: round t                par: attempt t
-  shared  V / V / V                                            V                           V
-  indiv   max_j s_j / S / s_j                                  s_t                         s_t
-  gain    V / S - max_j s_j / V                                -                           -
-  diff    V / max(0, S - max_j s_j) / V - max(S, s_-j)         max(0, s_t - max_{i<t} s_i)  V - max_{i!=t} s_i
-          (team diff: S leaves the counterfactual of a subagent the lead adopted)
-indiv on par is plain single-agent RL (each attempt its own score); shared on seq is the sequential baseline.
+Rewards (MA_FO_REWARD; s = a judged score in [0, 1]):
+  team  shared  every turn gets S (plan, final, every subagent turn)
+        bonus   lead S; subagent j: S + MA_FO_BONUS x (score of its last tested program; 0 if it tested none)
+        diff    lead S; subagent j: S - S_-j, where S_-j is the score of a counterfactual final the lead writes from
+                the same context with subagent j's block replaced by "not available" (MA_FO_SUBS extra lead turns,
+                generated and judged but never trained on; also computed when MA_FO_CF=1, e.g. by the shared-value
+                producer, so a diff run can relabel replayed rollouts)
+  seq   shared  every round gets s_last;  indiv  s_t;  diff  max(0, s_t - max_{i<t} s_i)
+  par   shared  max_t s_t;  indiv  s_t (plain single-agent RL);  diff  V - max_{i!=t} s_i
 
 Training returns one sample per agent turn (a turn that string-extends its session's previous turn shares that
-segment, which then carries the later turn's reward), padded with masked stand-ins to a fixed count per episode (team 6, seq/par MA_FO_ROUNDS), so the samples
-per step stay fixed. Critic groups: 8 g + role (team: plan 0, final 1, subagent 2; seq: round t; par: 0; padding 7).
-A training episode in which any judge call failed for infrastructure reasons is aborted (miles resubmits the group).
-Every real sample carries fo = the episode record (game, scores, role) so post_process recomputes the arm's reward
-(identity live; relabels rollouts replayed by miles --replay-rollout-data). Eval returns the episode's last
-submission's sample with reward V. Latency = generated tokens on the critical path (team: plan + the longest
+segment), padded with masked stand-ins to a fixed count per episode (team 2 + SUBS x (SUB_TESTS + 1), seq/par
+MA_FO_ROUNDS). Critic groups: 8 g + role (team: plan 0, final 1, every subagent turn 2; seq: round t; par: 0;
+padding 7). A training episode in which a judge call failed for infrastructure reasons is aborted (miles resubmits
+the group). Every real sample carries fo = the episode record (game, scores, role) so post_process recomputes the
+arm's reward (identity live; relabels rollouts replayed by miles --replay-rollout-data). Eval returns the sample of
+the episode's outcome turn with reward V. Latency = generated tokens on the critical path (team: plan + the longest
 subagent + final; seq: sum; par: max), as DeepSeek's derived latency without the prefill and tool terms.
 """
 from __future__ import annotations
@@ -58,37 +61,66 @@ CODE_CHARS = int(os.environ.get("MA_FO_CODE_CHARS", "8000"))
 MAX_CASES = int(os.environ.get("MA_FO_MAX_CASES", "100"))
 MAX_LEN = int(os.environ.get("MA_FO_MAX_LEN", "65536"))
 THINK = os.environ.get("MA_FO_THINK", "1") == "1"
+SUB_TESTS = int(os.environ.get("MA_FO_SUB_TESTS", "3"))
+REPORT_BUDGET = int(os.environ.get("MA_FO_REPORT_BUDGET", "16384"))
+REPORT_CHARS = int(os.environ.get("MA_FO_REPORT_CHARS", "6000"))
+BONUS = float(os.environ.get("MA_FO_BONUS", "0.5"))
+CF = os.environ.get("MA_FO_CF", "0") == "1"
 TRACE_DIR = os.environ.get("MA_FO_TRACE_DIR", "")
 TRACE_EVERY = int(os.environ.get("MA_FO_TRACE_EVERY", "32"))
 GAMES = ("team", "seq", "par")
-ARMS = {"team": ("shared", "indiv", "gain", "diff"), "seq": ("shared", "indiv", "diff"),
+ARMS = {"team": ("shared", "bonus", "diff"), "seq": ("shared", "indiv", "diff"),
         "par": ("shared", "indiv", "diff")}
 assert GAME in GAMES and REWARD in ARMS[GAME], (GAME, REWARD)
 
+# the problem prompt's output rule (data/*.jsonl), dropped for the lead's plan and the subagents, who need not answer
+# with code only
+OUTPUT_RULE = ("Output ONLY the C++ code wrapped in ```cpp and ```. No explanation. If you write more than one ```cpp "
+               "block, only the last one is submitted.")
+OLD_OUTPUT_RULE = "Output ONLY the C++ code wrapped in ```cpp and ```. No explanation."
 PLAN = (
-    "\n\nYou lead a team of {n} subagents. Each subagent gets this problem plus one task you write, and submits a "
-    "complete C++ solution. Every submission is judged: you will see each subagent's code with its total score "
-    "(0-100) and its per-test-case scores, and then you write the team's final solution. The team keeps its "
-    "best-scoring submission. Write the {n} tasks now: the approach each subagent should take and what to watch out "
-    "for. Output exactly {n} blocks, <task 1>...</task> through <task {n}>...</task>. Do not write the solution yet."
+    "\n\nYou lead a team of {n} subagents. Each subagent gets this problem plus one task you write. A subagent may "
+    "test up to {k} C++ programs against the judge, seeing each program's total score (0-100), per-test-case scores "
+    "and compiler errors, and then reports back to you: ideas, analysis, test cases or code. Then you write the "
+    "team's final solution; only your final submission counts. Write the {n} tasks now: what each subagent should "
+    "explore, try or check. Output exactly {n} blocks, <task 1>...</task> through <task {n}>...</task>. Do not write "
+    "the solution yet."
 )
-SUB = "\n\nYour team lead gave you this task:\n{task}\n\nFollow it. Output ONLY the C++ code wrapped in ```cpp and ```."
-NO_TASK = "(no task was given: solve the problem your own way)"
+SUB = (
+    "\n\nYou are a subagent. Your team lead gave you this task:\n{task}\n\nYou do not have to write a full "
+    "solution: your report to the lead can hold ideas, analysis, test cases, partial code or a complete program, "
+    "whatever helps the lead most. To test a C++ program, put it in a ```cpp block: the last ```cpp block of a reply "
+    "is judged, and you will see its total score (0-100), per-test-case scores and compiler errors. You can test up "
+    "to {k} programs. When you are done, write your report for the lead inside <report>...</report>; a reply without "
+    "a ```cpp block also ends your work and goes to the lead as your report."
+)
+SUB_FEEDBACK = (
+    "Your program was judged: {result}\nPer-test-case scores (fractions of full marks): {cases}\nYou can test {left} "
+    "more program(s). Reply with another ```cpp block to test it, or finish with <report>...</report>."
+)
+SUB_LAST = (
+    "Your program was judged: {result}\nPer-test-case scores (fractions of full marks): {cases}\nYou have no tests "
+    "left. Write your report for the lead inside <report>...</report>."
+)
+NO_TASK = "(no task was given: help with the problem your own way)"
 FEEDBACK = (
-    "The subagents' submissions were judged (total score 0-100; per-test-case scores are fractions of full marks)."
-    "\n\n{blocks}\n\nThe team keeps its best submission, currently {best:.2f}/100. Write the final solution: improve "
-    "on, fix or combine theirs to score higher. Output ONLY the final C++ code wrapped in ```cpp and ```, or output "
-    "only <adopt j/> to resubmit subagent j's code unchanged."
+    "Your subagents reported back. For each: its task, the programs it tested with their results (total score "
+    "0-100; per-test-case scores are fractions of full marks), and its report.\n\n{blocks}\n\nWrite the team's "
+    "final solution; only your final submission counts. Output the final C++ code in a ```cpp block (if you write "
+    "more than one, only the last one is submitted), or output only <adopt j/> to submit the last program subagent "
+    "j tested, unchanged."
 )
-SUB_BLOCK = "### Subagent {j}\nTask: {task}\nResult: {result}\nPer-test-case scores: {cases}\n```cpp\n{code}\n```"
-SUB_NONE = "### Subagent {j}\nTask: {task}\nResult: no code (the answer was cut off or contained no program), score 0"
+NOT_AVAILABLE = "### Subagent {j}\n(this subagent's work is not available)"
 REVISE = (
     "Your submission was judged: {result}\nPer-test-case scores (fractions of full marks): {cases}\nYour best score "
-    "so far is {best:.2f}/100. Write an improved solution. Output ONLY the C++ code wrapped in ```cpp and ```."
+    "so far is {best:.2f}/100. Write an improved solution. Output ONLY the C++ code wrapped in ```cpp and ```; "
+    "only the last ```cpp block is submitted."
 )
 _SPECIAL = ("<|im_end|>", "<|endoftext|>", "<|im_start|>")  # Session decodes with special tokens kept
 _TASK_RE = re.compile(r"<task\s*(\d+)\s*>(.*?)</task\s*>", re.IGNORECASE | re.DOTALL)
 _ADOPT_RE = re.compile(r"<adopt\s*(?:j\s*=\s*)?\"?(\d+)\"?\s*/?>", re.IGNORECASE)
+_REPORT_RE = re.compile(r"<report>(.*?)(?:</report>|$)", re.IGNORECASE | re.DOTALL)
+_BLOCK_RE = re.compile(r"```(?:cpp|c\+\+)?\s*\n(.*?)```", re.DOTALL)
 _trace_count = 0
 
 
@@ -142,23 +174,20 @@ def fmt_result(res: dict) -> str:
 
 
 def rewards(game: str, arm: str, rec: dict) -> list[float]:
-    """Rewards in the order of rec's submissions. team: [plan, final, sub_1..sub_n]; seq/par: one per round."""
-    s = rec["s"]
+    """Rewards by reward index. team: [plan, final, sub_1..sub_n] (every turn of subagent j gets sub_j); seq/par: one
+    per round."""
     if game == "team":
-        S, best = rec["S"], max(s)
-        V = max(S, best)
+        S, last = rec["S"], [t[-1] if t else 0.0 for t in rec["tests"]]
         if arm == "shared":
-            return [V, V] + [V] * len(s)
-        if arm == "indiv":
-            return [best, S] + list(s)
-        if arm == "gain":
-            return [V, S - best] + [V] * len(s)
-        if arm == "diff":  # without j the lead could not have adopted j's code, so S leaves j's counterfactual then
-            adopted = rec.get("adopted")
-            return [V, max(0.0, S - best)] + [V - max(([] if adopted == j + 1 else [S]) + s[:j] + s[j + 1:])
-                                              for j in range(len(s))]
+            return [S, S] + [S] * len(last)
+        if arm == "bonus":
+            return [S, S] + [S + BONUS * x for x in last]
+        if arm == "diff":
+            assert rec.get("S_minus") is not None, "diff needs the counterfactual finals (MA_FO_CF=1 when generating)"
+            return [S, S] + [S - m for m in rec["S_minus"]]
     else:
-        V = max(s)
+        s = rec["s"]
+        V = s[-1] if game == "seq" else max(s)
         if arm == "shared":
             return [V] * len(s)
         if arm == "indiv":
@@ -253,12 +282,12 @@ async def _play(input: GenerateFnInput) -> GenerateFnOutput:
         # a submission could not be judged (fork / disk / sandbox): its 0 is not the policy's, so do not train on the
         # episode; miles resubmits the group (eval keeps the 0, flagged in fo_judge_infra_error)
         raise Aborted("judge infrastructure error")
-    V = max(rec["s"] + ([rec["S"]] if game == "team" else []))
+    V = rec["S"] if game == "team" else (rec["s"][-1] if game == "seq" else max(rec["s"]))
     info = {**info, "fo_V": V, "fo_game_" + game: 1.0}
     _write_trace({"time": round(time.time(), 1), "eval": input.evaluation, "game": game, "arm": REWARD,
                   "label": label, **rec, "V": V, "turns": texts})
     if input.evaluation:  # the episode's last submission (team: the lead's final), scored V
-        sess, seg_i = turns[1] if game == "team" else turns[-1]
+        sess, seg_i = turns[1][:2] if game == "team" else turns[-1][:2]
         if seg_i >= 0:
             out = sess.segments[seg_i]
         else:
@@ -270,52 +299,118 @@ async def _play(input: GenerateFnInput) -> GenerateFnOutput:
     return _pack(input, turns, game, rec, info)
 
 
+def last_block(text: str) -> str:
+    """The last ```cpp block of a reply's visible part, or "" (a reply without one submits nothing)."""
+    m = _BLOCK_RE.findall(strip_think(text) or "")
+    return m[-1].strip() if m else ""
+
+
+def _without_output_rule(messages: list) -> list:
+    out = deepcopy(messages)
+    c = out[-1]["content"]
+    out[-1] = {**out[-1], "content": c.replace(OUTPUT_RULE, "").replace(OLD_OUTPUT_RULE, "")}
+    return out
+
+
+async def _subagent(input, j: int, messages: list, task: str, label: str) -> dict:
+    """One subagent: up to SUB_TESTS judged programs, each result shown back, then its report for the lead."""
+    sess = Session(input, f"sub{j + 1}", THINK, max_len=MAX_LEN)
+    chat = _with_suffix(_without_output_rule(messages), SUB.format(task=task, k=SUB_TESTS))
+    tests, segs, trace, report, cut_any = [], [], [], "", False
+    while True:
+        last_turn = len(tests) >= SUB_TESTS  # tests used up: this turn only reports
+        text, cut, seg = await _turn(sess, chat, REPORT_BUDGET if last_turn else BUDGET)
+        if seg >= 0 and seg not in segs:
+            segs.append(seg)
+        vis = "" if cut else (strip_think(text) or "").strip()
+        code = "" if (cut or last_turn) else last_block(text)
+        res = await judge_code(label, code) if code else None
+        if code:
+            tests.append((code, res))
+        trace.append(_tt(f"sub{j + 1}", text, cut, res, test=len(tests) if code else 0))
+        if cut:
+            cut_any, report = True, "(cut off: the subagent's reply hit the token limit)"
+            break
+        m = _REPORT_RE.search(vis)
+        if m or not code or last_turn:
+            report = (m.group(1) if m else vis).strip() or "(empty report)"
+            break
+        left = SUB_TESTS - len(tests)
+        chat = chat + [{"role": "assistant", "content": vis},
+                       {"role": "user", "content": (SUB_FEEDBACK if left else SUB_LAST).format(
+                           result=fmt_result(res), cases=fmt_cases(res["cases"]), left=left)}]
+    return {"sess": sess, "segs": segs, "tests": tests, "report": report[:REPORT_CHARS], "cut": cut_any,
+            "trace": trace}
+
+
+def _sub_block(j: int, task: str, r: dict) -> str:
+    out = f"### Subagent {j + 1}\nTask: {task}\n"
+    if r["tests"]:
+        code, res = r["tests"][-1]
+        scores = ", ".join(f"{100 * x['score']:.2f}" for _, x in r["tests"])
+        out += (f"Programs tested: {len(r['tests'])} (scores: {scores})\nLast tested program: {fmt_result(res)}\n"
+                f"Per-test-case scores: {fmt_cases(res['cases'])}\n```cpp\n{code[:CODE_CHARS]}\n```\n")
+    else:
+        out += "Programs tested: 0\n"
+    return out + "Report:\n" + r["report"]
+
+
+async def _final(input, name: str, msgs: list, subr: list[dict], label: str):
+    """A lead final turn and its judged result: the last ```cpp block, else <adopt j/> of a tested program."""
+    sess = Session(input, name, THINK, max_len=MAX_LEN) if isinstance(name, str) else name
+    text, cut, seg = await _turn(sess, msgs, BUDGET)
+    adopted = None if cut else parse_adopt(text, len(subr))
+    code = "" if cut else last_block(text)
+    if not code and adopted is not None and subr[adopted - 1]["tests"]:
+        return sess, text, cut, seg, adopted, subr[adopted - 1]["tests"][-1][1]  # its judged result, reused
+    if not code and not cut:
+        code = extract_cpp(text)  # no fenced block: the fence-less fallback, as for a solo answer
+    return sess, text, cut, seg, None, await judge_code(label, code)
+
+
 async def _team(input, messages, label):
     n = SUBS
     lead = Session(input, "lead", THINK, max_len=MAX_LEN)
-    plan_msgs = _with_suffix(messages, PLAN.format(n=n))
+    plan_msgs = _with_suffix(_without_output_rule(messages), PLAN.format(n=n, k=SUB_TESTS))
     ptext, pcut, pseg = await _turn(lead, plan_msgs, PLAN_BUDGET)
     tasks = parse_tasks("" if pcut else ptext, n)
-    subs = [Session(input, f"sub{j + 1}", THINK, max_len=MAX_LEN) for j in range(n)]
-    runs = await asyncio.gather(*[_turn(subs[j], _with_suffix(messages, SUB.format(task=tasks[j])), BUDGET)
-                                  for j in range(n)])
-    codes = ["" if cut else extract_cpp(text) for text, cut, _ in runs]
-    res = await asyncio.gather(*[judge_code(label, c) for c in codes])
-    blocks = [SUB_BLOCK.format(j=j + 1, task=tasks[j], result=fmt_result(r), cases=fmt_cases(r["cases"]),
-                               code=codes[j][:CODE_CHARS]) if codes[j] else
-              SUB_NONE.format(j=j + 1, task=tasks[j]) for j, r in enumerate(res)]
-    s = [r["score"] for r in res]
-    best = max(s)
-    final_msgs = plan_msgs + [{"role": "assistant", "content": _visible(ptext, pcut)},
-                              {"role": "user", "content": FEEDBACK.format(blocks="\n\n".join(blocks),
-                                                                          best=100 * best)}]
-    ftext, fcut, fseg = await _turn(lead, final_msgs, BUDGET)
-    adopted = None if fcut else parse_adopt(ftext, n)
-    if adopted is not None and codes[adopted - 1]:
-        fres = res[adopted - 1]  # the same program: reuse its score (time-limited heuristics vary run to run)
-    else:
-        adopted = None
-        fres = await judge_code(label, "" if fcut else extract_cpp(ftext))
+    subr = await asyncio.gather(*[_subagent(input, j, messages, tasks[j], label) for j in range(n)])
+    blocks = [_sub_block(j, tasks[j], r) for j, r in enumerate(subr)]
+    head = plan_msgs + [{"role": "assistant", "content": _visible(ptext, pcut)}]
+    final_msgs = head + [{"role": "user", "content": FEEDBACK.format(blocks="\n\n".join(blocks))}]
+    _, ftext, fcut, fseg, adopted, fres = await _final(input, lead, final_msgs, subr, label)
     S = fres["score"]
-    gen_sub = [_gen(x) for x in subs]
+    S_minus, cf_gen, cf_trace, cf_infra = None, 0, [], False
+    if (REWARD == "diff" or CF) and not input.evaluation:
+        cfs = await asyncio.gather(*[_final(input, f"cf{j + 1}", head + [{"role": "user", "content": FEEDBACK.format(
+            blocks="\n\n".join(NOT_AVAILABLE.format(j=j + 1) if i == j else b for i, b in enumerate(blocks)))}],
+            subr, label) for j in range(n)])
+        S_minus = [c[5]["score"] for c in cfs]
+        cf_gen = sum(_gen(c[0]) for c in cfs)
+        cf_infra = any(c[5]["infra_error"] for c in cfs)
+        cf_trace = [_tt(f"cf{j + 1}", c[1], c[2], c[5]) for j, c in enumerate(cfs)]
+    tests = [[x["score"] for _, x in r["tests"]] for r in subr]
+    all_tests = [x for t in tests for x in t]
+    best = max(all_tests, default=0.0)
+    gen_sub = [_gen(r["sess"]) for r in subr]
     plan_gen = sum(lead.segments[pseg].loss_mask) if pseg >= 0 else 0
     lead_gen = _gen(lead)
-    rec = {"game": "team", "s": s, "S": S, "adopted": adopted}
-    corr = [c for i in range(n) for j in range(i + 1, n)
-            if (c := _pearson(res[i]["cases"], res[j]["cases"])) is not None]
-    info = {"fo_sub_corr": sum(corr) / len(corr) if corr else float("nan"),"fo_S": S, "fo_best_sub": best, "fo_mean_sub": sum(s) / n, "fo_beat": float(S > best),
-            "fo_gain": max(0.0, S - best), "fo_adopt": float(adopted is not None),
+    rec = {"game": "team", "S": S, "tests": tests, "adopted": adopted, "S_minus": S_minus}
+    info = {"fo_S": S, "fo_best_test": best, "fo_beat": float(S > best), "fo_adopt": float(adopted is not None),
+            "fo_sub_tests": sum(map(len, tests)) / n, "fo_sub_notest": sum(not t for t in tests) / n,
             "fo_tasks_ok": sum(t != NO_TASK for t in tasks) / n, "fo_plan_cut": float(pcut),
-            "fo_final_cut": float(fcut), "fo_sub_cut": sum(c for _, c, _ in runs) / n,
-            "fo_final_bad": _bad(fres), "fo_sub_bad": sum(_bad(r) for r in res) / n,
-            "fo_tokens": lead_gen + sum(gen_sub), "fo_latency": lead_gen + max(gen_sub),
-            "fo_plan_tokens": plan_gen,
-            "fo_judge_infra_error": float(fres["infra_error"] or any(r["infra_error"] for r in res))}
-    # turns in reward order: plan, final, sub_1..sub_n (session, segment index or -1)
-    turns = [(lead, pseg), (lead, fseg)] + [(subs[j], runs[j][2]) for j in range(n)]
-    trace = ([_tt("plan", ptext, pcut, None, tasks=tasks)]
-             + [_tt(f"sub{j + 1}", runs[j][0], runs[j][1], res[j]) for j in range(n)]
-             + [_tt("final", ftext, fcut, fres)])
+            "fo_final_cut": float(fcut), "fo_sub_cut": sum(r["cut"] for r in subr) / n,
+            "fo_final_bad": _bad(fres), "fo_report_chars": sum(len(r["report"]) for r in subr) / n,
+            "fo_tokens": lead_gen + sum(gen_sub), "fo_latency": lead_gen + max(gen_sub), "fo_plan_tokens": plan_gen,
+            "fo_cf_tokens": cf_gen,
+            "fo_judge_infra_error": float(fres["infra_error"] or cf_infra
+                                          or any(x["infra_error"] for r in subr for _, x in r["tests"]))}
+    if S_minus is not None:
+        info["fo_sub_marginal"] = sum(S - m for m in S_minus) / n
+    # turns with their reward index: plan 0, final 1, every turn of subagent j 2 + j
+    turns = [(lead, pseg, 0), (lead, fseg, 1)] + [(r["sess"], sg, 2 + j) for j, r in enumerate(subr) for sg in r["segs"]]
+    trace = ([_tt("plan", ptext, pcut, None, tasks=tasks)] + [t for r in subr for t in r["trace"]]
+             + [_tt("final", ftext, fcut, fres, adopted=adopted)] + cf_trace)
     return turns, rec, info, trace
 
 
@@ -362,7 +457,7 @@ async def _par(input, messages, label):
 
 
 def n_samples(game: str) -> int:
-    return 2 + SUBS if game == "team" else ROUNDS
+    return 2 + SUBS * (SUB_TESTS + 1) if game == "team" else ROUNDS
 
 
 def _role_group(game: str, role: int) -> int:
@@ -376,11 +471,12 @@ def _pack(input, turns, game: str, rec: dict, info: dict) -> GenerateFnOutput:
     rollout_id = input.sample.rollout_id if input.sample.rollout_id is not None else input.sample.index
     g = input.sample.group_index if input.sample.group_index is not None else input.sample.index
     r = rewards(game, REWARD, rec)
-    real = [sg for sess, _ in turns for sg in sess.segments if any(sg.loss_mask)]
+    real = [sg for item in turns for sg in item[0].segments if any(sg.loss_mask)]
     if not real:  # nothing generated by anyone: retry the episode
         raise Aborted("empty episode")
     samples, at = [], {}
-    for role, (sess, seg_i) in enumerate(turns):
+    for k, item in enumerate(turns):
+        sess, seg_i, role = item if len(item) == 3 else (*item, k)
         if seg_i < 0:
             continue  # this turn generated nothing
         seg = sess.segments[seg_i]

@@ -1,20 +1,23 @@
 #!/bin/bash
 # Frontier-CS games with an oracle (labs-molt-docs docs/fcs_multiagent_reward.md; miles_team/fcs_oracle.py) under
 # EasyPPO on miles, Qwen3.5-9B EasyPPO SFT init, text-only. The EasyPPO flags are submit_fcs.sh's verbatim; what differs
-# is the game, the batch shape and the evals. Every submission returns its total and per-test-case scores; an episode
-# keeps its best submission (V); every game has 5 submissions of up to BUDGET tokens.
+# is the game, the batch shape and the evals. Every judged program returns its total score, per-test-case scores and
+# compiler errors; a reply's judged program is its LAST ```cpp block.
 #
-# GAME=team REWARD=shared|indiv|gain|diff  1 lead (plans 4 tasks, then writes the final) + 4 subagents
-# GAME=seq  REWARD=shared|indiv|diff       one agent, 5 rounds of revision with feedback (baseline: shared)
-# GAME=par  REWARD=shared|indiv|diff       5 independent attempts (baseline: indiv = single-agent RL)
-# Batch: 480 samples per step: team 16 prompts x 5 episodes x 6 turns (plan, final, 4 subagents); seq/par 16 x 6 x 5.
-#   Critic batch 120 (EasyPPO: 4 critic mini-batches).
+# GAME=team REWARD=shared|bonus|diff  1 lead (plans 4 tasks, then submits the final) + 4 helper subagents (each may test
+#                                     up to SUB_TESTS=3 programs, sees each result, then reports); outcome = the lead's
+#                                     final submission S. shared: all S; bonus: subagent S + 0.5 x its last test score;
+#                                     diff: subagent S - S_-j (counterfactual final without its work)
+# GAME=seq  REWARD=shared|indiv|diff  one agent, 5 rounds of revision with feedback; outcome = the last round
+# GAME=par  REWARD=shared|indiv|diff  5 independent attempts (indiv = single-agent RL); outcome = the best attempt
+# Batch: team 16 prompts x 5 episodes x 18 sample slots (plan, final, 4 subagents x 4 turns; unused slots are masked
+#   pads) = 1440; seq/par 16 x 6 x 5 = 480. Critic batch = batch / 4 (EasyPPO: 4 critic mini-batches).
 # Screen: NUM_ROLLOUT 60 (10 critic-only, 6-rollout lr warmup), val every 20 on two oracle-game sets of 172 problems x
 #   N_EVAL (2) episodes: team arms play team + par (the same weights as 5 independent attempts), seq plays seq + par,
 #   par plays par + team. Step 0 is evaluated once per game (team: the producer; seq and par: their runs).
 # Shared value pretraining: PRETRAIN=1 runs the 10 critic-only rollouts of GAME once (runs/fcs_vp_oracle_<game>_...),
 #   dumped; VP=1 VP_DEP=<its jid> makes an arm replay them, relabeled with its reward (fcs_oracle.post_process).
-# Usage: GAME=... REWARD=... [SEED=42] [NUM_ROLLOUT] [EVAL_EVERY] [N_EVAL] [BUDGET] [MODEL] [SMOKE=1] [PRETRAIN=1]
+# Usage: GAME=... REWARD=... [SUB_TESTS=3] [SEED=42] [NUM_ROLLOUT] [EVAL_EVERY] [N_EVAL] [BUDGET] [MODEL] [SMOKE=1] [PRETRAIN=1]
 #        [VP=1 VP_DEP=jid] [QOS] [TIME] [DEP] [NICE] [DRY=1] bash submit_fcs_oracle.sh
 #   SMOKE=1: 2 rollouts of 2 prompts x 1 episode, 4096-token turns, 16-problem val sets of the game at the end.
 set -euo pipefail
@@ -25,14 +28,16 @@ MILES_SRC=/scratch/gpfs/GROUP/USER/project/miles-easyppo
 MODEL=${MODEL:-$W/models/Qwen3.5-9B-FCS-SFT}
 MG=$MODEL-text; SG=$MODEL-lm
 for d in $MG $SG; do [ -f $d/config.json ] || { echo "missing $d: run tools/make_qwen35_text_ckpts.py $MODEL" >&2; exit 1; }; done
-: "${GAME:?GAME=team|seq|par}" "${REWARD:?REWARD=shared|indiv|gain|diff}"
-case "$GAME:$REWARD" in team:shared|team:indiv|team:gain|team:diff|seq:shared|seq:indiv|seq:diff|par:shared|par:indiv|par:diff) ;;
+: "${GAME:?GAME=team|seq|par}" "${REWARD:?REWARD=shared|bonus|diff (team), shared|indiv|diff (seq, par)}"
+case "$GAME:$REWARD" in team:shared|team:bonus|team:diff|seq:shared|seq:indiv|seq:diff|par:shared|par:indiv|par:diff) ;;
   *) echo "bad GAME:REWARD $GAME:$REWARD" >&2; exit 1 ;; esac
 SEED=${SEED:-42}
 TAG=$(basename $MODEL | tr 'A-Z.' 'a-z_' | sed 's/^qwen3_5-9b/q9b/')
-case $GAME in team) NS_FULL=5; PER=6; EVS=(team par) ;; seq) NS_FULL=6; PER=5; EVS=(seq par) ;; par) NS_FULL=6; PER=5; EVS=(par team) ;; esac
+# team: plan + final + 4 subagents x (3 tests + a report turn) = 18 sample slots per episode (unused ones are masked pads)
+SUB_TESTS=${SUB_TESTS:-3}
+case $GAME in team) NS_FULL=5; PER=$((2 + 4 * (SUB_TESTS + 1))); EVS=(team par) ;; seq) NS_FULL=6; PER=5; EVS=(seq par) ;; par) NS_FULL=6; PER=5; EVS=(par team) ;; esac
 if [ -n "${SMOKE:-}" ]; then
-  # batch and critic batch must divide by DP 2: team 2 x 1 x 6 = 12 (critic 6), seq/par 2 x 2 x 5 = 20 (critic 10)
+  # batch and critic batch must divide by DP 2: team 2 x 1 x 18 = 36 (critic 18), seq/par 2 x 2 x 5 = 20 (critic 10)
   R=fcs_oracle_smoke_${GAME}_${REWARD}_$TAG; NR=${NUM_ROLLOUT:-2}; RB=2; NS=$([ "$GAME" = team ] && echo 1 || echo 2); NVAL=16
   BUDGET=${BUDGET:-4096}; PLAN=2048; CO=1; WU=0; EV=${EVAL_EVERY:-$NR}; SAVE=$NR; EN=${N_EVAL:-1}; CGBS=$((RB * NS * PER / 2))
   QOS=${QOS:-pli-short}; TIME=${TIME:-01:30:00}
@@ -42,7 +47,8 @@ else
   # PLAN 16384: the plan turn thinks first (the SFT model averages ~16.5k tokens per solve), and a cut plan gives
   # every subagent NO_TASK and is masked from the actor (audit 2026-10-04; 8192 at first)
   # SAVE 5: a 24 h wall throws away everything since the last save (a team rollout ~36 min, an eval ~2 h)
-  BUDGET=${BUDGET:-32768}; PLAN=16384; CO=10; WU=0; EV=${EVAL_EVERY:-20}; SAVE=${SAVE_EVERY:-5}; EN=${N_EVAL:-2}; CGBS=120
+  BUDGET=${BUDGET:-32768}; PLAN=16384; CO=10; WU=0; EV=${EVAL_EVERY:-20}; SAVE=${SAVE_EVERY:-5}; EN=${N_EVAL:-2}
+  CGBS=$((RB * NS * PER / 4))  # four critic steps per rollout
   QOS=${QOS:-pli-short}; TIME=${TIME:-24:00:00}
   extra=(--use-wandb --wandb-mode offline --wandb-dir $B/runs/$R --wandb-project fcs_easyppo
          --wandb-group $R --wandb-run-id $R --disable-wandb-random-suffix)
@@ -64,9 +70,11 @@ fi
 for g in "${EVS[@]}"; do [ -f $D/fcs_val${NVAL}_fo_$g.jsonl ] || { echo "missing data/fcs_val${NVAL}_fo_$g.jsonl: python3 tools/make_fcs_team_data.py" >&2; exit 1; }; done
 evd=(); for g in "${EVS[@]}"; do evd+=(fo_$g $D/fcs_val${NVAL}_fo_$g.jsonl); done
 GBS=$((RB * NS * PER))
-# longest sample: the lead's final turn or round 5 (problem <= 8192 + 4 programs of <= 8000 chars with feedback) + BUDGET
-MAXTOK=$((BUDGET + 28672))
+# longest sample: the lead's final turn (problem <= 8192 + plan + 4 x (a tested program <= 8000 chars with its result
+# and a report <= 6000 chars)) or a subagent's 4th turn, + BUDGET
+MAXTOK=$((BUDGET + 32768))
 fo=(MA_FO_GAME=$GAME MA_FO_REWARD=$REWARD MA_FO_SUBS=4 MA_FO_ROUNDS=5 MA_FO_BUDGET=$BUDGET MA_FO_PLAN_BUDGET=$PLAN
+    MA_FO_SUB_TESTS=$SUB_TESTS MA_FO_CF=$([ -n "${PRETRAIN:-}" ] && echo 1 || echo 0)
     MA_FO_MAX_LEN=$MAXTOK MA_FO_TRACE_DIR=$B/runs/$R/traces MA_FO_TRACE_EVERY=32)
 envs=(FCS_RM_CONCURRENCY=8 FCS_CASE_WORKERS=8 MILES_SRC=$MILES_SRC RUN_NAME=$R GPUS=8 MILES_MODEL_TYPE=qwen3.5-9B
       "${fo[@]}")
