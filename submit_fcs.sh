@@ -14,7 +14,7 @@
 #     30 critic-only steps; value clip 0.2, 0.5 x value loss; critic weights 1/max(std of the prompt's rewards, 0.075)
 #     (beta 0.5 on the variance = inverse STD); four critic mini-batches per step; truncated responses masked from the
 #     actor only. Reward = judge score / 100 (the floor formula eps = range/(2 sqrt(n)) gives 0.088 for range 1, n 32).
-# Usage: [SMOKE=1] [SEED=42] [NUM_ROLLOUT] [EVAL_EVERY] [QOS] [TIME] [NICE] [DEP=<jid>] [MODEL=<hf dir>] [DRY=1] bash submit_fcs.sh
+# Usage: [SMOKE=1] [SEED=42] [VARIANT] [SAVE_EVERY] [NUM_ROLLOUT] [EVAL_EVERY] [QOS] [TIME] [NICE] [DEP=<jid>] [MODEL=<hf dir>] [DRY=1] bash submit_fcs.sh
 #   SMOKE=1: 3 rollouts of 4 prompts x 8 samples (rollout 0 critic-only), 1-rollout lr warmup (Megatron asserts
 #     warmup < total steps; smoke 14850360 died on 20 > 3), 4096-token answers, then a val eval
 #     (1 sample each), on pli-cp, ~1 h: checks the critic + actor + judge pipeline, not 32k memory.
@@ -35,17 +35,19 @@ SEED=${SEED:-42}
 TAG=$(basename $MODEL | tr 'A-Z.' 'a-z_' | sed 's/^qwen3_5-9b/q9b/')
 if [ -n "${SMOKE:-}" ]; then
   R=fcs_easyppo_smoke_$TAG; NR=${NUM_ROLLOUT:-3}; RB=4; NS=8; GBS=32; CGBS=8; LEN=4096; CO=1; WU=0; EV=${EVAL_EVERY:-$NR}; EN=1
+  SAVE=$NR
   QOS=${QOS:-pli-cp}; TIME=${TIME:-01:30:00}
   extra=(--skip-eval-before-train)
 else
-  R=fcs_easyppo_${TAG}_s$SEED; NR=${NUM_ROLLOUT:-200}; RB=16; NS=32; GBS=512; CGBS=128; LEN=32768; CO=30; WU=0
-  EV=${EVAL_EVERY:-10}; EN=5; QOS=${QOS:-pli-short}; TIME=${TIME:-24:00:00}
+  # VARIANT names a fresh run (e.g. lastblock: the runs restarted under the last-code-block rule, 2026-10-04)
+  R=fcs_easyppo${VARIANT:+_$VARIANT}_${TAG}_s$SEED; NR=${NUM_ROLLOUT:-200}; RB=16; NS=32; GBS=512; CGBS=128; LEN=32768
+  CO=30; WU=0; EV=${EVAL_EVERY:-10}; SAVE=${SAVE_EVERY:-5}; EN=5; QOS=${QOS:-pli-short}; TIME=${TIME:-24:00:00}
   extra=(--use-wandb --wandb-mode offline --wandb-dir $B/runs/$R --wandb-project fcs_easyppo
          --wandb-group $R --wandb-run-id $R --disable-wandb-random-suffix)
 fi
 CK=$B/runs/$R/ckpt
 args=(--hf-checkpoint $SG --megatron-hf-checkpoint $MG --megatron-to-hf-mode bridge
-  --ref-load $MG --load $CK --save $CK --critic-load ${CK}_critic --critic-save ${CK}_critic --save-interval $EV
+  --ref-load $MG --load $CK --save $CK --critic-load ${CK}_critic --critic-save ${CK}_critic --save-interval $SAVE
   --custom-megatron-post-save-hook-path miles_team.ckpt_rotate.keep_latest
   --prompt-data $D/fcs_train200.jsonl --input-key prompt --label-key label --apply-chat-template --rollout-shuffle
   --custom-rm-path miles_team.fcs_rm.fcs_rm
