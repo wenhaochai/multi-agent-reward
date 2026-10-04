@@ -7,8 +7,7 @@ Code block rule (2026-10-04, user decision): the LAST ```cpp block is judged (FC
 LiveCodeBench, open-r1, rllm/DeepCoder and verl. Frontier-CS's official harness and FrontierSmith take the LONGEST
 block (FCS_EXTRACT=longest; Frontier-CS d5185d23, 2025-12-10, "likely the main solution"); on the SFT init's
 multi-block answers the longest is usually the first draft (149 of 203) and the last block scores 4.88 vs 1.29.
-For val problems the official (longest) score is also written to <run>/val_official.jsonl whenever the two rules pick
-different code, so val can be reported both ways.
+Every comparison is against our own single-agent baseline under the same rule, so no second (official) score is kept.
 Every FCS_RM_TRACE_EVERY-th judged sample (default 32; 0 = off) is written in full to <run>/traces/solo_<pid>.jsonl
 (<run> = the parent of --save): response, finish reason, extracted code, status, score; tools/read_traces.py reads it.
 """
@@ -116,30 +115,9 @@ def _trace(args, sample, reward: float) -> None:
         print(f"[fcs_rm] trace failed: {e}"[:300], file=sys.stderr, flush=True)
 
 
-def _val_official(args, sample, reward: float) -> None:
-    """Val problems only: when the official (longest-block) rule picks other code than the rule in use, judge it too
-    and write both scores to <run>/val_official.jsonl (logging only; the reward is unchanged)."""
-    try:
-        from miles_team.fcs_judge import FCS_ROOT
-        from pathlib import Path
-        if not getattr(args, "save", None) or not Path(sample.label).resolve().is_relative_to(FCS_ROOT.resolve()):
-            return
-        resp = sample.response or ""
-        code, off = extract_cpp(resp), extract_cpp(resp, "longest")
-        official = reward if off == code else (judge_full(sample.label, off)["score"] if off else 0.0)
-        d = os.path.dirname(os.path.abspath(args.save))
-        with open(os.path.join(d, "val_official.jsonl"), "a") as f:
-            f.write(json.dumps({"time": round(time.time(), 1), "label": sample.label, "reward": reward,
-                                "official": official, "same_code": off == code}) + "\n")
-    except Exception as e:
-        print(f"[fcs_rm] val_official failed: {e}"[:300], file=sys.stderr, flush=True)
-
-
 async def _one(sample, args=None) -> float:
     async with _sem():
         reward = await asyncio.to_thread(score, sample.response or "", sample.label)
-        if args is not None and EXTRACT != "longest":
-            await asyncio.to_thread(_val_official, args, sample, reward)
         if args is not None and _TRACE_EVERY:
             await asyncio.to_thread(_trace, args, sample, reward)
         return reward
