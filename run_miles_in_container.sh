@@ -22,6 +22,11 @@ export PYTHONPATH=$B/pyfix:$MEGATRON:$MILES:$B${PYTHONPATH:+:$PYTHONPATH}
 export PYTHONUNBUFFERED=1 CUDA_DEVICE_MAX_CONNECTIONS=1 MASTER_ADDR=127.0.0.1 no_proxy=127.0.0.1,localhost
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 RAY_USAGE_STATS_ENABLED=0
 export NCCL_NVLS_ENABLE=$(nvidia-smi topo -m 2>/dev/null | grep -c 'NV[0-9]' | awk '{print ($1 > 0) ? 1 : 0}')
+# runs/<run>/extra_env: KEY=VALUE lines ('#' ignored), exported before `ray start` so every Ray worker sees them (e.g.
+# FCS_EXTRACT=longest pins a run that started under the old code-block rule)
+if [ -f "$RUN_DIR/extra_env" ]; then
+  while IFS= read -r kv; do case "$kv" in ''|'#'*) ;; *) export "$kv"; echo "[miles-run] extra env: $kv" ;; esac; done < "$RUN_DIR/extra_env"
+fi
 echo "[miles-run] $(date -u +%FT%TZ) host=$(hostname) job=$SLURM_JOB_ID run=$RUN_NAME miles=$MILES sha=$(git -C "$MILES" rev-parse --short HEAD) megatron=$MEGATRON"
 # every segment imports the live trees at start: record exactly which code it ran (uncommitted files counted)
 echo "[miles-run] code: miles $(git -C "$MILES" rev-parse --short HEAD) dirty=$(git -C "$MILES" status --porcelain 2>/dev/null | wc -l)" \
