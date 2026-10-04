@@ -189,7 +189,11 @@ final_text = [c[1] for c in CALLS if c[0] == "final"][0]
 assert "Programs tested: 1 (scores in order: 37.50)\nBest tested program (test 1): done, score 37.50/100" in final_text
 assert "Per-test-case scores: 0.00 1.00 0.00 0.50" in final_text and "Report:\nsee my code" in final_text
 assert "Task: Try E." in final_text and "<task 1>Try greedy A.</task>" in final_text
-print(f"[ok] team episode: {len(real)} real samples, groups {[o.group_index for o in real]}")
+args.variable_rollout_samples = 1440  # miles takes any count: no pads at all
+out_v = play(plan=[(PLAN_TXT, "stop")], sub=SUBS, final=[(cpp("int main(){D;}"), "stop")])
+args.variable_rollout_samples = None
+assert len(out_v) == 10 and not any(o.metadata.get("fo_pad") for o in out_v)
+print(f"[ok] team episode: {len(real)} real samples, groups {[o.group_index for o in real]}; no pads when variable")
 
 # 3b) best test shown and adopted; an ideas-only subagent; a report reply with code is not judged
 out = play(plan=[(PLAN_TXT, "stop")],

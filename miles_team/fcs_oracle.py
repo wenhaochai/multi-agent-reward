@@ -30,8 +30,8 @@ Rewards (MA_FO_REWARD; s = a judged score in [0, 1]):
   par   shared  max_t s_t;  indiv  s_t (plain single-agent RL);  diff  V - max_{i!=t} s_i
 
 Training returns one sample per agent turn (a turn that string-extends its session's previous turn shares that
-segment), padded with masked stand-ins to a fixed count per episode (team 2 + SUBS x (SUB_TESTS + 1), seq/par
-MA_FO_ROUNDS). Critic groups: 8 g + role (team: plan 0, final 1, every subagent turn 2; seq: round t; par: 0;
+segment). With miles --variable-rollout-samples the trainers take any count; without it the episode is padded with
+masked 2-token stand-ins to a fixed count (team 2 + SUBS x (SUB_TESTS + 1), seq/par MA_FO_ROUNDS). Critic groups: 8 g + role (team: plan 0, final 1, every subagent turn 2; seq: round t; par: 0;
 padding 7). A training episode in which a judge call failed for infrastructure reasons is aborted (miles resubmits
 the group). Every real sample carries fo = the episode record (game, scores, role) so post_process recomputes the
 arm's reward (identity live; relabels rollouts replayed by miles --replay-rollout-data). Eval returns the sample of
@@ -544,7 +544,9 @@ def _pack(input, turns, game: str, rec: dict, info: dict) -> GenerateFnOutput:
         seg.reward, seg.rollout_id, seg.group_index = float(r[role]), rollout_id, 8 * g + _role_group(game, role)
         seg.metadata = {**(seg.metadata or {}), "fo_role": role, "fo": {**rec, "role": role}}
     assert len(samples) <= n_samples(game), (len(samples), n_samples(game))
-    while len(samples) < n_samples(game):
+    # with miles --variable-rollout-samples the trainers split whatever a rollout returns into fixed steps: no pads
+    target = len(samples) if getattr(input.state.args, "variable_rollout_samples", None) else n_samples(game)
+    while len(samples) < target:
         p = _pad_sample(real[0])
         p.tokens = [p.tokens[0], p.tokens[-1]]  # a 2-token stand-in: one prompt token and one masked response token
         p.reward, p.rollout_id, p.group_index = 0.0, rollout_id, 8 * g + 7

@@ -18,13 +18,13 @@
 # Shared value pretraining: PRETRAIN=1 runs the 10 critic-only rollouts of GAME once (runs/fcs_vp_oracle_<game>_...),
 #   dumped; VP=1 VP_DEP=<its jid> makes an arm replay them, relabeled with its reward (fcs_oracle.post_process).
 # Usage: GAME=... REWARD=... [SUB_TESTS=3] [SEED=42] [NUM_ROLLOUT] [EVAL_EVERY] [N_EVAL] [BUDGET] [MODEL] [SMOKE=1] [PRETRAIN=1]
-#        [VP=1 VP_DEP=jid] [QOS] [TIME] [DEP] [NICE] [DRY=1] bash submit_fcs_oracle.sh
+#        [VP=1 VP_DEP=jid] [QOS] [TIME] [DEP] [NICE] [MILES_SRC=<worktree>] [EXTRA_ARGS="..."] [DRY=1] bash submit_fcs_oracle.sh
 #   SMOKE=1: 2 rollouts of 2 prompts x 1 episode, 4096-token turns, 16-problem val sets of the game at the end.
 set -euo pipefail
 B=/scratch/gpfs/GROUP/USER/project/miles-q38-build
 W=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace
 D=$B/data
-MILES_SRC=/scratch/gpfs/GROUP/USER/project/miles-easyppo
+MILES_SRC=${MILES_SRC:-/scratch/gpfs/GROUP/USER/project/miles-easyppo}  # the miles worktree the job imports
 MODEL=${MODEL:-$W/models/Qwen3.5-9B-FCS-SFT}
 MG=$MODEL-text; SG=$MODEL-lm
 for d in $MG $SG; do [ -f $d/config.json ] || { echo "missing $d: run tools/make_qwen35_text_ckpts.py $MODEL" >&2; exit 1; }; done
@@ -119,6 +119,8 @@ args=(--hf-checkpoint $SG --megatron-hf-checkpoint $MG --megatron-to-hf-mode bri
   --attention-dropout 0.0 --hidden-dropout 0.0 --update-weight-buffer-size 536870912
   --actor-num-nodes 1 --actor-num-gpus-per-node 8 --colocate --seed $SEED --rollout-seed $SEED)
 sb=(); [ -n "${NICE:-}" ] && sb=(--nice="$NICE")
+# EXTRA_ARGS: whitespace-separated flags appended last (argparse: the last occurrence wins), e.g. replay or test flags
+[ -n "${EXTRA_ARGS:-}" ] && read -r -a _xa <<< "$EXTRA_ARGS" && args+=("${_xa[@]}")
 dep=(); [ -n "${DEP:-}" ] && dep+=(afterany:"$DEP"); [ -n "${VP_DEP:-}" ] && dep+=(afterok:"$VP_DEP")
 [ ${#dep[@]} -gt 0 ] && sb+=(--dependency=$(IFS=,; echo "${dep[*]}"))
 [ -n "${VP:-}" ] && [ -z "${VP_DEP:-}" ] && [ ! -f $B/runs/$VPR/rollout_data/$((CO - 1)).pt ] && {
