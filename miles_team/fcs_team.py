@@ -241,7 +241,11 @@ async def _play(input: GenerateFnInput) -> GenerateFnOutput:
     _write_trace({"time": round(time.time(), 1), "eval": input.evaluation, "arm": REWARD, "label": label,
                   "S": S, "s": s, "adopted": adopted, "r_lead": r_lead, "r_mates": r_mates,
                   "mate_status": [r["status"] for r in mate_res], "lead_status": lead_res["status"],
-                  "lead_visible": (strip_think(ltext) or "")[-3000:], "codes": [c[:3000] for c in codes]})
+                  "lead_visible": (strip_think(ltext) or "")[-3000:], "codes": [c[:3000] for c in codes],
+                  # full texts (reasoning included) and cut flags: a "compile error" can be a cut-off answer whose
+                  # reasoning text the FrontierSmith fallback hands to the compiler
+                  "lead_cut": bool(lcut), "mate_cut": [bool(c) for _, _, c in mate_runs], "lead_text": ltext or "",
+                  "mate_texts": [t or "" for _, t, _ in mate_runs]})
 
     if input.evaluation:
         return _single(input, lead, S, info)

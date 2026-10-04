@@ -204,6 +204,21 @@ assert out[0].metadata["fo_plan_cut"] == 1.0 and out[0].metadata["fo_tasks_ok"] 
 assert "(cut off: the answer hit the token limit)" in final_text
 print("[ok] cut plan / cut subagent")
 
+# 5b) the trace file keeps every turn's full text, cut flag and judged status
+import glob, json  # noqa: E402
+_td = tempfile.mkdtemp()
+O.TRACE_DIR, O.TRACE_EVERY, O._trace_count = _td, 1, 0
+play(plan=[("still thinking " * 30, "length")], sub=[SUBS[0], ("x " * 50, "length"), SUBS[2], SUBS[3]],
+     final=[(cpp("int main(){A;}"), "stop")])
+O.TRACE_DIR = ""
+tr = [json.loads(l) for f in glob.glob(_td + "/*.jsonl") for l in open(f)][-1]
+roles = [t["role"] for t in tr["turns"]]
+assert roles == ["plan", "sub1", "sub2", "sub3", "sub4", "final"], roles
+assert tr["turns"][0]["cut"] and not tr["turns"][0]["closed_think"] and tr["turns"][0]["text"].count("still thinking") == 30
+assert tr["turns"][2]["cut"] and tr["turns"][2]["status"] == "no code" and not tr["turns"][1]["cut"]
+assert tr["turns"][5]["closed_think"] and "int main(){A;}" in tr["turns"][5]["text"] and tr["turns"][0]["tasks"]
+print("[ok] trace keeps full texts, cut flags and statuses")
+
 # 6) seq (shared): 5 rounds in one chat, each round sees its result, per-case scores and the best so far
 O.GAME = "seq"
 out = play(solo=[(cpp("int main(){A;}"), "stop")],

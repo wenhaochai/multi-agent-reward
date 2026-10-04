@@ -184,6 +184,13 @@ async def _turn(sess: Session, messages: list, budget: int) -> tuple[str, bool, 
     return text, cut, (len(sess.segments) - 1 if _gen(sess) > before else -1)
 
 
+def _tt(role: str, text: str, cut: bool, res: dict | None, **extra) -> dict:
+    """One turn for the trace file: the full text (reasoning included), whether it was cut, and how it was judged."""
+    return {"role": role, "cut": bool(cut), "closed_think": "</think>" in (text or ""),
+            "status": res["status"] if res else None, "score": res["score"] if res else None,
+            "text": text or "", **extra}
+
+
 def _visible(text: str, cut: bool) -> str:
     """What an agent's earlier turn shows in later context: its answer without the reasoning."""
     return "(cut off: the answer hit the token limit)" if cut else (strip_think(text) or "").strip() or "(empty)"
@@ -226,7 +233,7 @@ async def _play(input: GenerateFnInput) -> GenerateFnOutput:
     V = max(rec["s"] + ([rec["S"]] if game == "team" else []))
     info = {**info, "fo_V": V, "fo_game_" + game: 1.0}
     _write_trace({"time": round(time.time(), 1), "eval": input.evaluation, "game": game, "arm": REWARD,
-                  "label": label, **rec, "V": V, "texts": [(strip_think(t) or "")[-2000:] for t in texts]})
+                  "label": label, **rec, "V": V, "turns": texts})
     if input.evaluation:  # the episode's last submission (team: the lead's final), scored V
         sess, seg_i = turns[1] if game == "team" else turns[-1]
         if seg_i >= 0:
@@ -283,7 +290,10 @@ async def _team(input, messages, label):
             "fo_judge_infra_error": float(fres["infra_error"] or any(r["infra_error"] for r in res))}
     # turns in reward order: plan, final, sub_1..sub_n (session, segment index or -1)
     turns = [(lead, pseg), (lead, fseg)] + [(subs[j], runs[j][2]) for j in range(n)]
-    return turns, rec, info, [ptext] + [t for t, _, _ in runs] + [ftext]
+    trace = ([_tt("plan", ptext, pcut, None, tasks=tasks)]
+             + [_tt(f"sub{j + 1}", runs[j][0], runs[j][1], res[j]) for j in range(n)]
+             + [_tt("final", ftext, fcut, fres)])
+    return turns, rec, info, trace
 
 
 async def _seq(input, messages, label):
@@ -296,7 +306,7 @@ async def _seq(input, messages, label):
         res = await judge_code(label, code)
         s.append(res["score"])
         turns.append((sess, seg))
-        texts.append(text)
+        texts.append(_tt(f"round{t + 1}", text, cut, res))
         cut_n, bad, infra = cut_n + cut, bad + _bad(res), infra or res["infra_error"]
         best = max(best, res["score"])
         v_at.append(best)
@@ -324,7 +334,8 @@ async def _par(input, messages, label):
             "fo_bad": sum(_bad(r) for r in res) / ROUNDS, "fo_tokens": sum(gen), "fo_latency": max(gen),
             **{f"fo_V_at{t + 1}": max(s[: t + 1]) for t in range(ROUNDS)},
             "fo_judge_infra_error": float(any(r["infra_error"] for r in res))}
-    return [(sessions[t], runs[t][2]) for t in range(ROUNDS)], rec, info, [t for t, _, _ in runs]
+    trace = [_tt(f"try{t + 1}", runs[t][0], runs[t][1], res[t]) for t in range(ROUNDS)]
+    return [(sessions[t], runs[t][2]) for t in range(ROUNDS)], rec, info, trace
 
 
 def n_samples(game: str) -> int:
