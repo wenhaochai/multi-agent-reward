@@ -19,6 +19,8 @@ rows = sorted((json.loads(l) for f in glob.glob(str(d / "traces" / "*.jsonl")) f
 
 def turns(r):
     """(role, text, cut, status) per agent turn; text None when the trace predates full texts."""
+    if "reward" in r and "text" in r:  # solo EasyPPO (fcs_rm)
+        return [("solo", r["text"], r["truncated"], r["status"])]
     if "turns" in r:
         return [(t["role"], t["text"], t["cut"], t["status"]) for t in r["turns"]]
     if "lead_text" in r:
@@ -42,9 +44,9 @@ def kind(text, cut, status):
     return {"compile error": "compile error", "done": "judged"}.get(status, status)
 
 
-tr = [r for r in rows if not r["eval"]]
+tr = [r for r in rows if not r.get("eval")]
 print(f"{d.name}: {len(tr)} train traces, {len(rows) - len(tr)} eval traces")
-for name, part in (("first half", tr[: len(tr) // 2]), ("second half", tr[len(tr) // 2:]), ("eval", [r for r in rows if r["eval"]])):
+for name, part in (("first half", tr[: len(tr) // 2]), ("second half", tr[len(tr) // 2:]), ("eval", [r for r in rows if r.get("eval")])):
     if not part:
         continue
     by = collections.defaultdict(collections.Counter)
