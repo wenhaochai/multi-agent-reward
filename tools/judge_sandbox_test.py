@@ -107,6 +107,8 @@ run = lambda n: int(subprocess.run([str(work / "t"), str(n)], capture_output=Tru
 # engine, every new thread reserves the whole address space and no thread starts at all)
 few, many = run(8), run(400)
 check("a program may start a few threads", few == 8, str(few))
-check("a program cannot start ~400 threads (procLimit ~128)", 0 < many <= J.NPROC_MARGIN + 8, str(many))
+# the limit is the user's task count + 128 at count time (5 s cache): tasks of the same user that exit in between give
+# the program more room, so on a busy node the bound is loose; the point is that 400 cannot all start
+check("a program cannot start ~400 threads (procLimit ~128)", 0 < many < 300, str(many))
 
 print("ALL OK" if not fails else f"FAILED: {fails}")

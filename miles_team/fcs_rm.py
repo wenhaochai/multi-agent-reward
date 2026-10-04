@@ -120,19 +120,19 @@ def judge_full(problem_dir: str, code: str) -> dict:
     from pathlib import Path
     n = len(load_problem(Path(problem_dir))["cases"])
     if not code:
-        return {"score": 0.0, "cases": [0.0] * n, "status": "no code", "infra_error": False}
+        return {"score": 0.0, "cases": [0.0] * n, "status": "no code", "infra_error": False, "msg": ""}
     try:
         r = judge(problem_dir, code)
     except Exception as e:
         print(f"[fcs_rm] JUDGE-ERROR {problem_dir}: {e}"[:500], file=sys.stderr, flush=True)
-        return {"score": 0.0, "cases": [0.0] * n, "status": "judge error", "infra_error": True}
+        return {"score": 0.0, "cases": [0.0] * n, "status": "judge error", "infra_error": True, "msg": ""}
     cases = r.get("cases") or [0.0] * n
     infra = bool(r.get("infra")) or r.get("status") == "infra error"
     if infra:
         print(f"[fcs_rm] JUDGE-INFRA {problem_dir}: {r.get('status')} {(r.get('msg') or '')[-200:]}"[:500],
               file=sys.stderr, flush=True)
     return {"score": r["score"] / 100.0, "cases": [float(c) for c in cases], "status": r["status"],
-            "infra_error": infra}
+            "infra_error": infra, "msg": r.get("msg", "") if r["status"] == "compile error" else ""}
 
 
 async def judge_code(problem_dir: str, code: str) -> dict:

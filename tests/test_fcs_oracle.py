@@ -67,7 +67,10 @@ async def fake_judge(problem_dir, code):
     c = code.strip()
     cases = CASES.get(c, [0.0] * 4)
     status = "done" if c in CASES else ("no code" if not code else "compile error")
-    return {"score": sum(cases) / len(cases), "cases": cases, "status": status, "infra_error": False}
+    msg = ("/tmp/fcsj_x/sol.cpp: In function 'int main()':\n/tmp/fcsj_x/sol.cpp:1:12: error: 'X' was not declared in "
+           "this scope\n    1 | int main(){X;}\n      |            ^\n/usr/include/c++/13/bits/stl_algo.h:9:1: note: "
+           "candidate: template<...>\n" + "  required from here\n" * 50) if status == "compile error" else ""
+    return {"score": sum(cases) / len(cases), "cases": cases, "status": status, "infra_error": False, "msg": msg}
 
 
 TR.post = fake_post
@@ -219,6 +222,22 @@ assert tr["turns"][2]["cut"] and tr["turns"][2]["status"] == "no code" and not t
 assert tr["turns"][5]["closed_think"] and "int main(){A;}" in tr["turns"][5]["text"] and tr["turns"][0]["tasks"]
 print("[ok] trace keeps full texts, cut flags and statuses")
 
+# 5c) a compile error shows every compiler error (path shortened, source line and caret), without notes
+out = play(game=None, plan=[(PLAN_TXT, "stop")], sub=[(cpp("int main(){X;}"), "stop"), SUBS[1], SUBS[2], SUBS[3]],
+           final=[(cpp("int main(){A;}"), "stop")])
+final_text = [c[1] for c in CALLS if c[0] == "final"][0]
+assert ("Result: compile error, score 0.00/100\nCompiler errors:\nsol.cpp:1:12: error: 'X' was not declared in this "
+        "scope\n    1 | int main(){X;}\n      |            ^\nPer-test-case") in final_text, final_text[-900:]
+assert "note:" not in final_text and "required from here" not in final_text and "/tmp/fcsj" not in final_text
+# the real judge on a real compile error
+from miles_team.fcs_rm import judge_full  # noqa: E402
+from miles_team.fcs_judge import FCS_ROOT  # noqa: E402
+r = judge_full(str(FCS_ROOT / "problems" / "0"), "#include <vector>\nint main(){ std::vector<int> v; v.push(1); "
+               "return y; }\n")
+shown = O.fmt_result(r)
+assert r["status"] == "compile error" and shown.count(" error: ") == 2 and "sol.cpp:2:" in shown and "^" in shown, shown
+print("[ok] compile errors in the feedback:\n" + shown)
+
 # 6) seq (shared): 5 rounds in one chat, each round sees its result, per-case scores and the best so far
 O.GAME = "seq"
 out = play(solo=[(cpp("int main(){A;}"), "stop")],
@@ -229,7 +248,7 @@ assert all(close(o.reward, 1.0) for o in out)
 m = out[0].metadata
 assert [round(m[f"fo_V_at{t}"], 4) for t in range(1, 6)] == [sA, sA, sB, 1.0, 1.0] and close(m["fo_S"], sE)
 rev = [c[1] for c in CALLS if c[0] == "revise"]
-assert "Your submission was judged: done, score 37.50/100." in rev[0] and "0.50 0.50 0.00 0.00" in rev[1]
+assert "Your submission was judged: done, score 37.50/100\n" in rev[0] and "0.50 0.50 0.00 0.00" in rev[1]
 assert "best score so far is 37.50/100" in rev[1] and "```cpp\nint main(){A;}\n```" in rev[0]
 assert "thinking..." not in rev[0].split("Your submission was judged")[0].split("<|im_start|>assistant")[-1]
 print(f"[ok] seq: 5 samples, groups {[o.group_index for o in out]}, V@t {[round(m[f'fo_V_at{t}'], 3) for t in range(1, 6)]}")

@@ -373,7 +373,7 @@ def judge(problem_dir, source: str, case_workers: int = CASE_WORKERS) -> dict:
         if r.returncode != 0:
             infra = r.returncode < 0 or any(m in r.stderr for m in _INFRA_MARKERS)
             return {"score": 0.0, "status": "infra error" if infra else "compile error", "cases": [],
-                    "msg": r.stderr[-1000:], "infra": infra}
+                    "msg": r.stderr[:1 << 21], "infra": infra}  # whole compiler output (up to 2 MiB)
         helper = _compile_helper(prob["dir"], prob["interactor"] if prob["interactive"] else prob["checker"])
         fn = _case_interactive if prob["interactive"] else _case_classic
         with ThreadPoolExecutor(max_workers=max(1, case_workers)) as ex:

@@ -83,7 +83,7 @@ FEEDBACK = (
 SUB_BLOCK = "### Subagent {j}\nTask: {task}\nResult: {result}\nPer-test-case scores: {cases}\n```cpp\n{code}\n```"
 SUB_NONE = "### Subagent {j}\nTask: {task}\nResult: no code (the answer was cut off or contained no program), score 0"
 REVISE = (
-    "Your submission was judged: {result}.\nPer-test-case scores (fractions of full marks): {cases}\nYour best score "
+    "Your submission was judged: {result}\nPer-test-case scores (fractions of full marks): {cases}\nYour best score "
     "so far is {best:.2f}/100. Write an improved solution. Output ONLY the C++ code wrapped in ```cpp and ```."
 )
 _SPECIAL = ("<|im_end|>", "<|endoftext|>", "<|im_start|>")  # Session decodes with special tokens kept
@@ -114,8 +114,31 @@ def fmt_cases(cases: list[float]) -> str:
     return s + (f" ... ({len(cases)} cases)" if len(cases) > MAX_CASES else "") if cases else "(none)"
 
 
+_PATH_RE = re.compile(r"^\S*?sol\.cpp:")
+
+
+def compile_errors(msg: str) -> str:
+    """Every error of a g++/ld run, as an online judge shows it: each `error:` line (path shortened to sol.cpp) with
+    the source line and caret g++ prints under it; `note:` lines and template-instantiation context are dropped (the
+    whole output reaches 133k tokens, the errors alone at most ~1.5k on the SFT model's programs)."""
+    out, lines = [], (msg or "").splitlines()
+    for i, l in enumerate(lines):
+        if " error: " in l or "fatal error:" in l or "undefined reference" in l:
+            out.append(_PATH_RE.sub("sol.cpp:", l))
+            for nxt in lines[i + 1:i + 3]:  # "   12 |     code" and "      |     ^~~"
+                if re.match(r"^\s*\d*\s*\|", nxt):
+                    out.append(nxt)
+                else:
+                    break
+    return "\n".join(out)
+
+
 def fmt_result(res: dict) -> str:
-    return f"{res['status']}, score {100 * res['score']:.2f}/100"
+    head = f"{res['status']}, score {100 * res['score']:.2f}/100"
+    if res["status"] == "compile error":
+        errs = compile_errors(res.get("msg", ""))
+        return head + ("\nCompiler errors:\n" + errs if errs else "")
+    return head
 
 
 def rewards(game: str, arm: str, rec: dict) -> list[float]:
