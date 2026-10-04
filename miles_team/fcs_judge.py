@@ -113,6 +113,12 @@ def _compile_helper(pdir: Path, src_name: str) -> Path:
     return exe
 
 
+# checkers and interactors are trusted problem code: official go-judge gives them no address-space limit; RLIMIT_AS
+# 256 MiB broke val problem 23 (its checker has 214 MiB of static data: bad_alloc on 16 of 22 cases, every program
+# capped at 27.27; audit 2026-10-04). 2 GiB only guards the node.
+TRUSTED_AS = 2 << 30
+
+
 def _limits(cpu_s: float, mem_b: int | None):
     def f():
         os.setsid()
@@ -156,7 +162,7 @@ def _case_classic(prob, sol: Path, chk: Path, case, work: Path) -> float:
         return 0.0, f"run: code={code} cpu={cpu:.2f}/{tl} killed={killed}"
     ans = td / outp if (td / outp).exists() else td / outp.replace(".ans", ".out")
     r = subprocess.run([str(chk), str(td / inp), str(out), str(ans)], capture_output=True, text=True,
-                       errors="replace", preexec_fn=_limits(10, 256 << 20), timeout=20)
+                       errors="replace", preexec_fn=_limits(10, TRUSTED_AS), timeout=20)
     ok = r.returncode == OK_EXIT
     msg = r.stdout or r.stderr or ""
     m = _RATIO.search(msg) if r.returncode in (OK_EXIT, POINTS_EXIT) else None
@@ -172,7 +178,7 @@ def _case_interactive(prob, sol: Path, inter: Path, case, work: Path) -> float:
     i2s_r, i2s_w = os.pipe()
     err = open(work / f"{inp}.ierr", "w+b")
     pi = subprocess.Popen([str(inter), str(td / inp), str(work / f"{inp}.tout"), str(ans)], stdin=s2i_r, stdout=i2s_w,
-                          stderr=err, cwd=work, preexec_fn=_limits(4 * tl, 4 * ml))
+                          stderr=err, cwd=work, preexec_fn=_limits(4 * tl, max(4 * ml, TRUSTED_AS)))
     ps = subprocess.Popen([str(sol)], stdin=i2s_r, stdout=s2i_w, stderr=subprocess.DEVNULL, cwd=work,
                           preexec_fn=_limits(tl, ml))
     for fd in (s2i_r, s2i_w, i2s_r, i2s_w):

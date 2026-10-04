@@ -71,6 +71,10 @@ def main():
                     futs.append(pool.submit(score_one, rec))
                 print(f'gen {c + len(part)}/{len(rest)}: {ntok / (time.time() - t0):.0f} tok/s, '
                       f'{sum(f.done() for f in futs)}/{len(futs)} judged', flush=True)
+        # finish every judge first: sglang's Engine.shutdown kills this process's whole child tree, including in-flight
+        # g++ / solutions / checkers, which then score as compile errors (3 SFT train samples did; audit 2026-10-04)
+        for f in futs:
+            f.exception()
         eng.shutdown()
     with open(sc_f, 'a') as sf:
         for f in futs:
