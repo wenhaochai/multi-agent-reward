@@ -1,4 +1,4 @@
-"""Checks of miles_team/fcs_judge_next.py (audit 2026-10-04): Landlock is active; untrusted code cannot read test
+"""Checks of miles_team/fcs_judge.py (audit 2026-10-04): Landlock is active; untrusted code cannot read test
 answers (neither by #include at compile time nor by fopen at run time), other processes' environments, or write to
 scratch; ratio parsing (val: the official regex, train: full float clamped to [0, 1]); an interactive-program MLE is
 scored from the peak RSS. Run in miles.sif:  python3 tools/judge_sandbox_test.py
@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import miles_team.fcs_judge_next as J  # noqa: E402
+import miles_team.fcs_judge as J  # noqa: E402
 
 VAL0 = J.FCS_ROOT / "problems" / "0"
 ANS = sorted((VAL0 / "testdata").glob("*.ans"))[0]
