@@ -1,7 +1,9 @@
 """Difficulty probe of a model on the Frontier-CS study data: sample with SGLang (EasyPPO's eval settings: T 1.0,
 top-p 1.0, 32768 new tokens, default chat template; THINKING=0 turns thinking off), score each response with miles_team.fcs_judge, write every record
 incrementally (gen.jsonl, scores.jsonl; a rerun skips what is done) and a summary.
-usage: python fcs_probe.py MODEL OUTDIR SPEC... where SPEC = name:path.jsonl:n_samples"""
+usage: python fcs_probe.py MODEL OUTDIR SPEC... where SPEC = name:path.jsonl:n_samples
+Prompt variants: PROMPT_FILE=<json {"system": str, "user_suffix": str}> adds a system message and/or appends text to
+the user message; TEMP sets the temperature (default 1.0)."""
 import json, os, sys, time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -12,6 +14,19 @@ from miles_team.fcs_judge import CASE_WORKERS, judge
 from miles_team.fcs_rm import extract_cpp
 
 MAX_NEW, CHUNK = int(os.environ.get('MAX_NEW', 32768)), int(os.environ.get('CHUNK', 256))
+
+
+_PV = json.load(open(os.environ['PROMPT_FILE'])) if os.environ.get('PROMPT_FILE') else {}
+
+
+def variant(messages):
+    """The prompt variant of PROMPT_FILE applied to a chat (system message first, suffix on the last user turn)."""
+    msgs = [dict(m) for m in messages]
+    if _PV.get('user_suffix'):
+        msgs[-1]['content'] = msgs[-1]['content'] + _PV['user_suffix']
+    if _PV.get('system'):
+        msgs = [{'role': 'system', 'content': _PV['system']}] + [m for m in msgs if m['role'] != 'system']
+    return msgs
 
 
 def load(p):
@@ -53,11 +68,11 @@ def main():
         tok = AutoTokenizer.from_pretrained(model)
         eng = sgl.Engine(model_path=model, dp_size=int(os.environ.get('DP', 8)), tp_size=1, mem_fraction_static=0.85,
                          log_level='warning')
-        sp = {'temperature': 1.0, 'top_p': 1.0, 'max_new_tokens': MAX_NEW}
+        sp = {'temperature': float(os.environ.get('TEMP', 1.0)), 'top_p': 1.0, 'max_new_tokens': MAX_NEW}
         with open(gen_f, 'a') as gf:
             for c in range(0, len(rest), CHUNK):
                 part, t0 = rest[c:c + CHUNK], time.time()
-                texts = [tok.apply_chat_template(t['prompt'], tokenize=False, add_generation_prompt=True,
+                texts = [tok.apply_chat_template(variant(t['prompt']), tokenize=False, add_generation_prompt=True,
                                                  enable_thinking=os.environ.get('THINKING', '1') == '1') for t in part]
                 res = eng.generate(prompt=texts, sampling_params=sp)
                 ntok = 0
