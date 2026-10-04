@@ -94,7 +94,8 @@ args=(--hf-checkpoint $SG --megatron-hf-checkpoint $MG --megatron-to-hf-mode bri
   --eval-prompt-data fcs_val $VT fcs_val_solo $VS --eval-interval $EV --n-samples-per-eval-prompt $EN
   --eval-temperature 1.0 --eval-top-p 1.0 --eval-max-prompt-len 8192 --eval-max-response-len $BUDGET
   --eval-max-context-len $MAXTOK "${extra[@]}"
-  # EasyPPO algorithm (submit_fcs.sh)
+  # EasyPPO algorithm as first ported, with the AIME config's upper clip 0.28, floor 0.25 and warmup (the blind-game arms
+  # ran with these; the paper's Frontier-CS values are 0.2 / 0.075 / no warmup, see submit_fcs.sh)
   --advantage-estimator ppo --gamma 1.0 --lambd 1.0 --normalize-advantages
   --eps-clip 0.2 --eps-clip-high 0.28 --eps-clip-c 3.0 --calculate-per-token-loss
   --use-kl-loss --kl-loss-coef 0.001 --kl-loss-type low_var_kl --kl-coef 0 --entropy-coef 0

@@ -7,13 +7,13 @@
 #     (miles_team/fcs_rm.py).
 #   EasyPPO paper, Frontier-CS: 16 prompts x 32 samples per step, 32768 response tokens, T 1.0, actor lr 1e-6,
 #     critic lr 2e-6, 200 updates (NUM_ROLLOUT; here 200 rollouts including the 30 critic-only ones).
-#   EasyPPO configs/easyppo_aime.yaml algorithm: GAE gamma = lambda = 1 with batch advantage whitening; clip 0.2/0.28,
-#     dual clip 3.0; token-mean losses; low_var_kl loss 0.001, no KL in reward, no entropy bonus; Adam (0.9, 0.999),
-#     weight decay 0.01, grad clip 1.0, constant lr with 20 warmup steps; 30 critic-only steps; value clip 0.2, 0.5 x
-#     value loss; critic weights 1/max(std of the prompt's rewards, 0.25) (beta 0.5); four critic mini-batches per
-#     step; truncated responses masked from the actor only.
-#   miles units: --lr-warmup-iters counts optimizer steps of the trainer's own global batch, so the actor (one step per
-#     rollout) takes 20 and the critic (four steps per rollout) 80; both warm up over 20 rollouts as in EasyPPO.
+#   EasyPPO algorithm, Frontier-CS column of the paper's Tables 1, 2 and 4 (the repo ships only configs/easyppo_aime.yaml,
+#     whose AIME values 0.28 / 0.25 / 20-step warmup the first runs carried by mistake; corrected 2026-10-04): GAE gamma =
+#     lambda = 1 with batch advantage whitening; clip 0.2/0.2, dual clip 3.0; token-mean losses; low_var_kl loss 0.001,
+#     no KL in reward, no entropy bonus; AdamW (0.9, 0.999), weight decay 0.01, grad clip 1.0, constant lr, NO warmup;
+#     30 critic-only steps; value clip 0.2, 0.5 x value loss; critic weights 1/max(std of the prompt's rewards, 0.075)
+#     (beta 0.5 on the variance = inverse STD); four critic mini-batches per step; truncated responses masked from the
+#     actor only. Reward = judge score / 100 (the floor formula eps = range/(2 sqrt(n)) gives 0.088 for range 1, n 32).
 # Usage: [SMOKE=1] [SEED=42] [NUM_ROLLOUT] [EVAL_EVERY] [QOS] [TIME] [NICE] [DEP=<jid>] [MODEL=<hf dir>] [DRY=1] bash submit_fcs.sh
 #   SMOKE=1: 3 rollouts of 4 prompts x 8 samples (rollout 0 critic-only), 1-rollout lr warmup (Megatron asserts
 #     warmup < total steps; smoke 14850360 died on 20 > 3), 4096-token answers, then a val eval
@@ -34,11 +34,11 @@ SEED=${SEED:-42}
 # the run name carries the init (--load = --save resumes): a base-model run's checkpoint must never seed an SFT run
 TAG=$(basename $MODEL | tr 'A-Z.' 'a-z_' | sed 's/^qwen3_5-9b/q9b/')
 if [ -n "${SMOKE:-}" ]; then
-  R=fcs_easyppo_smoke_$TAG; NR=${NUM_ROLLOUT:-3}; RB=4; NS=8; GBS=32; CGBS=8; LEN=4096; CO=1; WU=1; EV=${EVAL_EVERY:-$NR}; EN=1
+  R=fcs_easyppo_smoke_$TAG; NR=${NUM_ROLLOUT:-3}; RB=4; NS=8; GBS=32; CGBS=8; LEN=4096; CO=1; WU=0; EV=${EVAL_EVERY:-$NR}; EN=1
   QOS=${QOS:-pli-cp}; TIME=${TIME:-01:30:00}
   extra=(--skip-eval-before-train)
 else
-  R=fcs_easyppo_${TAG}_s$SEED; NR=${NUM_ROLLOUT:-200}; RB=16; NS=32; GBS=512; CGBS=128; LEN=32768; CO=30; WU=20
+  R=fcs_easyppo_${TAG}_s$SEED; NR=${NUM_ROLLOUT:-200}; RB=16; NS=32; GBS=512; CGBS=128; LEN=32768; CO=30; WU=0
   EV=${EVAL_EVERY:-10}; EN=5; QOS=${QOS:-pli-short}; TIME=${TIME:-24:00:00}
   extra=(--use-wandb --wandb-mode offline --wandb-dir $B/runs/$R --wandb-project fcs_easyppo
          --wandb-group easyppo --disable-wandb-random-suffix)
@@ -57,10 +57,10 @@ args=(--hf-checkpoint $SG --megatron-hf-checkpoint $MG --megatron-to-hf-mode bri
   --eval-max-context-len $((LEN + 8192)) "${extra[@]}"
   # EasyPPO algorithm
   --advantage-estimator ppo --gamma 1.0 --lambd 1.0 --normalize-advantages
-  --eps-clip 0.2 --eps-clip-high 0.28 --eps-clip-c 3.0 --calculate-per-token-loss
+  --eps-clip 0.2 --eps-clip-high 0.2 --eps-clip-c 3.0 --calculate-per-token-loss
   --use-kl-loss --kl-loss-coef 0.001 --kl-loss-type low_var_kl --kl-coef 0 --entropy-coef 0
   --num-critic-only-steps $CO --critic-global-batch-size $CGBS
-  --critic-variance-weighted-loss --critic-variance-weight-beta 0.5 --critic-variance-weight-min 0.25
+  --critic-variance-weighted-loss --critic-variance-weight-beta 0.5 --critic-variance-weight-min 0.075
   --actor-only-overlong-filter --value-clip 0.2 --value-loss-scale 0.5
   --optimizer adam --lr 1e-6 --critic-lr 2e-6 --lr-decay-style constant --lr-warmup-iters $WU
   --critic-lr-warmup-iters $((WU * GBS / CGBS)) --weight-decay 0.01 --adam-beta1 0.9 --adam-beta2 0.999 --clip-grad 1.0

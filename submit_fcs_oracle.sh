@@ -34,7 +34,7 @@ case $GAME in team) NS_FULL=5; PER=6; EVS=(team par) ;; seq) NS_FULL=6; PER=5; E
 if [ -n "${SMOKE:-}" ]; then
   # batch and critic batch must divide by DP 2: team 2 x 1 x 6 = 12 (critic 6), seq/par 2 x 2 x 5 = 20 (critic 10)
   R=fcs_oracle_smoke_${GAME}_${REWARD}_$TAG; NR=${NUM_ROLLOUT:-2}; RB=2; NS=$([ "$GAME" = team ] && echo 1 || echo 2); NVAL=16
-  BUDGET=${BUDGET:-4096}; PLAN=2048; CO=1; WU=1; EV=${EVAL_EVERY:-$NR}; SAVE=$NR; EN=${N_EVAL:-1}; CGBS=$((RB * NS * PER / 2))
+  BUDGET=${BUDGET:-4096}; PLAN=2048; CO=1; WU=0; EV=${EVAL_EVERY:-$NR}; SAVE=$NR; EN=${N_EVAL:-1}; CGBS=$((RB * NS * PER / 2))
   QOS=${QOS:-pli-short}; TIME=${TIME:-01:30:00}
   extra=(--skip-eval-before-train)
 else
@@ -42,7 +42,7 @@ else
   # PLAN 16384: the plan turn thinks first (the SFT model averages ~16.5k tokens per solve), and a cut plan gives
   # every subagent NO_TASK and is masked from the actor (audit 2026-10-04; 8192 at first)
   # SAVE 5: a 24 h wall throws away everything since the last save (a team rollout ~36 min, an eval ~2 h)
-  BUDGET=${BUDGET:-32768}; PLAN=16384; CO=10; WU=6; EV=${EVAL_EVERY:-20}; SAVE=${SAVE_EVERY:-5}; EN=${N_EVAL:-2}; CGBS=120
+  BUDGET=${BUDGET:-32768}; PLAN=16384; CO=10; WU=0; EV=${EVAL_EVERY:-20}; SAVE=${SAVE_EVERY:-5}; EN=${N_EVAL:-2}; CGBS=120
   QOS=${QOS:-pli-short}; TIME=${TIME:-24:00:00}
   extra=(--use-wandb --wandb-mode offline --wandb-dir $B/runs/$R --wandb-project fcs_easyppo
          --wandb-group fcs_oracle --disable-wandb-random-suffix)
@@ -85,12 +85,12 @@ args=(--hf-checkpoint $SG --megatron-hf-checkpoint $MG --megatron-to-hf-mode bri
   --eval-prompt-data "${evd[@]}" --eval-interval $EV --n-samples-per-eval-prompt $EN
   --eval-temperature 1.0 --eval-top-p 1.0 --eval-max-prompt-len 8192 --eval-max-response-len $BUDGET
   --eval-max-context-len $MAXTOK "${extra[@]}"
-  # EasyPPO algorithm (submit_fcs.sh)
+  # EasyPPO algorithm, Frontier-CS settings of the paper (submit_fcs.sh): upper clip 0.2, floor 0.075, no LR warmup
   --advantage-estimator ppo --gamma 1.0 --lambd 1.0 --normalize-advantages
-  --eps-clip 0.2 --eps-clip-high 0.28 --eps-clip-c 3.0 --calculate-per-token-loss
+  --eps-clip 0.2 --eps-clip-high 0.2 --eps-clip-c 3.0 --calculate-per-token-loss
   --use-kl-loss --kl-loss-coef 0.001 --kl-loss-type low_var_kl --kl-coef 0 --entropy-coef 0
   --num-critic-only-steps $CO --critic-global-batch-size $CGBS
-  --critic-variance-weighted-loss --critic-variance-weight-beta 0.5 --critic-variance-weight-min 0.25
+  --critic-variance-weighted-loss --critic-variance-weight-beta 0.5 --critic-variance-weight-min 0.075
   --actor-only-overlong-filter --value-clip 0.2 --value-loss-scale 0.5
   --optimizer adam --lr 1e-6 --critic-lr 2e-6 --lr-decay-style constant --lr-warmup-iters $WU
   # constant LR: decay iters only feed Megatron's assert warmup < decay, in each trainer's own steps (the critic takes
