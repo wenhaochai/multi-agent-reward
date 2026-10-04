@@ -1,0 +1,67 @@
+From 6a8976bdf6de73ab3b759700a019c7bc04c482cd Mon Sep 17 00:00:00 2001
+From: Wenhao Chai <reselfchai@gmail.com>
+Date: Sat, 3 Oct 2026 21:20:35 -0400
+Subject: [PATCH 7/7] Resume inside the critic-only phase: start at the
+ critic's rollout with the initial actor; data state from --load
+
+train.py saves only the critic while the actor is frozen, so a run stopped there had a critic checkpoint and no actor
+one: the restored-rollout assert failed (critic k vs actor 1) and every chained segment would crash. Starting both at
+k with the initial actor is exact. The data source now reads its state from args.requested_load (the run's --load),
+which resolve_args_checkpoint_load keeps when args.load is switched to the initial weights.
+---
+ miles/ray/placement_group.py | 17 +++++++++++++++++
+ miles/rollout/data_source.py |  7 +++++--
+ 2 files changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/miles/ray/placement_group.py b/miles/ray/placement_group.py
+index 5d7cb5ad2..dc928811f 100644
+--- a/miles/ray/placement_group.py
++++ b/miles/ray/placement_group.py
+@@ -238,6 +238,23 @@ async def create_training_models(
+             trainer_id=critic_config.trainer_id,
+             resumed=resumed,
+         )
++        k = critic_info.restored_rollout_id
++        if (
++            k != actor_info.restored_rollout_id
++            and getattr(args, "requested_load", None) is not None
++            and read_checkpoint_tracker_iteration(args.requested_load) is None
++            and k <= args.num_critic_only_steps
++        ):
++            # EasyPPO: train.py saves only the critic while the actor is frozen (rollout < --num-critic-only-steps),
++            # so a run stopped inside that phase resumes with a critic checkpoint and no actor one. The frozen actor
++            # still equals its initial weights, so resuming both at the critic's rollout is exact.
++            logger.info(
++                f"critic-only phase resume: no actor checkpoint under {args.requested_load}, the critic restored "
++                f"rollout {k} <= --num-critic-only-steps {args.num_critic_only_steps}: both start at rollout {k} "
++                f"with the initial actor"
++            )
++            actor_info = actor_info._replace(restored_rollout_id=k, start_rollout_id=k)
++            critic_info = critic_info._replace(start_rollout_id=k)
+         assert critic_info.restored_rollout_id == actor_info.restored_rollout_id, (
+             f"the actor restored to rollout {actor_info.restored_rollout_id} but its critic to "
+             f"{critic_info.restored_rollout_id}"
+diff --git a/miles/rollout/data_source.py b/miles/rollout/data_source.py
+index 6b8e7cb42..b032a0b56 100644
+--- a/miles/rollout/data_source.py
++++ b/miles/rollout/data_source.py
+@@ -145,11 +145,14 @@ class RolloutDataSource(DataSource):
+             logger.warning("--disable-rollout-global-dataset: the dataset starts where a fresh run's would")
+             return
+ 
+-        if self.args.load is None:
++        # the run's own checkpoint dir: when the actor has no checkpoint yet, args.load already points at the
++        # initial weights (megatron_config.resolve_args_checkpoint_load), but the data state lives under --load
++        load_dir = getattr(self.args, "requested_load", None) or self.args.load
++        if load_dir is None:
+             logger.warning("no --load: the dataset starts where a fresh run's would")
+             return
+ 
+-        path = compute_global_dataset_state_path(self.args.load, rollout_id=rollout_id)
++        path = compute_global_dataset_state_path(load_dir, rollout_id=rollout_id)
+         if not os.path.exists(path):
+             logger.warning(f"no dataset state under {path}: the dataset starts where a fresh run's would")
+             return
+-- 
+2.52.0
+

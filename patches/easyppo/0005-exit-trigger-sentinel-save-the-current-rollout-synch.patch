@@ -1,7 +1,7 @@
 From f09a5be85d1c3571a7bcc65dcf5ccc99aa9340be Mon Sep 17 00:00:00 2001
 From: Wenhao Chai <reselfchai@gmail.com>
 Date: Fri, 2 Oct 2026 13:33:25 -0400
-Subject: [PATCH 5/6] --exit-trigger-sentinel: save the current rollout
+Subject: [PATCH 5/7] --exit-trigger-sentinel: save the current rollout
  synchronously and leave the train loop
 
 A queue worker nearing its wall time asks a resumable run to stop cleanly instead of being killed
