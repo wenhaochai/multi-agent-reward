@@ -147,8 +147,22 @@ assert O.extract_cpp("x</think>```cpp\nint main(){A;}\n```\n```\n5\n```") == "in
 assert O.extract_cpp("x</think>```\nint main(){A;}\n```") == "int main(){A;}"  # a final may be untagged
 assert O.extract_cpp("x</think>```cpp\nint main(){\n}```") == "int main(){\n}"
 assert O.extract_cpp("x</think>```cpp\nint main(){A;}\n```<|im_end|>") == "int main(){A;}"
-assert O.last_block("x</think>```cpp\na\n```python\nb\n```") == "a"  # a fence line always closes
-assert O.extract_cpp("```text\nhi\n```\n```cpp\nnew\n```", "longest") == "nn" or True  # longest keeps the old regex
+assert O.last_block("x</think>```cpp\na\n```python\nb\n```") == "a"  # a tagged fence opens the next block
+assert O.last_block("x</think>```cpp``` blocks follow:\n```cpp\nint main(){}\n```") == "int main(){}"  # inline span
+assert O.last_block("x</think>```cpp17\nA\n```\n```c++17\nB\n```\n```{.cpp}\nC\n```") == "C"
+assert O.last_block("x</think>```c\nA\n```") == ""  # C is not C++
+assert O.last_block("x</think>```cpp\nfirst\n```cpp\nsecond\n```") == "second"  # an unclosed block, then the next
+assert O.extract_cpp("x</think>```cpp\nint main(){A;}\n```\nWait, rewrite:\n```cpp\nint mai") == "int main(){A;}"
+assert O.extract_cpp("x</think>```cpp\nint mai") == "int mai"  # an unclosed block counts when it is the only one
+assert O.extract_cpp("x</think>```cpp\r\nint main(){}\r\n```") == "int main(){}"
+# "longest" is FrontierSmith's extract_cpp exactly (the blind arms run it): compare on hostile inputs
+import importlib.util as _iu  # noqa: E402
+_spec = _iu.spec_from_file_location("fs_frontiercs", "/scratch/gpfs/GROUP/USER/project/FrontierSmith/verl/verl/utils/reward_score/frontiercs.py")
+_fs = _iu.module_from_spec(_spec)
+_spec.loader.exec_module(_fs)
+HOSTILE = ["```text\nhi\n```\n```cpp\nnew\n```", "x</think>```cpp\na\n```\n```\n5\n```", "no code", "```cpp\nint a;",
+           "t</think>```c++\nlong one\n```\n```cpp\nb\n```", "```cpp a```", "", "```\n```", "<think>x</think>\n```cpp\nz\n```"]
+assert all(O.extract_cpp(h, "longest") == _fs.extract_cpp(h) for h in HOSTILE), [h for h in HOSTILE if O.extract_cpp(h, "longest") != _fs.extract_cpp(h)]
 assert O.OUTPUT_RULE not in O._without_output_rule([{"role": "user", "content": "a " + O.OUTPUT_RULE + " b"}])[0]["content"]
 assert O._clip("```cpp\n" + "x" * 50, 20, "code").endswith("(code truncated)\n```")
 print("[ok] parsing: tasks, code blocks, clipping")
@@ -199,6 +213,11 @@ out = play(plan=[(PLAN_TXT, "stop")], sub=[[(cpp("int main(){A;}"), "stop"), (cp
            final=[(cpp("int main(){C;}"), "stop")])
 assert close(out[2].reward, sC + 0.5 * sA)  # the best test, though the last one failed to compile
 O.REWARD = "shared"
+out = play(plan=[(PLAN_TXT, "stop")],
+           sub=[[("t\n</think>\n\nTesting before my <report>:\n```cpp\nint main(){A;}\n```", "stop"),
+                 ("r\n</think>\n\n<report>done</report>", "stop")], SUBS[1], SUBS[2], SUBS[3]],
+           final=[(cpp("int main(){C;}"), "stop")])
+assert out[0].metadata["fo"]["tests"][0] == [sA]
 print("[ok] best test shown, adopted and paid; ideas-only subagent; report replies not judged")
 
 # 4) diff: counterfactual finals are not trained on and cannot adopt the removed subagent
@@ -259,7 +278,7 @@ print("[ok] judge infra error aborts training episodes at once, flags eval")
 
 # 4d) eval when the final generated nothing (cut at once): a TRUNCATED stand-in with reward 0
 out = play(evaluation=True, game="team", plan=[(PLAN_TXT, "stop")], sub=SUBS, final=[("", "length")])
-assert len(out) == 1 and out[0].reward == 0.0
+assert len(out) == 1 and out[0].reward == 0.0 and out[0].metadata["fo_final_clamped"] == 1.0
 print("[ok] eval with an empty final")
 
 # 5) a cut subagent reports "cut off"; a cut plan gives every subagent NO_TASK

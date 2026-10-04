@@ -18,7 +18,7 @@ import re
 import sys
 import time
 
-from miles_team.fcs_judge import CASE_WORKERS, judge
+from miles_team.fcs_judge import CASE_WORKERS, job_cpus, judge
 
 _SEM = None
 
@@ -35,37 +35,57 @@ EXTRACT = os.environ.get("FCS_EXTRACT", "last")
 assert EXTRACT in ("last", "longest"), f"FCS_EXTRACT must be last or longest, not {EXTRACT}"
 
 
-CPP_TAGS = ("cpp", "c++", "cc", "cxx")
 _SPECIAL = ("<|im_end|>", "<|endoftext|>", "<|im_start|>")
 
 
+PARSER = "lines-v2"  # recorded with re-judged scores (tools/rescore_probe.py)
+_TAG_RE = re.compile(r"^(?:cpp|c\+\+|cc|cxx)\d*$")
+
+
+def _cpp_tag(info: str) -> bool | None:
+    """True for a C++ fence tag (cpp, c++, cc, cxx, cpp17, c++17, {.cpp}, "cpp title=..."), None for no tag."""
+    word = (info.split() or [""])[0].strip("{}.").lower()
+    return None if not word else bool(_TAG_RE.match(word))
+
+
 def code_blocks(text: str, untagged: bool = True) -> list[str]:
-    """Fenced blocks of a reply, in order. A fence opens on a line starting with ``` (its tag is the rest of the line)
-    and closes on a line that is ``` alone or ends with ```; fences pair in order, so a ```text block cannot swallow
-    the next one. Only cpp-tagged blocks count, plus untagged ones when `untagged` (audit 2026-10-04: FrontierSmith's
-    regex let a closing fence open a "block" and treated every untagged fence, e.g. a test case, as C++)."""
-    out, cur, tag = [], None, None
+    """Fenced blocks of a reply, in order. A fence opens on a line starting with ``` (its tag is the rest of the line;
+    a line holding a second ``` is inline code, not a fence) and closes on a line that starts or ends with ```; a
+    tagged fence line inside an open block (the model forgot to close it) closes that block and opens the next.
+    Only C++-tagged blocks count, plus untagged ones when `untagged`. An unclosed block at the end counts only when
+    the reply has no closed block (a cut-off rewrite must not replace a complete program). Audit 2026-10-04:
+    FrontierSmith's regex let a closing fence open a "block" and took every untagged fence (a test case) as C++."""
     for tok in _SPECIAL:  # a decoded reply can end in "```<|im_end|>"
         text = (text or "").replace(tok, "")
-    for line in text.split("\n"):
+    closed, open_block, cur, tag = [], None, None, None
+
+    def keep(t):
+        return t is True or (untagged and t is None)
+
+    for line in text.replace("\r\n", "\n").split("\n"):
         st = line.strip()
+        is_fence = st.startswith("```") and "```" not in st[3:]
         if cur is None:
-            if st.startswith("```"):
-                cur, tag = [], st[3:].strip().lower()
-                if tag.endswith("```"):  # a one-line ```...``` is not a block
-                    cur = None
+            if is_fence:
+                cur, tag = [], _cpp_tag(st[3:])
+            continue
+        if is_fence and st[3:].strip():  # a tagged fence inside an open block: close it, open the next
+            if keep(tag):
+                closed.append("\n".join(cur).strip())
+            cur, tag = [], _cpp_tag(st[3:])
             continue
         if st.startswith("```") or st.endswith("```"):  # a fence line closes the block (code may precede it)
             if not st.startswith("```"):
                 cur.append(line.rstrip()[:-3])
-            if tag in CPP_TAGS or (untagged and tag == ""):
-                out.append("\n".join(cur).strip())
+            if keep(tag):
+                closed.append("\n".join(cur).strip())
             cur = None
             continue
         cur.append(line)
-    if cur is not None and (tag in CPP_TAGS or (untagged and tag == "")):  # an unclosed block runs to the end
-        out.append("\n".join(cur).strip())
-    return [c for c in out if c]
+    if cur is not None and keep(tag):
+        open_block = "\n".join(cur).strip()
+    out = [c for c in closed if c]
+    return out if out else ([open_block] if open_block else [])
 
 
 def extract_cpp(response_text: str, rule: str | None = None) -> str:
@@ -123,7 +143,7 @@ def _sem():
     global _SEM
     if _SEM is None:
         # default: the job's own cores (sched_getaffinity, not the node's cpu_count), 8 kept for SGLang
-        n = int(os.environ.get("FCS_RM_CONCURRENCY", max(1, (len(os.sched_getaffinity(0)) - 8) // CASE_WORKERS)))
+        n = int(os.environ.get("FCS_RM_CONCURRENCY", max(1, (job_cpus() - 8) // CASE_WORKERS)))
         _SEM = asyncio.Semaphore(n)
     return _SEM
 
@@ -185,9 +205,16 @@ def judge_full(problem_dir: str, code: str) -> dict:
 
 
 async def judge_code(problem_dir: str, code: str) -> dict:
-    """judge_full in a thread under the shared FCS_RM_CONCURRENCY semaphore."""
+    """judge_full in a thread under the shared FCS_RM_CONCURRENCY semaphore. The slot is held until the thread ends,
+    also when the caller is cancelled (an aborted episode): a cancelled await would otherwise free the slot while the
+    judge keeps running, and the extra judges oversubscribe the node (wall-limit kills elsewhere)."""
     async with _sem():
-        return await asyncio.to_thread(judge_full, problem_dir, code)
+        fut = asyncio.ensure_future(asyncio.to_thread(judge_full, problem_dir, code))
+        try:
+            return await asyncio.shield(fut)
+        except asyncio.CancelledError:
+            await asyncio.wait([fut])
+            raise
 
 
 async def fcs_rm(args, sample, **kwargs):

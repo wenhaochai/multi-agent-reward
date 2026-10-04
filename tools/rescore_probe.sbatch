@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=fcs-rescore
 #SBATCH --account=group --partition=cpu --qos=short
-#SBATCH --nodes=1 --cpus-per-task=32 --mem=96G --time=03:00:00
+#SBATCH --nodes=1 --cpus-per-task=16 --mem=48G --time=04:00:00
 #SBATCH --output=/scratch/gpfs/GROUP/USER/project/miles-q38-build/logs/fcs_rescore-%j.out
-# re-judge the three Qwen3.5-9B probes with the current judge and the last-code-block rule
+# re-judge probe answers with the current judge and the last-code-block rule: sbatch tools/rescore_probe.sbatch <probe dirs>
+# 14 judges on 16 cores, one case at a time each (no oversubscription: the wall limit is 2 x the time limit)
 B=/scratch/gpfs/GROUP/USER/project/miles-q38-build
 LT=/tmp/fcs_$SLURM_JOB_ID; mkdir -p $LT; trap 'rm -rf $LT' EXIT
 apptainer exec --contain --cleanenv --bind /scratch/gpfs/GROUP/USER,$LT:/tmp \
-  --env HOME=/tmp/home,FCS_JUDGE_CACHE=/tmp/fcsj_cache,PYTHONPATH=$B/pyfix,FCS_EXTRACT=last \
-  $B/miles.sif python3 $B/tools/rescore_probe.py $B/runs/fcs_probe_qwen35_9b_sft $B/runs/fcs_probe_qwen35_9b \
-  $B/runs/fcs_probe_qwen35_9b_nothink
+  --env HOME=/tmp/home,FCS_JUDGE_CACHE=/tmp/fcsj_cache,PYTHONPATH=$B/pyfix,FCS_EXTRACT=last,FCS_CASE_WORKERS=1,RESCORE_WORKERS=14 \
+  $B/miles.sif python3 $B/tools/rescore_probe.py "$@"

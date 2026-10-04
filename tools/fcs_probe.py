@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from miles_team.fcs_judge import CASE_WORKERS, judge
+from miles_team.fcs_judge import CASE_WORKERS, job_cpus, judge
 from miles_team.fcs_rm import extract_cpp
 
 MAX_NEW, CHUNK = int(os.environ.get('MAX_NEW', 32768)), int(os.environ.get('CHUNK', 256))
@@ -39,7 +39,7 @@ def score_one(rec):
         return {**{k: rec[k] for k in ('key', 'split', 'pid', 'i')}, 'score': 0.0, 'status': 'no code'}
     try:
         r = judge(rec['label'], code)
-        out = {'score': r['score'], 'status': r['status']}
+        out = {'score': r['score'], 'status': r['status'], 'infra': bool(r.get('infra'))}
     except Exception as e:
         out = {'score': 0.0, 'status': f'judge error: {e}'[:200]}
     return {**{k: rec[k] for k in ('key', 'split', 'pid', 'i')}, **out}
@@ -60,7 +60,7 @@ def main():
     done_sc = {r['key'] for r in load(sc_f)}
     # judges at once: the job's own cores (os.cpu_count() is the whole 96-core node, the job has 64), 8 kept for the
     # SGLang schedulers; oversubscription trips the judge's wall limit (2 x the time limit)
-    pool = ThreadPoolExecutor(max(1, (len(os.sched_getaffinity(0)) - 8) // CASE_WORKERS))
+    pool = ThreadPoolExecutor(max(1, (job_cpus() - 8) // CASE_WORKERS))
     futs = [pool.submit(score_one, r) for k, r in done_gen.items() if k not in done_sc]
     rest = [t for t in todo if t['key'] not in done_gen]
     print(f'{len(todo)} samples; {len(done_gen)} generated already; {len(rest)} to generate', flush=True)
@@ -104,7 +104,7 @@ def summarize(out):
     sc = {r['key']: r for r in load(out / 'scores.jsonl')}
     lines = []
     for split in sorted({r['split'] for r in sc.values()}):
-        rs = [r for r in sc.values() if r['split'] == split]
+        rs = [r for r in sc.values() if r['split'] == split and not r.get('infra')]  # infra zeros are not scores
         g = [gen[r['key']] for r in rs if r['key'] in gen]
         per = defaultdict(list)
         for r in rs:

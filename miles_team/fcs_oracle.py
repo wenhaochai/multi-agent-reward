@@ -125,7 +125,8 @@ REVISE = (
 _SPECIAL = ("<|im_end|>", "<|endoftext|>", "<|im_start|>")  # Session decodes with special tokens kept
 _TASK_RE = re.compile(r"<task\s*(\d+)\s*>(.*?)</task\s*\d*\s*>", re.IGNORECASE | re.DOTALL)
 _ADOPT_RE = re.compile(r"<adopt\s*(?:j\s*=\s*)?\"?(\d+)\"?\s*/?>", re.IGNORECASE)
-_REPORT_RE = re.compile(r"<report>(.*?)(?:</report>|$)", re.IGNORECASE | re.DOTALL)
+_REPORT_RE = re.compile(r"<report>(.*?)</report>", re.IGNORECASE | re.DOTALL)
+_REPORT_OPEN_RE = re.compile(r"<report>(.*)$", re.IGNORECASE | re.DOTALL)
 _trace_count = 0
 
 
@@ -360,12 +361,15 @@ async def _subagent(input, j: int, messages: list, task: str, label: str) -> dic
         last_turn = len(tests) >= SUB_TESTS  # tests used up: this turn only reports
         budget = REPORT_BUDGET if last_turn else BUDGET
         text, cut, seg = await _turn(sess, chat, budget)
-        clamped = clamped or _prompt_len(sess, seg) + budget > MAX_LEN
+        clamped = clamped or (cut and seg < 0) or _prompt_len(sess, seg) + budget > MAX_LEN
         if seg >= 0 and seg not in segs:
             segs.append(seg)
         vis = "" if cut else (strip_think(text) or "").strip()
-        m = None if cut else _REPORT_RE.search(vis)
-        code = "" if (cut or last_turn or m) else last_block(text)
+        code = "" if (cut or last_turn) else last_block(text)
+        # a report: a closed <report>...</report>, or an open <report> in a reply with no cpp block (a mention of the
+        # tag in a test reply does not stop its program from being judged)
+        m = None if cut else (_REPORT_RE.search(vis) or (None if code else _REPORT_OPEN_RE.search(vis)))
+        code = "" if m else code
         res = _check_infra(input, await judge_code(label, code)) if code else None
         if code:
             tests.append((code, res))
@@ -450,7 +454,10 @@ async def _team(input, messages, label):
             "fo_tasks_ok": sum(t != NO_TASK for t in tasks) / n, "fo_plan_cut": float(pcut),
             "fo_final_cut": float(fcut), "fo_sub_cut": sum(r["cut"] for r in subr) / n,
             "fo_final_bad": _bad(fres), "fo_report_chars": sum(len(r["report"]) for r in subr) / n,
-            "fo_final_prompt_tokens": final_prompt, "fo_final_clamped": float(final_prompt + BUDGET > MAX_LEN),
+            "fo_final_prompt_tokens": final_prompt,
+            "fo_final_clamped": float((fcut and fseg < 0) or final_prompt + BUDGET > MAX_LEN),
+            "fo_adopt_invalid": float(bool(not fcut and _ADOPT_RE.search(strip_think(ftext) or "")) and adopted is None
+                                      and not last_block(ftext)),
             "fo_sub_clamped": sum(r["clamped"] for r in subr) / n,
             "fo_tokens": lead_gen + sum(gen_sub), "fo_latency": lead_gen + max(gen_sub), "fo_plan_tokens": plan_gen,
             "fo_cf_tokens": cf_gen,
@@ -479,7 +486,8 @@ async def _seq(input, messages, label):
         best = max(best, res["score"])
         v_at.append(best)
         if t + 1 < ROUNDS:
-            shown = f"```cpp\n{code[:CODE_CHARS]}\n```" if code else "(no code: the answer was cut off or had no program)"
+            shown = (f"```cpp\n{_clip(code, CODE_CHARS, 'code')}\n```" if code
+                     else "(no code: the answer was cut off or had no program)")
             chat = chat + [{"role": "assistant", "content": shown},
                            {"role": "user", "content": REVISE.format(result=fmt_result(res), cases=fmt_cases(res["cases"]),
                                                                      best=100 * best, t=t + 2, r=ROUNDS)}]
@@ -493,8 +501,8 @@ async def _seq(input, messages, label):
 
 async def _par(input, messages, label):
     sessions = [Session(input, f"try{t + 1}", THINK, max_len=MAX_LEN) for t in range(ROUNDS)]
-    runs = await asyncio.gather(*[_turn(x, messages, BUDGET) for x in sessions])
-    res = await asyncio.gather(*[judge_code(label, "" if cut else extract_cpp(text)) for text, cut, _ in runs])
+    runs = await _gather(*[_turn(x, messages, BUDGET) for x in sessions])
+    res = await _gather(*[judge_code(label, "" if cut else extract_cpp(text)) for text, cut, _ in runs])
     s = [r["score"] for r in res]
     gen = [_gen(x) for x in sessions]
     rec = {"game": "par", "s": s}

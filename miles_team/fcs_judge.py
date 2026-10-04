@@ -55,6 +55,29 @@ TESTLIB_DIR = FCS_ROOT / "judge" / "include"
 CACHE = Path(os.environ.get("FCS_JUDGE_CACHE", "/tmp/fcs_judge_cache"))
 TMP = Path(os.environ.get("FCS_JUDGE_TMP", "/tmp"))
 CASE_WORKERS = int(os.environ.get("FCS_CASE_WORKERS", "8"))
+
+
+def job_cpus() -> int:
+    """The cores this process may use: the CPU affinity (a Slurm job's cpuset) and every cgroup-v2 cpu.max quota from
+    this process's cgroup up to the root (a vis node limits a user to 7 cores by quota while affinity shows 80).
+    FCS_JOB_CPUS overrides. Inside apptainer the quota is visible only with --bind /sys/fs/cgroup."""
+    if os.environ.get("FCS_JOB_CPUS"):
+        return int(os.environ["FCS_JOB_CPUS"])
+    n = len(os.sched_getaffinity(0))
+    try:
+        path = next(l.split("::", 1)[1].strip() for l in open("/proc/self/cgroup") if l.startswith("0::"))
+        while True:
+            f = Path("/sys/fs/cgroup") / path.lstrip("/") / "cpu.max"
+            if f.exists():
+                q, per = f.read_text().split()[:2]
+                if q != "max":
+                    n = min(n, max(1, -(-int(q) // int(per))))
+            if path in ("/", ""):
+                break
+            path = str(Path(path).parent)
+    except (OSError, StopIteration, ValueError):
+        pass
+    return n
 COMPILE = ["g++", "-O2", "-pipe", "-static", "-s", "-std=gnu++17"]
 STDOUT_MAX = 128 << 20
 OK_EXIT, POINTS_EXIT = 0, 7
@@ -122,6 +145,8 @@ def load_problem(pdir: Path) -> dict:
                 cases.append((f.name, f.stem + ext, ft, fm))
                 break
     interactive = str(cfg.get("type", "default")).lower() == "interactive"
+    # a case's output files are named after its input and deleted when it is scored: names must not repeat
+    assert len({c[0] for c in cases}) == len(cases), f"{pdir}: repeated test input names"
     try:
         train = not Path(pdir).resolve().is_relative_to(FCS_ROOT.resolve())
     except OSError:

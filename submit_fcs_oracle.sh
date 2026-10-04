@@ -6,7 +6,7 @@
 #
 # GAME=team REWARD=shared|bonus|diff  1 lead (plans 4 tasks, then submits the final) + 4 helper subagents (each may test
 #                                     up to SUB_TESTS=3 programs, sees each result, then reports); outcome = the lead's
-#                                     final submission S. shared: all S; bonus: subagent S + 0.5 x its last test score;
+#                                     final submission S. shared: all S; bonus: subagent S + 0.5 x its best test score;
 #                                     diff: subagent S - S_-j (counterfactual final without its work)
 # GAME=seq  REWARD=shared|indiv|diff  one agent, 5 rounds of revision with feedback; outcome = the last round
 # GAME=par  REWARD=shared|indiv|diff  5 independent attempts (indiv = single-agent RL); outcome = the best attempt

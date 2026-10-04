@@ -122,4 +122,15 @@ r7 = J._case_classic(pr0, work / "big", chk0, case0, work)
 check("a classic case leaves no output file behind", not (work / f"{case0[0]}.out").exists() and r7[0] == 0.0,
       str(r7[1])[:80])
 
+# 8) an interactive case leaves no .tout / .ierr behind
+pri = J.load_problem(inter)
+ci = pri["cases"][0]
+(work / "q.cpp").write_text("#include <cstdio>\nint main(){ puts(\"0\"); fflush(stdout); return 0; }\n")
+subprocess.run(J.COMPILE + ["-o", str(work / "q"), str(work / "q.cpp")], check=True)
+itr = J._compile_helper(pri["dir"], pri["interactor"])
+J._case_interactive(pri, work / "q", itr, ci, work)
+check("an interactive case leaves no files behind",
+      not (work / f"{ci[0]}.tout").exists() and not (work / f"{ci[0]}.ierr").exists())
+check("job_cpus reads the cgroup quota", 1 <= J.job_cpus() <= len(os.sched_getaffinity(0)), str(J.job_cpus()))
+
 print("ALL OK" if not fails else f"FAILED: {fails}")
