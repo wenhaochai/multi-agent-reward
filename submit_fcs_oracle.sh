@@ -12,9 +12,9 @@
 # GAME=par  REWARD=shared|indiv|diff  5 independent attempts (indiv = single-agent RL); outcome = the best attempt
 # Batch: team 16 prompts x 5 episodes x 18 sample slots (plan, final, 4 subagents x 4 turns; unused slots are masked
 #   pads) = 1440; seq/par 16 x 6 x 5 = 480. Critic batch = batch / 4 (EasyPPO: 4 critic mini-batches).
-# Screen: NUM_ROLLOUT 60 (10 critic-only, 6-rollout lr warmup), val every 20 on two oracle-game sets of 172 problems x
+# Screen: NUM_ROLLOUT 60 (10 critic-only, no lr warmup), val every 20 on two oracle-game sets of 172 problems x
 #   N_EVAL (2) episodes: team arms play team + par (the same weights as 5 independent attempts), seq plays seq + par,
-#   par plays par + team. Step 0 is evaluated once per game (team: the producer; seq and par: their runs).
+#   par plays par + team. Step 0 is evaluated once per game (team and par sets: the team producer; seq: its run).
 # Shared value pretraining: PRETRAIN=1 runs the 10 critic-only rollouts of GAME once (runs/fcs_vp_oracle_<game>_...),
 #   dumped; VP=1 VP_DEP=<its jid> makes an arm replay them, relabeled with its reward (fcs_oracle.post_process).
 # Usage: GAME=... REWARD=... [SUB_TESTS=3] [SEED=42] [NUM_ROLLOUT] [EVAL_EVERY] [N_EVAL] [BUDGET] [MODEL] [SMOKE=1] [PRETRAIN=1]
@@ -55,7 +55,9 @@ else
   # step 0 once per game: team and par sets in the team producer, the seq set in the seq run
   [ "$GAME" != seq ] && extra+=(--skip-eval-before-train)
 fi
-VPR=fcs_vp_oracle_${GAME}_${TAG}_s$SEED; [ -n "${SMOKE:-}" ] && VPR=fcs_vp_oracle_smoke_${GAME}_$TAG
+# the producer's dumps fix the samples per episode: a SUB_TESTS other than 3 gets its own producer
+VT=$([ "$SUB_TESTS" = 3 ] || echo "_t$SUB_TESTS")
+VPR=fcs_vp_oracle_${GAME}${VT}_${TAG}_s$SEED; [ -n "${SMOKE:-}" ] && VPR=fcs_vp_oracle_smoke_${GAME}${VT}_$TAG
 if [ -n "${PRETRAIN:-}" ]; then  # the producer: CO critic-only rollouts, dumped; step-0 eval
   # NR = CO + 1 with an exit after CO rollouts: miles forces an eval and a (104 GB critic) save on the last rollout
   # (should_run_periodic_action), which would repeat the step-0 eval on the same frozen weights
@@ -75,6 +77,7 @@ GBS=$((RB * NS * PER))
 MAXTOK=$((BUDGET + 32768))
 fo=(MA_FO_GAME=$GAME MA_FO_REWARD=$REWARD MA_FO_SUBS=4 MA_FO_ROUNDS=5 MA_FO_BUDGET=$BUDGET MA_FO_PLAN_BUDGET=$PLAN
     MA_FO_SUB_TESTS=$SUB_TESTS MA_FO_CF=$([ -n "${PRETRAIN:-}" ] && echo 1 || echo 0)
+    MA_FO_REPORT_BUDGET=$((BUDGET < 16384 ? BUDGET : 16384))
     MA_FO_MAX_LEN=$MAXTOK MA_FO_TRACE_DIR=$B/runs/$R/traces MA_FO_TRACE_EVERY=32)
 envs=(FCS_RM_CONCURRENCY=8 FCS_CASE_WORKERS=7 MILES_SRC=$MILES_SRC RUN_NAME=$R GPUS=8 MILES_MODEL_TYPE=qwen3.5-9B
       "${fo[@]}")

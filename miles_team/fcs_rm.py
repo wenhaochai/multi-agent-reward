@@ -35,9 +35,43 @@ EXTRACT = os.environ.get("FCS_EXTRACT", "last")
 assert EXTRACT in ("last", "longest"), f"FCS_EXTRACT must be last or longest, not {EXTRACT}"
 
 
+CPP_TAGS = ("cpp", "c++", "cc", "cxx")
+_SPECIAL = ("<|im_end|>", "<|endoftext|>", "<|im_start|>")
+
+
+def code_blocks(text: str, untagged: bool = True) -> list[str]:
+    """Fenced blocks of a reply, in order. A fence opens on a line starting with ``` (its tag is the rest of the line)
+    and closes on a line that is ``` alone or ends with ```; fences pair in order, so a ```text block cannot swallow
+    the next one. Only cpp-tagged blocks count, plus untagged ones when `untagged` (audit 2026-10-04: FrontierSmith's
+    regex let a closing fence open a "block" and treated every untagged fence, e.g. a test case, as C++)."""
+    out, cur, tag = [], None, None
+    for tok in _SPECIAL:  # a decoded reply can end in "```<|im_end|>"
+        text = (text or "").replace(tok, "")
+    for line in text.split("\n"):
+        st = line.strip()
+        if cur is None:
+            if st.startswith("```"):
+                cur, tag = [], st[3:].strip().lower()
+                if tag.endswith("```"):  # a one-line ```...``` is not a block
+                    cur = None
+            continue
+        if st.startswith("```") or st.endswith("```"):  # a fence line closes the block (code may precede it)
+            if not st.startswith("```"):
+                cur.append(line.rstrip()[:-3])
+            if tag in CPP_TAGS or (untagged and tag == ""):
+                out.append("\n".join(cur).strip())
+            cur = None
+            continue
+        cur.append(line)
+    if cur is not None and (tag in CPP_TAGS or (untagged and tag == "")):  # an unclosed block runs to the end
+        out.append("\n".join(cur).strip())
+    return [c for c in out if c]
+
+
 def extract_cpp(response_text: str, rule: str | None = None) -> str:
-    """Extract C++ code from model response (markdown or raw), ignoring <think> blocks; with several ```cpp blocks,
-    the last one (rule "last", the default) or the longest one (rule "longest", Frontier-CS's official harness)."""
+    """Extract C++ code from model response (markdown or raw), ignoring <think> blocks: the last cpp block (rule
+    "last", the default), or with rule "longest" FrontierSmith's original regex and longest block, verbatim (the
+    blind-game arms keep it)."""
     if not response_text:
         return ""
 
@@ -47,11 +81,15 @@ def extract_cpp(response_text: str, rule: str | None = None) -> str:
 
     code = response_text.strip()
 
-    # Try to extract from ```cpp blocks
-    cpp_pattern = r'```(?:cpp|c\+\+)?\s*\n(.*?)```'
-    matches = re.findall(cpp_pattern, code, re.DOTALL)
-    if matches:
-        return (max(matches, key=len) if (rule or EXTRACT) == "longest" else matches[-1]).strip()
+    if (rule or EXTRACT) == "longest":
+        cpp_pattern = r'```(?:cpp|c\+\+)?\s*\n(.*?)```'
+        matches = re.findall(cpp_pattern, code, re.DOTALL)
+        if matches:
+            return max(matches, key=len).strip()
+    else:  # the last cpp-tagged block; an untagged one only when the reply has no tagged block
+        blocks = code_blocks(code, untagged=False) or code_blocks(code)
+        if blocks:
+            return blocks[-1]
 
     # Fallback: strip markdown if present
     if code.startswith("```cpp"):
