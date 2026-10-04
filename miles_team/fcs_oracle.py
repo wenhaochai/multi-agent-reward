@@ -20,6 +20,7 @@ Rewards (MA_FO_REWARD; s = a submission's score in [0, 1], V = the episode's bes
   indiv   max_j s_j / S / s_j                                  s_t                         s_t
   gain    V / S - max_j s_j / V                                -                           -
   diff    V / max(0, S - max_j s_j) / V - max(S, s_-j)         max(0, s_t - max_{i<t} s_i)  V - max_{i!=t} s_i
+          (team diff: S leaves the counterfactual of a subagent the lead adopted)
 indiv on par is plain single-agent RL (each attempt its own score); shared on seq is the sequential baseline.
 
 Training returns one sample per agent turn (a turn that string-extends its session's previous turn shares that
@@ -84,6 +85,7 @@ REVISE = (
     "Your submission was judged: {result}.\nPer-test-case scores (fractions of full marks): {cases}\nYour best score "
     "so far is {best:.2f}/100. Write an improved solution. Output ONLY the C++ code wrapped in ```cpp and ```."
 )
+_SPECIAL = ("<|im_end|>", "<|endoftext|>", "<|im_start|>")  # Session decodes with special tokens kept
 _TASK_RE = re.compile(r"<task\s*(\d+)\s*>(.*?)</task\s*>", re.IGNORECASE | re.DOTALL)
 _ADOPT_RE = re.compile(r"<adopt\s*(?:j\s*=\s*)?\"?(\d+)\"?\s*/?>", re.IGNORECASE)
 _trace_count = 0
@@ -127,8 +129,10 @@ def rewards(game: str, arm: str, rec: dict) -> list[float]:
             return [best, S] + list(s)
         if arm == "gain":
             return [V, S - best] + [V] * len(s)
-        if arm == "diff":
-            return [V, max(0.0, S - best)] + [V - max([S] + s[:j] + s[j + 1:]) for j in range(len(s))]
+        if arm == "diff":  # without j the lead could not have adopted j's code, so S leaves j's counterfactual then
+            adopted = rec.get("adopted")
+            return [V, max(0.0, S - best)] + [V - max(([] if adopted == j + 1 else [S]) + s[:j] + s[j + 1:])
+                                              for j in range(len(s))]
     else:
         V = max(s)
         if arm == "shared":
@@ -174,6 +178,8 @@ async def _turn(sess: Session, messages: list, budget: int) -> tuple[str, bool, 
     """(text, cut, index of the segment this turn generated into, or -1 when it generated nothing)."""
     before = _gen(sess)
     text, cut = await sess.turn(messages, budget)
+    for tok in _SPECIAL:  # e.g. the closing <|im_end|> would otherwise end up in fence-less code and in later prompts
+        text = text.replace(tok, "")
     return text, cut, (len(sess.segments) - 1 if _gen(sess) > before else -1)
 
 
@@ -251,10 +257,10 @@ async def _team(input, messages, label):
     ftext, fcut, fseg = await _turn(lead, final_msgs, BUDGET)
     adopted = None if fcut else parse_adopt(ftext, n)
     if adopted is not None and codes[adopted - 1]:
-        final = codes[adopted - 1]
+        fres = res[adopted - 1]  # the same program: reuse its score (time-limited heuristics vary run to run)
     else:
-        adopted, final = None, ("" if fcut else extract_cpp(ftext))
-    fres = await judge_code(label, final)
+        adopted = None
+        fres = await judge_code(label, "" if fcut else extract_cpp(ftext))
     S = fres["score"]
     gen_sub = [_gen(x) for x in subs]
     plan_gen = sum(lead.segments[pseg].loss_mask) if pseg >= 0 else 0
@@ -281,7 +287,8 @@ async def _seq(input, messages, label):
     cut_n, bad, infra, best = 0, 0.0, False, 0.0
     for t in range(ROUNDS):
         text, cut, seg = await _turn(sess, chat, BUDGET)
-        res = await judge_code(label, "" if cut else extract_cpp(text))
+        code = "" if cut else extract_cpp(text)
+        res = await judge_code(label, code)
         s.append(res["score"])
         turns.append((sess, seg))
         texts.append(text)
@@ -289,7 +296,8 @@ async def _seq(input, messages, label):
         best = max(best, res["score"])
         v_at.append(best)
         if t + 1 < ROUNDS:
-            chat = chat + [{"role": "assistant", "content": _visible(text, cut)},
+            shown = f"```cpp\n{code[:CODE_CHARS]}\n```" if code else "(no code: the answer was cut off or had no program)"
+            chat = chat + [{"role": "assistant", "content": shown},
                            {"role": "user", "content": REVISE.format(result=fmt_result(res),
                                                                      cases=fmt_cases(res["cases"]), best=100 * best)}]
     gen = _gen(sess)

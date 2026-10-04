@@ -122,7 +122,10 @@ assert O.rewards("seq", "diff", {"game": "seq", "s": [0.2, 0.1, 0.5, 0.5, 0.6]})
 assert all(close(a, b) for a, b in zip(O.rewards("par", "diff", {"game": "par", "s": [0.2, 0.7, 0.1, 0.7, 0.3]}),
                                        [0.0, 0.0, 0.0, 0.0, 0.0]))
 assert O.rewards("par", "indiv", {"game": "par", "s": [0.2, 0.7]}) == [0.2, 0.7]
-print("[ok] reward tables")
+rec3 = {"game": "team", "s": [0.2, 0.7, 0.1, 0.3], "S": 0.7, "adopted": 2}  # the lead adopted subagent 2
+d = O.rewards("team", "diff", rec3)
+assert close(d[1], 0.0) and close(d[3], 0.4) and all(close(d[i], 0.0) for i in (2, 4, 5)), d
+print("[ok] reward tables (incl. diff under adoption)")
 
 # 2) task parsing: tags in the reasoning do not count; missing tasks get NO_TASK
 t = O.parse_tasks("<task 1>in thinking</task></think>\n<task 2> B </task><task 9>x</task>", 4)
@@ -159,6 +162,25 @@ assert close(out[1].reward, 0.0) and all(close(o.reward, 0.0) for o in out[2:]),
 O.REWARD = "shared"
 print("[ok] indiv / diff arms and adoption")
 
+# 4b) adoption reuses the subagent's judged result (no second judge call); fence-less code loses the <|im_end|> token
+JUDGED = []
+_judge = O.judge_code
+
+
+async def counting_judge(problem_dir, code):
+    JUDGED.append(code)
+    return await fake_judge(problem_dir, code)
+
+
+O.judge_code = counting_judge
+out = play(plan=[(PLAN_TXT, "stop")], sub=SUBS, final=[("ok\n</think>\n\n<adopt 1/>", "stop")])
+assert len(JUDGED) == 4 and close(out[0].metadata["fo_S"], sA), JUDGED
+JUDGED.clear()
+out = play(plan=[(PLAN_TXT, "stop")], sub=SUBS, final=[("ok\n</think>\n\nint main(){D;}", "stop")])
+assert JUDGED[-1] == "int main(){D;}" and close(out[0].metadata["fo_S"], 1.0), JUDGED[-1]
+O.judge_code = _judge
+print("[ok] adopted result reused; special tokens stripped")
+
 # 5) a subagent cut off shows as no code; a plan cut off gives every subagent NO_TASK
 out = play(plan=[("still thinking " * 30, "length")], sub=[SUBS[0], ("x " * 50, "length"), SUBS[2], SUBS[3]],
            final=[(cpp("int main(){A;}"), "stop")])
@@ -179,7 +201,8 @@ m = out[0].metadata
 assert [round(m[f"fo_V_at{t}"], 4) for t in range(1, 6)] == [sA, sA, sB, 1.0, 1.0] and close(m["fo_S"], sE)
 rev = [c[1] for c in CALLS if c[0] == "revise"]
 assert "Your submission was judged: done, score 37.50/100." in rev[0] and "0.50 0.50 0.00 0.00" in rev[1]
-assert "best score so far is 37.50/100" in rev[1] and "int main(){A;}" in rev[0]
+assert "best score so far is 37.50/100" in rev[1] and "```cpp\nint main(){A;}\n```" in rev[0]
+assert "thinking..." not in rev[0].split("Your submission was judged")[0].split("<|im_start|>assistant")[-1]
 print(f"[ok] seq: 5 samples, groups {[o.group_index for o in out]}, V@t {[round(m[f'fo_V_at{t}'], 3) for t in range(1, 6)]}")
 
 # 7) par (indiv): 5 independent attempts on the solo prompt, each its own score

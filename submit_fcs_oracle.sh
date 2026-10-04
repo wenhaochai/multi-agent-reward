@@ -34,21 +34,27 @@ case $GAME in team) NS_FULL=5; PER=6; EVS=(team par) ;; seq) NS_FULL=6; PER=5; E
 if [ -n "${SMOKE:-}" ]; then
   # batch and critic batch must divide by DP 2: team 2 x 1 x 6 = 12 (critic 6), seq/par 2 x 2 x 5 = 20 (critic 10)
   R=fcs_oracle_smoke_${GAME}_${REWARD}_$TAG; NR=${NUM_ROLLOUT:-2}; RB=2; NS=$([ "$GAME" = team ] && echo 1 || echo 2); NVAL=16
-  BUDGET=${BUDGET:-4096}; PLAN=1024; CO=1; WU=1; EV=${EVAL_EVERY:-$NR}; EN=${N_EVAL:-1}; CGBS=$((RB * NS * PER / 2))
+  BUDGET=${BUDGET:-4096}; PLAN=2048; CO=1; WU=1; EV=${EVAL_EVERY:-$NR}; SAVE=$NR; EN=${N_EVAL:-1}; CGBS=$((RB * NS * PER / 2))
   QOS=${QOS:-pli-short}; TIME=${TIME:-01:30:00}
   extra=(--skip-eval-before-train)
 else
   R=fcs_oracle_${GAME}_${REWARD}_${TAG}_s$SEED; NR=${NUM_ROLLOUT:-60}; RB=16; NS=$NS_FULL; NVAL=172
-  BUDGET=${BUDGET:-32768}; PLAN=8192; CO=10; WU=6; EV=${EVAL_EVERY:-20}; EN=${N_EVAL:-2}; CGBS=120
+  # PLAN 16384: the plan turn thinks first (the SFT model averages ~16.5k tokens per solve), and a cut plan gives
+  # every subagent NO_TASK and is masked from the actor (audit 2026-10-04; 8192 at first)
+  # SAVE 5: a 24 h wall throws away everything since the last save (a team rollout ~36 min, an eval ~2 h)
+  BUDGET=${BUDGET:-32768}; PLAN=16384; CO=10; WU=6; EV=${EVAL_EVERY:-20}; SAVE=${SAVE_EVERY:-5}; EN=${N_EVAL:-2}; CGBS=120
   QOS=${QOS:-pli-short}; TIME=${TIME:-24:00:00}
   extra=(--use-wandb --wandb-mode offline --wandb-dir $B/runs/$R --wandb-project fcs_easyppo
          --wandb-group fcs_oracle --disable-wandb-random-suffix)
-  [ "$GAME" = team ] && extra+=(--skip-eval-before-train)   # team step 0: the producer's eval
+  # step 0 once per game: team and par sets in the team producer, the seq set in the seq run
+  [ "$GAME" != seq ] && extra+=(--skip-eval-before-train)
 fi
 VPR=fcs_vp_oracle_${GAME}_${TAG}_s$SEED; [ -n "${SMOKE:-}" ] && VPR=fcs_vp_oracle_smoke_${GAME}_$TAG
 if [ -n "${PRETRAIN:-}" ]; then  # the producer: CO critic-only rollouts, dumped; step-0 eval
-  R=$VPR; NR=$CO; EV=1000000
-  extra=(--save-debug-rollout-data $B/runs/$R/rollout_data/{rollout_id}.pt)
+  # NR = CO + 1 with an exit after CO rollouts: miles forces an eval and a (104 GB critic) save on the last rollout
+  # (should_run_periodic_action), which would repeat the step-0 eval on the same frozen weights
+  R=$VPR; NR=$((CO + 1)); EV=1000000; SAVE=1000000
+  extra=(--save-debug-rollout-data $B/runs/$R/rollout_data/{rollout_id}.pt --debug-exit-after-rollout $CO)
   [ -n "${SMOKE:-}" ] || extra+=(--use-wandb --wandb-mode offline --wandb-dir $B/runs/$R --wandb-project fcs_easyppo
                                  --wandb-group fcs_oracle --disable-wandb-random-suffix)
 elif [ -n "${VP:-}" ]; then
@@ -66,7 +72,7 @@ envs=(FCS_RM_CONCURRENCY=8 FCS_CASE_WORKERS=8 MILES_SRC=$MILES_SRC RUN_NAME=$R G
       "${fo[@]}")
 CK=$B/runs/$R/ckpt
 args=(--hf-checkpoint $SG --megatron-hf-checkpoint $MG --megatron-to-hf-mode bridge
-  --ref-load $MG --load $CK --save $CK --critic-load ${CK}_critic --critic-save ${CK}_critic --save-interval $EV
+  --ref-load $MG --load $CK --save $CK --critic-load ${CK}_critic --critic-save ${CK}_critic --save-interval $SAVE
   --custom-megatron-post-save-hook-path miles_team.ckpt_rotate.keep_latest
   --prompt-data $D/fcs_train200_team.jsonl --input-key prompt --label-key label --apply-chat-template --rollout-shuffle
   --custom-generate-function-path miles_team.fcs_oracle.generate
@@ -87,9 +93,13 @@ args=(--hf-checkpoint $SG --megatron-hf-checkpoint $MG --megatron-to-hf-mode bri
   --critic-variance-weighted-loss --critic-variance-weight-beta 0.5 --critic-variance-weight-min 0.25
   --actor-only-overlong-filter --value-clip 0.2 --value-loss-scale 0.5
   --optimizer adam --lr 1e-6 --critic-lr 2e-6 --lr-decay-style constant --lr-warmup-iters $WU
-  --lr-decay-iters $NR
+  # constant LR: decay iters only feed Megatron's assert warmup < decay, in each trainer's own steps (the critic takes
+  # GBS/CGBS steps per rollout and warms up for WU*GBS/CGBS of them; --lr-decay-iters NR failed it for short runs)
+  --lr-decay-iters $(((NR + WU) * GBS / CGBS + 1))
   --critic-lr-warmup-iters $((WU * GBS / CGBS)) --weight-decay 0.01 --adam-beta1 0.9 --adam-beta2 0.999 --clip-grad 1.0
-  # 8x H100, colocated Megatron TP4 x DP2 (TP2 OOMed at the first actor step, s42 14869367) + 8 SGLang engines
+  # 8x H100, colocated Megatron TP4 x DP2 + 8 SGLang engines. TP2 OOMed at the first actor step (s42 14869367): the
+  # fused cross-entropy's fp32 buffer for one 20-33k-token sample took 9.4-15.2 GiB per rank (micro-batch 1, so
+  # --max-tokens-per-gpu does not bound it); TP4 halves the vocab shard and the per-rank weights/grads/optimizer
   --tensor-model-parallel-size 4 --sequence-parallel --pipeline-model-parallel-size 1 --context-parallel-size 1
   --use-distributed-optimizer --balance-data
   --recompute-granularity full --recompute-method uniform --recompute-num-layers 1 --qkv-format bshd
