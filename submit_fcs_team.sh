@@ -60,7 +60,7 @@ else
   BUDGET=${BUDGET:-32768}; CO=10; WU=6; EV=${EVAL_EVERY:-20}; EN=${N_EVAL:-4}; CGBS=128
   VT=$D/fcs_val172_team.jsonl; VS=$D/fcs_val172_solo.jsonl; QOS=${QOS:-pli-short}; TIME=${TIME:-24:00:00}
   extra=(--use-wandb --wandb-mode offline --wandb-dir $B/runs/$R --wandb-project fcs_easyppo
-         --wandb-group fcs_team --disable-wandb-random-suffix)
+         --wandb-group $R --wandb-run-id $R --disable-wandb-random-suffix)
   case $ARM in shared|solocm) ;; *) extra+=(--skip-eval-before-train) ;; esac
 fi
 VPR=fcs_vp_${GAME}_${TAG}_s$SEED; [ -n "${SMOKE:-}" ] && VPR=fcs_vp_smoke_${GAME}_$TAG
@@ -68,7 +68,7 @@ if [ -n "${PRETRAIN:-}" ]; then  # the producer: CO critic-only rollouts, saved;
   R=$VPR; NR=$CO; EV=1000000
   extra=(--save-debug-rollout-data $B/runs/$R/rollout_data/{rollout_id}.pt)
   [ -n "${SMOKE:-}" ] || extra+=(--use-wandb --wandb-mode offline --wandb-dir $B/runs/$R --wandb-project fcs_easyppo
-                                 --wandb-group fcs_team --disable-wandb-random-suffix)
+                                 --wandb-group $R --wandb-run-id $R --disable-wandb-random-suffix)
 elif [ -n "${VP:-}" ]; then
   extra+=(--replay-rollout-data $B/runs/$VPR/rollout_data/{rollout_id}.pt --replay-rollout-until $CO)
   case " ${extra[*]} " in *" --skip-eval-before-train "*) ;; *) extra+=(--skip-eval-before-train) ;; esac

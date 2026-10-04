@@ -26,6 +26,7 @@ indiv on par is plain single-agent RL (each attempt its own score); shared on se
 Training returns one sample per agent turn (a turn that string-extends its session's previous turn shares that
 segment, which then carries the later turn's reward), padded with masked stand-ins to a fixed count per episode (team 6, seq/par MA_FO_ROUNDS), so the samples
 per step stay fixed. Critic groups: 8 g + role (team: plan 0, final 1, subagent 2; seq: round t; par: 0; padding 7).
+A training episode in which any judge call failed for infrastructure reasons is aborted (miles resubmits the group).
 Every real sample carries fo = the episode record (game, scores, role) so post_process recomputes the arm's reward
 (identity live; relabels rollouts replayed by miles --replay-rollout-data). Eval returns the episode's last
 submission's sample with reward V. Latency = generated tokens on the critical path (team: plan + the longest
@@ -218,6 +219,10 @@ async def _play(input: GenerateFnInput) -> GenerateFnOutput:
     label = input.sample.label
     play = {"team": _team, "seq": _seq, "par": _par}[game]
     turns, rec, info, texts = await play(input, messages, label)
+    if info.get("fo_judge_infra_error") and not input.evaluation:
+        # a submission could not be judged (fork / disk / sandbox): its 0 is not the policy's, so do not train on the
+        # episode; miles resubmits the group (eval keeps the 0, flagged in fo_judge_infra_error)
+        raise Aborted("judge infrastructure error")
     V = max(rec["s"] + ([rec["S"]] if game == "team" else []))
     info = {**info, "fo_V": V, "fo_game_" + game: 1.0}
     _write_trace({"time": round(time.time(), 1), "eval": input.evaluation, "game": game, "arm": REWARD,

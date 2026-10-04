@@ -45,7 +45,7 @@ else
   BUDGET=${BUDGET:-32768}; PLAN=16384; CO=10; WU=0; EV=${EVAL_EVERY:-20}; SAVE=${SAVE_EVERY:-5}; EN=${N_EVAL:-2}; CGBS=120
   QOS=${QOS:-pli-short}; TIME=${TIME:-24:00:00}
   extra=(--use-wandb --wandb-mode offline --wandb-dir $B/runs/$R --wandb-project fcs_easyppo
-         --wandb-group fcs_oracle --disable-wandb-random-suffix)
+         --wandb-group $R --wandb-run-id $R --disable-wandb-random-suffix)
   # step 0 once per game: team and par sets in the team producer, the seq set in the seq run
   [ "$GAME" != seq ] && extra+=(--skip-eval-before-train)
 fi
@@ -56,7 +56,7 @@ if [ -n "${PRETRAIN:-}" ]; then  # the producer: CO critic-only rollouts, dumped
   R=$VPR; NR=$((CO + 1)); EV=1000000; SAVE=1000000
   extra=(--save-debug-rollout-data $B/runs/$R/rollout_data/{rollout_id}.pt --debug-exit-after-rollout $CO)
   [ -n "${SMOKE:-}" ] || extra+=(--use-wandb --wandb-mode offline --wandb-dir $B/runs/$R --wandb-project fcs_easyppo
-                                 --wandb-group fcs_oracle --disable-wandb-random-suffix)
+                                 --wandb-group $R --wandb-run-id $R --disable-wandb-random-suffix)
 elif [ -n "${VP:-}" ]; then
   extra+=(--replay-rollout-data $B/runs/$VPR/rollout_data/{rollout_id}.pt --replay-rollout-until $CO)
   case " ${extra[*]} " in *" --skip-eval-before-train "*) ;; *) extra+=(--skip-eval-before-train) ;; esac

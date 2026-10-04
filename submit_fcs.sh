@@ -41,7 +41,7 @@ else
   R=fcs_easyppo_${TAG}_s$SEED; NR=${NUM_ROLLOUT:-200}; RB=16; NS=32; GBS=512; CGBS=128; LEN=32768; CO=30; WU=0
   EV=${EVAL_EVERY:-10}; EN=5; QOS=${QOS:-pli-short}; TIME=${TIME:-24:00:00}
   extra=(--use-wandb --wandb-mode offline --wandb-dir $B/runs/$R --wandb-project fcs_easyppo
-         --wandb-group easyppo --disable-wandb-random-suffix)
+         --wandb-group $R --wandb-run-id $R --disable-wandb-random-suffix)
 fi
 CK=$B/runs/$R/ckpt
 args=(--hf-checkpoint $SG --megatron-hf-checkpoint $MG --megatron-to-hf-mode bridge

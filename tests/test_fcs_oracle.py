@@ -181,6 +181,20 @@ assert JUDGED[-1] == "int main(){D;}" and close(out[0].metadata["fo_S"], 1.0), J
 O.judge_code = _judge
 print("[ok] adopted result reused; special tokens stripped")
 
+# 4c) a judge infrastructure error aborts a training episode (miles resubmits the group); eval keeps the flagged 0
+async def infra_judge(problem_dir, code):
+    r = await fake_judge(problem_dir, code)
+    return {**r, "infra_error": "D;" in code}
+
+
+O.judge_code = infra_judge
+out = play(plan=[(PLAN_TXT, "stop")], sub=SUBS, final=[(cpp("int main(){D;}"), "stop")])
+assert len(out) == 1 and out[0].status == Sample.Status.ABORTED, [o.status for o in out]
+out = play(evaluation=True, game="team", plan=[(PLAN_TXT, "stop")], sub=SUBS, final=[(cpp("int main(){D;}"), "stop")])
+assert len(out) == 1 and out[0].metadata["fo_judge_infra_error"] == 1.0 and out[0].status != Sample.Status.ABORTED
+O.judge_code = _judge
+print("[ok] judge infra error aborts training episodes, flags eval")
+
 # 5) a subagent cut off shows as no code; a plan cut off gives every subagent NO_TASK
 out = play(plan=[("still thinking " * 30, "length")], sub=[SUBS[0], ("x " * 50, "length"), SUBS[2], SUBS[3]],
            final=[(cpp("int main(){A;}"), "stop")])

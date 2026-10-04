@@ -86,4 +86,27 @@ check(f"interactive MLE from peak RSS (problem {inter.name}, ML {ml >> 20} MiB)"
       r["status"] == "done" and max(r["cases"]) == 0.0 and any("rss=" in i for i in r["case_info"]),
       (r.get("case_info") or [""])[0][:120])
 
+# 6) process limit: ~128 new tasks (a fork bomb is contained), a few threads still work
+thr = r"""
+#include <thread>
+#include <vector>
+#include <cstdio>
+#include <cstdlib>
+int main(int argc, char** argv){ int n = atoi(argv[1]), ok = 0; std::vector<std::thread> v;
+  try { for (int i = 0; i < n; i++) { v.emplace_back([]{ volatile long s = 0; for (int k = 0; k < 2000000; k++) s += k; }); ok++; } }
+  catch (...) { }
+  for (auto& t : v) t.join(); printf("%d\n", ok); return 0; }
+"""
+(work / "t.cpp").write_text(thr)
+subprocess.run(J.COMPILE + ["-pthread", "-o", str(work / "t"), str(work / "t.cpp")], check=True)
+run = lambda n: int(subprocess.run([str(work / "t"), str(n)], capture_output=True, text=True, cwd=work, env=J._CLEAN_ENV,
+                                   preexec_fn=J._limits(10, 2 << 30, stack_b=8 << 20,
+                                                        sandbox=J._program_sandbox(work / "t"),
+                                                        nproc=J._nproc_limit())).stdout or -1)
+# (an 8 MiB stack isolates the process limit: with stack = address space, as the judge sets them like the official
+# engine, every new thread reserves the whole address space and no thread starts at all)
+few, many = run(8), run(400)
+check("a program may start a few threads", few == 8, str(few))
+check("a program cannot start ~400 threads (procLimit ~128)", 0 < many <= J.NPROC_MARGIN + 8, str(many))
+
 print("ALL OK" if not fails else f"FAILED: {fails}")

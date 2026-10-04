@@ -23,6 +23,9 @@ export PYTHONUNBUFFERED=1 CUDA_DEVICE_MAX_CONNECTIONS=1 MASTER_ADDR=127.0.0.1 no
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 RAY_USAGE_STATS_ENABLED=0
 export NCCL_NVLS_ENABLE=$(nvidia-smi topo -m 2>/dev/null | grep -c 'NV[0-9]' | awk '{print ($1 > 0) ? 1 : 0}')
 echo "[miles-run] $(date -u +%FT%TZ) host=$(hostname) job=$SLURM_JOB_ID run=$RUN_NAME miles=$MILES sha=$(git -C "$MILES" rev-parse --short HEAD) megatron=$MEGATRON"
+# every segment imports the live trees at start: record exactly which code it ran (uncommitted files counted)
+echo "[miles-run] code: miles $(git -C "$MILES" rev-parse --short HEAD) dirty=$(git -C "$MILES" status --porcelain 2>/dev/null | wc -l)" \
+     "repo $(git -C "$B" rev-parse --short HEAD) dirty=$(git -C "$B" status --porcelain --untracked-files=no 2>/dev/null | wc -l)"
 nvidia-smi --query-gpu=index,name,memory.used --format=csv,noheader
 python3 -c "import torch, sglang; print('torch', torch.__version__, 'sglang', sglang.__version__)"
 

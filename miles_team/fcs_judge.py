@@ -24,7 +24,10 @@ Deviations, all from the 2026-10-04 audit:
     (no #include of test answers), the program opens only its binary, /dev/null, /dev/{u,}random and /proc/self, with
     an empty environment;
   * infrastructure failures (an exception in a case, g++ killed by a signal or out of disk / processes) are flagged
-    ("infra": True) instead of passing as plain zeros.
+    ("infra": True) instead of passing as plain zeros;
+  * a program may create at most ~128 more tasks (the official procLimit): RLIMIT_NPROC counts all of the user's tasks,
+    so the limit is set to the user's current task count + 128 (counted at most every 5 s), which stops a fork bomb
+    from starving the training job and leaves single-threaded programs untouched.
 usage: judge(problem_dir, cpp_source) -> {"score": 0-100, "status": ..., "cases": [...], "infra": bool}
 """
 from __future__ import annotations
@@ -211,7 +214,7 @@ def _restrict(rules):
         os.close(rs)
 
 
-def _limits(cpu_s: float, mem_b: int | None, stack_b: int | None = None, sandbox=None):
+def _limits(cpu_s: float, mem_b: int | None, stack_b: int | None = None, sandbox=None, nproc: int | None = None):
     def f():
         os.setsid()
         resource.setrlimit(resource.RLIMIT_CPU, (max(1, math.ceil(cpu_s)) + 1,) * 2)
@@ -221,6 +224,8 @@ def _limits(cpu_s: float, mem_b: int | None, stack_b: int | None = None, sandbox
             resource.setrlimit(resource.RLIMIT_STACK, (s, s))
         resource.setrlimit(resource.RLIMIT_FSIZE, (STDOUT_MAX, STDOUT_MAX))
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        if nproc:
+            resource.setrlimit(resource.RLIMIT_NPROC, (nproc, nproc))
         if sandbox is not None:
             _restrict(sandbox)
     return f
@@ -245,6 +250,24 @@ def _compile_sandbox(work: Path):
 
 
 _CLEAN_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C"}
+NPROC_MARGIN = 128  # the official engine's procLimit
+_ucount = [0.0, 0]
+
+
+def _nproc_limit() -> int:
+    """The user's current task count (threads included, as RLIMIT_NPROC counts them) + NPROC_MARGIN; 5 s cache."""
+    now = time.monotonic()
+    if now - _ucount[0] > 5:
+        uid, n = os.getuid(), 0
+        for p in os.listdir("/proc"):
+            if p.isdigit():
+                try:
+                    if os.stat(f"/proc/{p}").st_uid == uid:
+                        n += len(os.listdir(f"/proc/{p}/task"))
+                except OSError:
+                    pass
+        _ucount[0], _ucount[1] = now, n
+    return _ucount[1] + NPROC_MARGIN
 
 
 def _wait(p: subprocess.Popen, wall_s: float, rss: list | None = None):
@@ -277,7 +300,7 @@ def _case_classic(prob, sol: Path, chk: Path, case, work: Path) -> float:
     out = work / f"{inp}.out"
     with open(td / inp, "rb") as fi, open(out, "wb") as fo:
         p = subprocess.Popen([str(sol)], stdin=fi, stdout=fo, stderr=subprocess.DEVNULL, cwd=work, env=_CLEAN_ENV,
-                             preexec_fn=_limits(tl, ml, sandbox=_program_sandbox(sol)))
+                             preexec_fn=_limits(tl, ml, sandbox=_program_sandbox(sol), nproc=_nproc_limit()))
         code, cpu, killed = _wait(p, 2 * tl)
     if killed or code != 0 or cpu > tl or out.stat().st_size > STDOUT_MAX:
         return 0.0, f"run: code={code} cpu={cpu:.2f}/{tl} killed={killed}"
@@ -306,7 +329,7 @@ def _case_interactive(prob, sol: Path, inter: Path, case, work: Path) -> float:
         # address space at max(4 x ML, 1 GiB) for the node's sake and score an MLE from the peak RSS
         ps = subprocess.Popen([str(sol)], stdin=i2s_r, stdout=s2i_w, stderr=subprocess.DEVNULL, cwd=work,
                               env=_CLEAN_ENV, preexec_fn=_limits(tl, max(4 * ml, 1 << 30), stack_b=ml,
-                                                                 sandbox=_program_sandbox(sol)))
+                                                                 sandbox=_program_sandbox(sol), nproc=_nproc_limit()))
     except BaseException:
         if pi is not None:  # the interactor started but the program did not: do not leak it
             try:
