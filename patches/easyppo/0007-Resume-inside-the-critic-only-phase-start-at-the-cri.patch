@@ -1,7 +1,7 @@
 From 6a8976bdf6de73ab3b759700a019c7bc04c482cd Mon Sep 17 00:00:00 2001
 From: Wenhao Chai <reselfchai@gmail.com>
 Date: Sat, 3 Oct 2026 21:20:35 -0400
-Subject: [PATCH 7/7] Resume inside the critic-only phase: start at the
+Subject: [PATCH 7/8] Resume inside the critic-only phase: start at the
  critic's rollout with the initial actor; data state from --load
 
 train.py saves only the critic while the actor is frozen, so a run stopped there had a critic checkpoint and no actor

@@ -1,7 +1,7 @@
 From 3346ebde5995d4715614ed1916d848c0ea18687f Mon Sep 17 00:00:00 2001
 From: Wenhao Chai <reselfchai@gmail.com>
 Date: Sat, 3 Oct 2026 14:54:16 -0400
-Subject: [PATCH 6/7] --replay-rollout-data/--replay-rollout-until: replay
+Subject: [PATCH 6/8] --replay-rollout-data/--replay-rollout-until: replay
  another run's rollout dump for the first N rollouts
 
 Value pretraining shared across runs with the same frozen actor: rollouts below N load the dump instead of

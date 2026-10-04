@@ -57,7 +57,11 @@ def score(response: str, problem_dir: str) -> float:
     if not code:
         return 0.0
     try:
-        return judge(problem_dir, code)["score"] / 100.0
+        r = judge(problem_dir, code)
+        if r.get("infra"):  # a case or the compile could not run (fork / disk / sandbox): scored 0, made visible
+            print(f"[fcs_rm] JUDGE-INFRA {problem_dir}: {r.get('status')} {(r.get('msg') or '')[-200:]}"[:500],
+                  file=sys.stderr, flush=True)
+        return r["score"] / 100.0
     except Exception as e:  # an infrastructure failure (helper compile, disk), not the policy's fault: make it visible
         print(f"[fcs_rm] JUDGE-ERROR {problem_dir}: {e}"[:500], file=sys.stderr, flush=True)
         return 0.0
@@ -90,8 +94,12 @@ def judge_full(problem_dir: str, code: str) -> dict:
         print(f"[fcs_rm] JUDGE-ERROR {problem_dir}: {e}"[:500], file=sys.stderr, flush=True)
         return {"score": 0.0, "cases": [0.0] * n, "status": "judge error", "infra_error": True}
     cases = r.get("cases") or [0.0] * n
+    infra = bool(r.get("infra")) or r.get("status") == "infra error"
+    if infra:
+        print(f"[fcs_rm] JUDGE-INFRA {problem_dir}: {r.get('status')} {(r.get('msg') or '')[-200:]}"[:500],
+              file=sys.stderr, flush=True)
     return {"score": r["score"] / 100.0, "cases": [float(c) for c in cases], "status": r["status"],
-            "infra_error": False}
+            "infra_error": infra}
 
 
 async def judge_code(problem_dir: str, code: str) -> dict:

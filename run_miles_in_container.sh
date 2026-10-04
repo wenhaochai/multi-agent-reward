@@ -37,6 +37,10 @@ ray start --head --node-ip-address 127.0.0.1 --num-gpus "${GPUS:-8}" --port=$P -
 export RAY_ADDRESS=127.0.0.1:$P
 trap 'pkill -9 -u "$(id -u)" -f -- "$RAY_TMP" 2>/dev/null || true' EXIT
 
+# a wall-clock kill between the actor save and the critic save leaves the two trackers at different iterations, which
+# fails miles' restored-rollout assert in every chained segment: point both at their newest common iteration first
+[ -d "$RUN_DIR/ckpt" ] && python3 -m miles_team.ckpt_consistency "$RUN_DIR/ckpt" "$RUN_DIR/ckpt_critic" || true
+
 cd "$MILES"
 MODEL_ARGS=$(python3 -c "from miles.utils.external_utils.model_args_utils import shell_safe_model_args; print(shell_safe_model_args('$MILES_MODEL_TYPE'))")
 echo "[miles-run] model args: $MODEL_ARGS"
