@@ -17,7 +17,7 @@
 #   par plays par + team. Step 0 is evaluated once per game (team and par sets: the team producer; seq: its run).
 # Shared value pretraining: PRETRAIN=1 runs the 10 critic-only rollouts of GAME once (runs/fcs_vp_oracle_<game>_...),
 #   dumped; VP=1 VP_DEP=<its jid> makes an arm replay them, relabeled with its reward (fcs_oracle.post_process).
-# Usage: GAME=... REWARD=... [SUB_TESTS=3] [SEED=42] [NUM_ROLLOUT] [EVAL_EVERY] [N_EVAL] [BUDGET] [MODEL] [SMOKE=1] [PRETRAIN=1]
+# Usage: GAME=... REWARD=... [SUB_TESTS=3] [SEED=42] [RUN_TAG=<suffix for a separate run dir>] [NUM_ROLLOUT] [EVAL_EVERY] [N_EVAL] [BUDGET] [MODEL] [SMOKE=1] [PRETRAIN=1]
 #        [VP=1 VP_DEP=jid] [QOS] [TIME] [DEP] [NICE] [MILES_SRC=<worktree>] [EXTRA_ARGS="..."] [DRY=1] bash submit_fcs_oracle.sh
 #   SMOKE=1: 2 rollouts of 2 prompts x 1 episode, 4096-token turns, 16-problem val sets of the game at the end.
 set -euo pipefail
@@ -38,12 +38,12 @@ SUB_TESTS=${SUB_TESTS:-3}
 case $GAME in team) NS_FULL=5; PER=$((2 + 4 * (SUB_TESTS + 1))); EVS=(team par) ;; seq) NS_FULL=6; PER=5; EVS=(seq par) ;; par) NS_FULL=6; PER=5; EVS=(par team) ;; esac
 if [ -n "${SMOKE:-}" ]; then
   # batch and critic batch must divide by DP 2: team 2 x 1 x 18 = 36 (critic 18), seq/par 2 x 2 x 5 = 20 (critic 10)
-  R=fcs_oracle_smoke_${GAME}_${REWARD}_$TAG; NR=${NUM_ROLLOUT:-2}; RB=2; NS=$([ "$GAME" = team ] && echo 1 || echo 2); NVAL=16
+  R=fcs_oracle_smoke_${GAME}_${REWARD}_$TAG${RUN_TAG:+_$RUN_TAG}; NR=${NUM_ROLLOUT:-2}; RB=2; NS=$([ "$GAME" = team ] && echo 1 || echo 2); NVAL=16
   BUDGET=${BUDGET:-4096}; PLAN=2048; CO=1; WU=0; EV=${EVAL_EVERY:-$NR}; SAVE=$NR; EN=${N_EVAL:-1}; CGBS=$((RB * NS * PER / 2))
   QOS=${QOS:-pli-short}; TIME=${TIME:-01:30:00}
   extra=(--skip-eval-before-train)
 else
-  R=fcs_oracle_${GAME}_${REWARD}_${TAG}_s$SEED; NR=${NUM_ROLLOUT:-60}; RB=16; NS=$NS_FULL; NVAL=172
+  R=fcs_oracle_${GAME}_${REWARD}_${TAG}_s$SEED${RUN_TAG:+_$RUN_TAG}; NR=${NUM_ROLLOUT:-60}; RB=16; NS=$NS_FULL; NVAL=172
   # PLAN 16384: the plan turn thinks first (the SFT model averages ~16.5k tokens per solve), and a cut plan gives
   # every subagent NO_TASK and is masked from the actor (audit 2026-10-04; 8192 at first)
   # SAVE 5: a 24 h wall throws away everything since the last save (a team rollout ~36 min, an eval ~2 h)
