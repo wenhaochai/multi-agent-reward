@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=fcs-probe
-#SBATCH --account=group --partition=pli-c --qos=pli-cp
+#SBATCH --account=group --partition=pli-c --qos=pli-short
+# probes are not smoke tests: pli-short (user rule 2026-10-04: pli-cp only for smoke tests)
 #SBATCH --nodes=1 --gres=gpu:8 --cpus-per-task=64 --mem=500G
 #SBATCH --time=03:00:00
 #SBATCH --output=/scratch/gpfs/GROUP/USER/project/miles-q38-build/logs/fcs_probe-%j.out
