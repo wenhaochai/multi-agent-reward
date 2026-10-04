@@ -3,11 +3,15 @@ strip_think + extract_cpp, copied verbatim) scored by the local judge (fcs_judge
 sample.label is the problem directory; the reward is the judge score / 100 (EasyPPO's continuous 0-100 score, rescaled).
 Judges run in threads (each a few subprocesses), at most FCS_RM_CONCURRENCY at once (default: cpus / FCS_CASE_WORKERS).
 Use: --custom-rm-path miles_team.fcs_rm.fcs_rm
+Every FCS_RM_TRACE_EVERY-th judged sample (default 32; 0 = off) is written in full to <run>/traces/solo_<pid>.jsonl
+(<run> = the parent of --save): response, finish reason, extracted code, status, score; tools/read_traces.py reads it.
 """
 import asyncio
+import json
 import os
 import re
 import sys
+import time
 
 from miles_team.fcs_judge import CASE_WORKERS, judge
 
@@ -75,9 +79,38 @@ def _sem():
     return _SEM
 
 
-async def _one(sample) -> float:
+_TRACE_EVERY = int(os.environ.get("FCS_RM_TRACE_EVERY", "32"))
+_trace_n = 0
+
+
+def _trace(args, sample, reward: float) -> None:
+    """Logging only: the full sample of every _TRACE_EVERY-th call, with the status the reward came from."""
+    global _trace_n
+    _trace_n += 1
+    if not _TRACE_EVERY or (_trace_n - 1) % _TRACE_EVERY or not getattr(args, "save", None):
+        return
+    try:
+        resp = sample.response or ""
+        code = extract_cpp(resp)
+        r = judge_full(sample.label, code) if code else {"status": "no code", "score": 0.0}
+        d = os.path.join(os.path.dirname(os.path.abspath(args.save)), "traces")
+        os.makedirs(d, exist_ok=True)
+        rec = {"time": round(time.time(), 1), "label": sample.label, "reward": reward, "status": r["status"], "rejudged_score": r["score"],
+               "truncated": str(getattr(sample, "status", "")).endswith("TRUNCATED"),
+               "response_length": getattr(sample, "response_length", None), "closed_think": "</think>" in resp,
+               "text": resp}
+        with open(os.path.join(d, f"solo_{os.getpid()}.jsonl"), "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception as e:  # tracing must never affect training
+        print(f"[fcs_rm] trace failed: {e}"[:300], file=sys.stderr, flush=True)
+
+
+async def _one(sample, args=None) -> float:
     async with _sem():
-        return await asyncio.to_thread(score, sample.response or "", sample.label)
+        reward = await asyncio.to_thread(score, sample.response or "", sample.label)
+        if args is not None and _TRACE_EVERY:
+            await asyncio.to_thread(_trace, args, sample, reward)
+        return reward
 
 
 def judge_full(problem_dir: str, code: str) -> dict:
@@ -110,5 +143,5 @@ async def judge_code(problem_dir: str, code: str) -> dict:
 
 async def fcs_rm(args, sample, **kwargs):
     if isinstance(sample, list):
-        return list(await asyncio.gather(*(_one(s) for s in sample)))
-    return await _one(sample)
+        return list(await asyncio.gather(*(_one(s, args) for s in sample)))
+    return await _one(sample, args)
