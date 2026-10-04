@@ -111,4 +111,15 @@ check("a program may start a few threads", few == 8, str(few))
 # the program more room, so on a busy node the bound is loose; the point is that 400 cannot all start
 check("a program cannot start ~400 threads (procLimit ~128)", 0 < many < 300, str(many))
 
+# 7) a case's output file is deleted as soon as the case is scored (a program printing 128 MiB per case filled /tmp)
+pr0 = J.load_problem(VAL0)
+case0 = pr0["cases"][0]
+big = "#include <cstdio>\nint main(){ static char b[1<<20]; for(int i=0;i<200;i++) fwrite(b,1,sizeof b,stdout); }\n"
+(work / "big.cpp").write_text(big)
+subprocess.run(J.COMPILE + ["-o", str(work / "big"), str(work / "big.cpp")], check=True)
+chk0 = J._compile_helper(pr0["dir"], pr0["checker"])
+r7 = J._case_classic(pr0, work / "big", chk0, case0, work)
+check("a classic case leaves no output file behind", not (work / f"{case0[0]}.out").exists() and r7[0] == 0.0,
+      str(r7[1])[:80])
+
 print("ALL OK" if not fails else f"FAILED: {fails}")

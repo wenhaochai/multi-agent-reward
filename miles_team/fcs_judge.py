@@ -293,7 +293,7 @@ def _wait(p: subprocess.Popen, wall_s: float, rss: list | None = None):
         time.sleep(0.005)
 
 
-def _case_classic(prob, sol: Path, chk: Path, case, work: Path) -> float:
+def _case_classic_run(prob, sol: Path, chk: Path, case, work: Path) -> float:
     inp, outp, t, mem = case
     td = prob["dir"] / "testdata"
     tl, ml = to_seconds(t), to_bytes(mem)
@@ -313,7 +313,7 @@ def _case_classic(prob, sol: Path, chk: Path, case, work: Path) -> float:
     return ratio, f"chk={r.returncode} cpu={cpu:.2f}/{tl} {msg.strip()[:120]}"
 
 
-def _case_interactive(prob, sol: Path, inter: Path, case, work: Path) -> float:
+def _case_interactive_run(prob, sol: Path, inter: Path, case, work: Path) -> float:
     inp, outp, t, mem = case
     td = prob["dir"] / "testdata"
     tl, ml = to_seconds(t), to_bytes(mem)
@@ -357,6 +357,24 @@ def _case_interactive(prob, sol: Path, inter: Path, case, work: Path) -> float:
         return 0.0, info                              # the run itself failed: no credit
     ok = icode == OK_EXIT and not ikilled
     return _ratio(imsg if inter_scoring else "", inter_scoring, ok, prob["train"]), info
+
+
+def _case_classic(prob, sol: Path, chk: Path, case, work: Path) -> float:
+    """A classic case; its output file is deleted as soon as the case is scored (a program that prints 128 MiB on
+    each of 130 cases otherwise holds 16 GiB of /tmp until the whole judge ends: della-vis2, 2026-10-04)."""
+    try:
+        return _case_classic_run(prob, sol, chk, case, work)
+    finally:
+        (work / f"{case[0]}.out").unlink(missing_ok=True)
+
+
+def _case_interactive(prob, sol: Path, inter: Path, case, work: Path) -> float:
+    """An interactive case; the interactor's output and stderr files are deleted once the case is scored."""
+    try:
+        return _case_interactive_run(prob, sol, inter, case, work)
+    finally:
+        for suffix in (".tout", ".ierr"):
+            (work / f"{case[0]}{suffix}").unlink(missing_ok=True)
 
 
 def judge(problem_dir, source: str, case_workers: int = CASE_WORKERS) -> dict:
