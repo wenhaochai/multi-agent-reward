@@ -84,7 +84,8 @@ def score(response: str, problem_dir: str) -> float:
 def _sem():
     global _SEM
     if _SEM is None:
-        n = int(os.environ.get("FCS_RM_CONCURRENCY", max(1, (os.cpu_count() or 8) // CASE_WORKERS)))
+        # default: the job's own cores (sched_getaffinity, not the node's cpu_count), 8 kept for SGLang
+        n = int(os.environ.get("FCS_RM_CONCURRENCY", max(1, (len(os.sched_getaffinity(0)) - 8) // CASE_WORKERS)))
         _SEM = asyncio.Semaphore(n)
     return _SEM
 

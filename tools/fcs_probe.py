@@ -58,7 +58,9 @@ def main():
     gen_f, sc_f = out / 'gen.jsonl', out / 'scores.jsonl'
     done_gen = {r['key']: r for r in load(gen_f)}
     done_sc = {r['key'] for r in load(sc_f)}
-    pool = ThreadPoolExecutor(max(1, (os.cpu_count() or 8) // CASE_WORKERS))
+    # judges at once: the job's own cores (os.cpu_count() is the whole 96-core node, the job has 64), 8 kept for the
+    # SGLang schedulers; oversubscription trips the judge's wall limit (2 x the time limit)
+    pool = ThreadPoolExecutor(max(1, (len(os.sched_getaffinity(0)) - 8) // CASE_WORKERS))
     futs = [pool.submit(score_one, r) for k, r in done_gen.items() if k not in done_sc]
     rest = [t for t in todo if t['key'] not in done_gen]
     print(f'{len(todo)} samples; {len(done_gen)} generated already; {len(rest)} to generate', flush=True)
