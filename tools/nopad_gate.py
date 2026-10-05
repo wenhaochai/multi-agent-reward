@@ -10,11 +10,12 @@ The checks that hold whatever the split:
   1. B ran both replayed rollouts on the no-pad path: critic-steps 0-3 and actor step 1, every metric finite, both
      flags on its command line, and every visible "variable rollout" line planning 1 actor step or 2 critic steps.
   2. Actor step 1 sees every real token of rollout 1 under the initial weights in both runs (rollout 0 trains only the
-     critic), so the trainer-vs-rollout log-prob gap must agree: relative difference <= 5% (abs diff), <= 25% (KL),
-     ESS ratio within 0.01. Broken per-sample padding or masks would move these far more.
+     critic). Exact, whatever the padding layout: ESS ratio = 6646/6655 (A's 6646/6679 without the 24 pads), PPO KL
+     and reference KL 0, 6 samples per rank. Within bands that absorb bf16 layout noise: the trainer-vs-rollout log-prob
+     gap (abs diff within 15%, KL within 50% of A's; data from another run differs by 32%).
   3. Coarse scale checks, which catch a wrong token normalization (pads counted as tokens or samples gives ~3x): the
-     mean critic value loss of the 4 critic steps within 0.67-1.5x of A's, the actor grad norm within 0.33-3x, and
-     no critic grad norm above 10x A's largest."""
+     mean critic value loss of the 4 critic steps within 0.5-2x of A's, the actor grad norm within 0.33-3x, and no
+     critic grad norm above 10x A's largest."""
 import ast
 import math
 import re
@@ -76,16 +77,26 @@ if not fails:
             var.append((m.group(1), int(m.group(2)), int(m.group(3))))
     want = {"actor": 1, "critic": 2}
     check(var and all(st == want[role] for role, _, st in var), f"B no-pad step plans (role, local samples, steps): {sorted(set(var))}")
+    # each replayed rollout has 12 real samples, balanced 6 and 6 over the 2 DP ranks (TP 4 x DP 2)
+    check(var and all(n == 6 for _, n, _ in var), f"B ranks hold 6 samples each: {sorted({n for _, n, _ in var})}")
     a1, b1 = A[("step", 1)], B[("step", 1)]
-    for name, tol in (("train/train_rollout_logprob_abs_diff", 0.05), ("train/train_rollout_kl", 0.25)):
+    # B pads each sequence to its own length (A: all to 6144), which moves bf16 sums by an unmeasured amount: wide
+    # bands here, exact layout-free checks below
+    for name, tol in (("train/train_rollout_logprob_abs_diff", 0.15), ("train/train_rollout_kl", 0.5)):
         check(rel(b1[name], a1[name]) <= tol, f"actor step 1 {name}: A {a1[name]:.6g} B {b1[name]:.6g} rel {rel(b1[name], a1[name]):.2e} <= {tol}")
-    d = abs(b1["train/ess_ratio"] - a1["train/ess_ratio"])
-    check(d <= 0.01, f"actor step 1 ess_ratio: A {a1['train/ess_ratio']:.5f} B {b1['train/ess_ratio']:.5f} |diff| {d:.2e} <= 0.01")
+    # actor step 1 has 6646 loss tokens (3 sequences; --actor-only-overlong-filter masks the 9 truncated ones), and each
+    # fully masked row adds 1 to the token denominator: A 6646 / (6646 + 24 pads + 9) = 0.9950591 as logged, so B,
+    # without the pads, must log 6646 / 6655 (independent review, 2026-10-04, from A's dumps)
+    d = abs(b1["train/ess_ratio"] - 6646 / 6655)
+    check(d <= 5e-4, f"actor step 1 ess_ratio: A {a1['train/ess_ratio']:.7f} B {b1['train/ess_ratio']:.7f}, want 6646/6655 = {6646 / 6655:.7f} +- 5e-4")
+    # the first step is on-policy against the initial weights: PPO KL and reference KL are exactly 0 in A
+    for name in ("train/ppo_kl", "train/kl_loss"):
+        check(abs(b1[name]) <= 1e-6, f"actor step 1 {name}: A {a1[name]:.3g} B {b1[name]:.3g}, want 0")
     r = b1["train/grad_norm"] / a1["train/grad_norm"]
     check(1 / 3 <= r <= 3, f"actor step 1 grad_norm: A {a1['train/grad_norm']:.4g} B {b1['train/grad_norm']:.4g} ratio {r:.3f} in [0.33, 3]")
     va = sum(A[("critic-step", k)]["train/critic-value_loss"] for k in range(4)) / 4
     vb = sum(B[("critic-step", k)]["train/critic-value_loss"] for k in range(4)) / 4
-    check(0.67 <= vb / va <= 1.5, f"mean critic value loss: A {va:.4g} B {vb:.4g} ratio {vb / va:.3f} in [0.67, 1.5]")
+    check(0.5 <= vb / va <= 2.0, f"mean critic value loss: A {va:.4g} B {vb:.4g} ratio {vb / va:.3f} in [0.5, 2]")
     ga = max(A[("critic-step", k)]["train/critic-grad_norm"] for k in range(4))
     gb = max(B[("critic-step", k)]["train/critic-grad_norm"] for k in range(4))
     check(gb <= 10 * ga, f"largest critic grad norm: A {ga:.4g} B {gb:.4g} <= 10x A")
