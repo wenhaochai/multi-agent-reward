@@ -8,5 +8,5 @@
 B=/scratch/gpfs/GROUP/USER/project/miles-q38-build
 LT=/tmp/fcs_$SLURM_JOB_ID; mkdir -p $LT; trap 'rm -rf $LT' EXIT
 apptainer exec --contain --cleanenv --bind /scratch/gpfs/GROUP/USER,$LT:/tmp \
-  --env HOME=/tmp/home,FCS_JUDGE_CACHE=/tmp/fcsj_cache,PYTHONPATH=$B/pyfix,FCS_EXTRACT=last,FCS_CASE_WORKERS=1,RESCORE_WORKERS=14 \
+  --env HOME=/tmp/home,FCS_JUDGE_CACHE=/tmp/fcsj_cache,PYTHONPATH=$B/pyfix,FCS_EXTRACT=last,FCS_CASE_WORKERS=1 \
   $B/miles.sif python3 $B/tools/rescore_probe.py "$@"
