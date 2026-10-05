@@ -7,8 +7,8 @@ Slurm cancel them (kill_invalid_depend).
 A and B split a rollout's real samples into optimizer steps differently (A balanced 36 samples with 24 pads over the
 ranks; B balances the 12 real ones), so single critic steps see different samples and are compared only coarsely.
 The checks that hold whatever the split:
-  1. B ran both replayed rollouts on the no-pad path: critic-steps 0-3 and actor step 1, every metric finite, and the
-     "variable rollout" lines with 1 actor step and 2 critic steps per rollout.
+  1. B ran both replayed rollouts on the no-pad path: critic-steps 0-3 and actor step 1, every metric finite, both
+     flags on its command line, and every visible "variable rollout" line planning 1 actor step or 2 critic steps.
   2. Actor step 1 sees every real token of rollout 1 under the initial weights in both runs (rollout 0 trains only the
      critic), so the trainer-vs-rollout log-prob gap must agree: relative difference <= 5% (abs diff), <= 25% (KL),
      ESS ratio within 0.01. Broken per-sample padding or masks would move these far more.
@@ -62,13 +62,20 @@ for key in need:
 if not fails:
     bad = [f"{k[0]} {k[1]} {n}" for k in need for n, v in B[k].items() if isinstance(v, float) and not math.isfinite(v)]
     check(not bad, f"B metrics finite {bad or ''}")
-    var = {"actor": [], "critic": []}
+    # the no-pad path: B's launcher printed both flags, and every visible "variable rollout" line has its role's step
+    # count. Ray folds lines of one pattern (words with digits ignored, so actor and critic lines match) from several
+    # processes into one "[repeated Nx]" line, so a role may have no visible line; at least one line must show
+    train = next((l for l in open(b_log, errors="replace") if "[miles-run] train args:" in l), "")
+    extra = next((l for l in open(b_log, errors="replace") if "[miles-run] extra args:" in l), "")
+    flags = [f for f in ("--variable-rollout-samples", "--bshd-pad-per-sample") if f not in train + extra]
+    check(not flags, f"B launched with both no-pad flags {flags or ''}")
+    var = []
     for line in open(b_log, errors="replace"):
         m = VAR.search(line)
         if m:
-            var[m.group(1)].append((int(m.group(2)), int(m.group(3))))
-    check(len(var["actor"]) >= 1 and {s for _, s in var["actor"]} == {1}, f"B actor on the no-pad path, 1 step per rollout: {sorted(set(var['actor']))}")
-    check(len(var["critic"]) >= 2 and {s for _, s in var["critic"]} == {2}, f"B critic on the no-pad path, 2 steps per rollout: {sorted(set(var['critic']))}")
+            var.append((m.group(1), int(m.group(2)), int(m.group(3))))
+    want = {"actor": 1, "critic": 2}
+    check(var and all(st == want[role] for role, _, st in var), f"B no-pad step plans (role, local samples, steps): {sorted(set(var))}")
     a1, b1 = A[("step", 1)], B[("step", 1)]
     for name, tol in (("train/train_rollout_logprob_abs_diff", 0.05), ("train/train_rollout_kl", 0.25)):
         check(rel(b1[name], a1[name]) <= tol, f"actor step 1 {name}: A {a1[name]:.6g} B {b1[name]:.6g} rel {rel(b1[name], a1[name]):.2e} <= {tol}")
