@@ -4,6 +4,7 @@
 #SBATCH --nodes=1 --ntasks=1 --cpus-per-task=32 --mem=64G
 #SBATCH --time=01:01:00
 #SBATCH --output=/scratch/gpfs/GROUP/USER/project/miles-q38-build/logs/fcs_parity-%j.out
+set -euo pipefail
 B=/scratch/gpfs/GROUP/USER/project/miles-q38-build
 W=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace
 LT=/tmp/fcs_$SLURM_JOB_ID; mkdir -p $LT  # container /tmp under --contain is a tiny tmpfs (parity 14849538: ENOSPC)

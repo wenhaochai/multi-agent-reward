@@ -3,6 +3,7 @@
 #SBATCH --account=group --partition=cpu --qos=short
 #SBATCH --nodes=1 --cpus-per-task=16 --mem=48G --time=04:00:00
 #SBATCH --output=/scratch/gpfs/GROUP/USER/project/miles-q38-build/logs/fcs_rescore-%j.out
+set -euo pipefail
 # re-judge probe answers with the current judge and the last-code-block rule: sbatch tools/rescore_probe.sbatch <probe dirs>
 # judges = the job's cores - 1 (fcs_judge.job_cpus), one case at a time each (the wall limit is 2 x the time limit)
 B=/scratch/gpfs/GROUP/USER/project/miles-q38-build

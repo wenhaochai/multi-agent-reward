@@ -4,6 +4,7 @@
 #SBATCH --nodes=1 --ntasks=1 --cpus-per-task=32 --mem=96G
 #SBATCH --time=02:00:00
 #SBATCH --output=/scratch/gpfs/GROUP/USER/project/miles-q38-build/logs/fcs_parity2-%j.out
+set -euo pipefail
 # official judge (host go-judge + node) and the local judge on the same node, one after the other
 B=/scratch/gpfs/GROUP/USER/project/miles-q38-build
 G=/scratch/gpfs/GROUP/USER/project/gojudge

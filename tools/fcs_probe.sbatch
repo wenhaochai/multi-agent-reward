@@ -5,6 +5,7 @@
 #SBATCH --nodes=1 --gres=gpu:8 --cpus-per-task=64 --mem=500G
 #SBATCH --time=03:00:00
 #SBATCH --output=/scratch/gpfs/GROUP/USER/project/miles-q38-build/logs/fcs_probe-%j.out
+set -euo pipefail
 # difficulty probe: base model on val172 x5 and train200 x4 (EasyPPO eval settings), judged locally
 # variants: PROMPT_FILE (system message / user suffix), TEMP, NVAL / NTRAIN samples per problem
 B=/scratch/gpfs/GROUP/USER/project/miles-q38-build
