@@ -134,5 +134,5 @@ echo "$R: arm=$ARM ${ft[*]} rb=$RB ns=$NS gbs=$GBS miles=$(git -C $MILES_SRC rev
 mkdir -p $B/runs/$R
 unset $(compgen -e | grep '^MA_' || true)   # only this arm's MA_* reach the job
 jid=$(env "${envs[@]}" sbatch --parsable --partition=pli-c --account=group --qos=$QOS --time=$TIME "${sb[@]}" \
-  --gres=gpu:8 --cpus-per-task=64 --mem=640G --job-name="miles-$R" $B/sbatch_miles.sh "${args[@]}")
+  --gres=gpu:8 --cpus-per-task=96 --mem=900G --job-name="miles-$R" $B/sbatch_miles.sh "${args[@]}")
 echo "  submitted: job $jid"
