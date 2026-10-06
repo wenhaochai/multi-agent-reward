@@ -85,7 +85,7 @@ sb=(); [ -n "${NICE:-}" ] && sb=(--nice="$NICE")
 echo "$R: miles=$(git -C $MILES_SRC rev-parse --short HEAD) repo=$(git -C $B rev-parse --short HEAD) qos=$QOS time=$TIME"
 [ -n "${DRY:-}" ] && { echo "  ${args[*]}"; exit 0; }
 mkdir -p $B/runs/$R
-jid=$(env FCS_RM_CONCURRENCY=56 FCS_CASE_WORKERS=1 MILES_SRC=$MILES_SRC RUN_NAME=$R GPUS=8 MILES_MODEL_TYPE=qwen3.5-9B \
+jid=$(env FCS_RM_CONCURRENCY=56 FCS_CASE_WORKERS=1 FCS_CASE_POOL=1 MILES_SRC=$MILES_SRC RUN_NAME=$R GPUS=8 MILES_MODEL_TYPE=qwen3.5-9B \
   sbatch --parsable --partition=pli-c --account=group --qos=$QOS --time=$TIME "${sb[@]}" --gres=gpu:8 \
   --cpus-per-task=64 --mem=640G --job-name="miles-$R" $B/sbatch_miles.sh "${args[@]}")
 echo "  submitted: job $jid"

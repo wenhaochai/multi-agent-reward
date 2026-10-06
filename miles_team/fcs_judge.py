@@ -402,6 +402,23 @@ def _case_interactive(prob, sol: Path, inter: Path, case, work: Path) -> float:
             (work / f"{case[0]}{suffix}").unlink(missing_ok=True)
 
 
+# FCS_CASE_POOL=1: one process-wide pool of FCS_CASE_SLOTS threads (default: the job's cores - 8) runs every compile
+# and every test case of every judge call, first come first served. The CPU stays bounded as before, a busy judge keeps
+# its throughput, and a program judged alone gets all slots for its cases. With a fixed FCS_CASE_WORKERS per program
+# and one case at a time, the last program of an eval ran its 100 cases one by one for ~50 min while every GPU idled,
+# and the CSES 90-min rule cancelled job 14952941 (2026-10-06).
+CASE_POOL = os.environ.get("FCS_CASE_POOL", "0") == "1"
+_POOL = None
+
+
+def _case_pool() -> ThreadPoolExecutor:
+    global _POOL
+    if _POOL is None:
+        slots = int(os.environ.get("FCS_CASE_SLOTS", "0")) or max(1, job_cpus() - 8)
+        _POOL = ThreadPoolExecutor(max_workers=slots, thread_name_prefix="fcs-slot")
+    return _POOL
+
+
 def judge(problem_dir, source: str, case_workers: int = CASE_WORKERS) -> dict:
     prob = load_problem(Path(problem_dir))
     if not prob["cases"]:
@@ -410,17 +427,23 @@ def judge(problem_dir, source: str, case_workers: int = CASE_WORKERS) -> dict:
     try:
         (work / "sol.cpp").write_text(source)
         sol = work / "sol"
-        r = subprocess.run(COMPILE + ["-o", str(sol), str(work / "sol.cpp")], capture_output=True, text=True,
-                           errors="replace", timeout=120, env={**_CLEAN_ENV, "TMPDIR": str(work)},
-                           preexec_fn=_limits(600, None, sandbox=_compile_sandbox(work)))
+        def compile_():
+            return subprocess.run(COMPILE + ["-o", str(sol), str(work / "sol.cpp")], capture_output=True, text=True,
+                                  errors="replace", timeout=120, env={**_CLEAN_ENV, "TMPDIR": str(work)},
+                                  preexec_fn=_limits(600, None, sandbox=_compile_sandbox(work)))
+        r = _case_pool().submit(compile_).result() if CASE_POOL else compile_()
         if r.returncode != 0:
             infra = r.returncode < 0 or any(m in r.stderr for m in _INFRA_MARKERS)
             return {"score": 0.0, "status": "infra error" if infra else "compile error", "cases": [],
                     "msg": r.stderr[:1 << 21], "infra": infra}  # whole compiler output (up to 2 MiB)
         helper = _compile_helper(prob["dir"], prob["interactor"] if prob["interactive"] else prob["checker"])
         fn = _case_interactive if prob["interactive"] else _case_classic
-        with ThreadPoolExecutor(max_workers=max(1, case_workers)) as ex:
-            res = list(ex.map(lambda c: _safe(fn, prob, sol, helper, c, work), prob["cases"]))
+        if CASE_POOL:   # leaf tasks only (no slot waits on another), so the shared pool cannot deadlock
+            futs = [_case_pool().submit(_safe, fn, prob, sol, helper, c, work) for c in prob["cases"]]
+            res = [f.result() for f in futs]
+        else:
+            with ThreadPoolExecutor(max_workers=max(1, case_workers)) as ex:
+                res = list(ex.map(lambda c: _safe(fn, prob, sol, helper, c, work), prob["cases"]))
         ratios = [r for r, _ in res]
         infos = [i for _, i in res]
         return {"score": 100.0 * sum(ratios) / len(ratios), "status": "done", "cases": ratios, "case_info": infos,
