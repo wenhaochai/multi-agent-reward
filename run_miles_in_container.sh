@@ -57,5 +57,13 @@ echo "[miles-run] train args: $*"
 # runs/<run>/extra_args, whitespace-separated flags, '#' lines ignored, appended last (argparse: the last flag wins)
 EXTRA=()
 [ -f "$RUN_DIR/extra_args" ] && read -r -a EXTRA <<< "$(grep -v '^#' "$RUN_DIR/extra_args" | tr '\n' ' ')"
+# runs/<run>/eval_before_train_once: this segment evaluates before training (miles labels it with the resumed checkpoint's
+# rollout, so it redoes an eval a cancelled segment lost) despite --skip-eval-before-train; the file is used up
+if [ -f "$RUN_DIR/eval_before_train_once" ]; then
+  KEEP=(); for a in "$@"; do [ "$a" = "--skip-eval-before-train" ] || KEEP+=("$a"); done; set -- "${KEEP[@]}"
+  KEEP=(); for a in "${EXTRA[@]}"; do [ "$a" = "--skip-eval-before-train" ] || KEEP+=("$a"); done; EXTRA=("${KEEP[@]}")
+  mv "$RUN_DIR/eval_before_train_once" "$RUN_DIR/eval_before_train_once.used.$SLURM_JOB_ID"
+  echo "[miles-run] eval before training (one shot, $RUN_DIR/eval_before_train_once)"
+fi
 echo "[miles-run] extra args: ${EXTRA[*]:-none}"
 eval "python3 train.py $MODEL_ARGS \"\$@\" \"\${EXTRA[@]}\""
