@@ -10,6 +10,11 @@ multi-block answers the longest is usually the first draft (149 of 203) and the 
 Every comparison is against our own single-agent baseline under the same rule, so no second (official) score is kept.
 Every FCS_RM_TRACE_EVERY-th judged sample (default 32; 0 = off) is written in full to <run>/traces/solo_<pid>.jsonl
 (<run> = the parent of --save): response, finish reason, extracted code, status, score; tools/read_traces.py reads it.
+No answer, no score (owner decision 2026-10-07): a reply cut off at its token limit, or a thinking reply that never
+closed its reasoning (no </think>), scores 0 without being judged, in this solo reward and in every fcs_oracle game
+(answer()). FrontierSmith's strip_think keeps the whole text of an unclosed reply, so the code written inside the
+reasoning was judged; this reward did that until 2026-10-07 (runs switch at their first segment after that).
+FCS_THINK=0 (a non-thinking chat template, whose replies have no </think>) zeroes only the cut-off ones.
 """
 import asyncio
 import functools
@@ -31,6 +36,28 @@ def strip_think(response: str) -> str:
         return response
     _, sep, suffix = response.rpartition("</think>")
     return suffix if sep else response
+
+
+def answer(text: str, thinking: bool = True) -> str:
+    """The answer part of a reply: the text after the last </think>; a thinking reply that never closed its reasoning
+    has none."""
+    if thinking and "</think>" not in (text or ""):
+        return ""
+    return strip_think(text or "") or ""
+
+
+THINK = os.environ.get("FCS_THINK", "1") == "1"
+
+
+def _cut(sample) -> bool:
+    """The sample hit its token limit (miles sets Sample.Status.TRUNCATED)."""
+    st = getattr(sample, "status", None)
+    return getattr(st, "name", str(st)) == "TRUNCATED"
+
+
+def answered(text: str, cut: bool, thinking: bool = THINK) -> bool:
+    """A reply that may be judged: not cut off, and (thinking on) its reasoning closed."""
+    return not cut and (not thinking or "</think>" in (text or ""))
 
 
 EXTRACT = os.environ.get("FCS_EXTRACT", "last")
@@ -181,6 +208,7 @@ def _trace(args, sample, reward: float) -> None:
         d = os.path.join(os.path.dirname(os.path.abspath(args.save)), "traces")
         os.makedirs(d, exist_ok=True)
         rec = {"time": round(time.time(), 1), "label": sample.label, "reward": reward, "status": r["status"], "rejudged_score": r["score"],
+               "answered": answered(resp, _cut(sample)),
                "truncated": str(getattr(sample, "status", "")).endswith("TRUNCATED"),
                "response_length": getattr(sample, "response_length", None), "closed_think": "</think>" in resp,
                "text": resp}
@@ -192,7 +220,8 @@ def _trace(args, sample, reward: float) -> None:
 
 async def _one(sample, args=None) -> float:
     async with _sem():
-        reward = await _thread(score, sample.response or "", sample.label)
+        resp = sample.response or ""
+        reward = await _thread(score, resp, sample.label) if answered(resp, _cut(sample)) else 0.0
         if args is not None and _TRACE_EVERY:
             await _thread(_trace, args, sample, reward)
         return reward

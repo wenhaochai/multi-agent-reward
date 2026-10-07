@@ -51,7 +51,7 @@ from copy import deepcopy
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
 from miles.utils.types import Sample
 
-from .fcs_rm import code_blocks, extract_cpp, judge_code, strip_think
+from .fcs_rm import answer, code_blocks, extract_cpp, judge_code
 from .team_rollout import Aborted, Session, _pad_sample
 
 GAME = os.environ.get("MA_FO_GAME", "team")
@@ -130,10 +130,17 @@ _REPORT_OPEN_RE = re.compile(r"<report>(.*)$", re.IGNORECASE | re.DOTALL)
 _trace_count = 0
 
 
+def _ans(text: str) -> str:
+    """A reply's answer, after its reasoning; none when a thinking reply never closed it (fcs_rm.answer: such a reply,
+    like a cut-off one, submits nothing, owner decision 2026-10-07; until then its code inside the reasoning was
+    judged)."""
+    return answer(text, THINK)
+
+
 def parse_tasks(text: str, n: int) -> list[str]:
     """The lead's tasks from its visible answer; missing ones become NO_TASK."""
     tasks = {}
-    for m in _TASK_RE.finditer(strip_think(text) or ""):
+    for m in _TASK_RE.finditer(_ans(text)):
         j = int(m.group(1))
         if 1 <= j <= n and j not in tasks and m.group(2).strip():
             tasks[j] = m.group(2).strip()
@@ -141,7 +148,7 @@ def parse_tasks(text: str, n: int) -> list[str]:
 
 
 def parse_adopt(text: str, k: int) -> int | None:
-    m = _ADOPT_RE.search(strip_think(text) or "")
+    m = _ADOPT_RE.search(_ans(text))
     if m and 1 <= int(m.group(1)) <= k:
         return int(m.group(1))
     return None
@@ -251,7 +258,7 @@ def _tt(role: str, text: str, cut: bool, res: dict | None, **extra) -> dict:
 
 def _visible(text: str, cut: bool) -> str:
     """What an agent's earlier turn shows in later context: its answer without the reasoning."""
-    return "(cut off: the answer hit the token limit)" if cut else (strip_think(text) or "").strip() or "(empty)"
+    return "(cut off: the answer hit the token limit)" if cut else _ans(text).strip() or "(empty)"
 
 
 def _pearson(a: list[float], b: list[float]) -> float | None:
@@ -308,7 +315,7 @@ async def _play(input: GenerateFnInput) -> GenerateFnOutput:
 def last_block(text: str) -> str:
     """The last cpp-tagged block of a reply's visible part, or "" (a reply without one submits nothing; an untagged
     block, e.g. a test case, is not a program)."""
-    m = code_blocks(strip_think(text) or "", untagged=False)
+    m = code_blocks(_ans(text), untagged=False)
     return m[-1] if m else ""
 
 
@@ -364,7 +371,7 @@ async def _subagent(input, j: int, messages: list, task: str, label: str) -> dic
         clamped = clamped or (cut and seg < 0) or _prompt_len(sess, seg) + budget > MAX_LEN
         if seg >= 0 and seg not in segs:
             segs.append(seg)
-        vis = "" if cut else (strip_think(text) or "").strip()
+        vis = "" if cut else _ans(text).strip()
         code = "" if (cut or last_turn) else last_block(text)
         # a report: a closed <report>...</report>, or an open <report> in a reply with no cpp block (a mention of the
         # tag in a test reply does not stop its program from being judged)
@@ -409,13 +416,13 @@ async def _final(input, name, msgs: list, subr: list[dict], label: str):
     sess = Session(input, name, THINK, max_len=MAX_LEN) if isinstance(name, str) else name
     text, cut, seg = await _turn(sess, msgs, BUDGET)
     code = "" if cut else last_block(text)
-    tag = None if cut else _ADOPT_RE.search(strip_think(text) or "")
+    tag = None if cut else _ADOPT_RE.search(_ans(text))
     adopted = parse_adopt(text, len(subr)) if (tag and not code) else None
     if adopted is not None and subr[adopted - 1]["tests"]:
         r = subr[adopted - 1]
         return sess, text, cut, seg, adopted, r["tests"][r["best"]][1]
     if not code and not cut and not tag:
-        code = extract_cpp(text)  # no fenced cpp block and no adopt tag: the fallback, as for a solo answer
+        code = extract_cpp(_ans(text))  # no fenced cpp block and no adopt tag: the fallback, as for a solo answer
     return sess, text, cut, seg, None, _check_infra(input, await judge_code(label, code))
 
 
@@ -456,7 +463,7 @@ async def _team(input, messages, label):
             "fo_final_bad": _bad(fres), "fo_report_chars": sum(len(r["report"]) for r in subr) / n,
             "fo_final_prompt_tokens": final_prompt,
             "fo_final_clamped": float((fcut and fseg < 0) or final_prompt + BUDGET > MAX_LEN),
-            "fo_adopt_invalid": float(bool(not fcut and _ADOPT_RE.search(strip_think(ftext) or "")) and adopted is None
+            "fo_adopt_invalid": float(bool(not fcut and _ADOPT_RE.search(_ans(ftext))) and adopted is None
                                       and not last_block(ftext)),
             "fo_sub_clamped": sum(r["clamped"] for r in subr) / n,
             "fo_tokens": lead_gen + sum(gen_sub), "fo_latency": lead_gen + max(gen_sub), "fo_plan_tokens": plan_gen,
@@ -477,7 +484,7 @@ async def _seq(input, messages, label):
     cut_n, bad, infra, best = 0, 0.0, False, 0.0
     for t in range(ROUNDS):
         text, cut, seg = await _turn(sess, chat, BUDGET)
-        code = "" if cut else extract_cpp(text)
+        code = "" if cut else extract_cpp(_ans(text))
         res = _check_infra(input, await judge_code(label, code))
         s.append(res["score"])
         turns.append((sess, seg))
@@ -502,7 +509,7 @@ async def _seq(input, messages, label):
 async def _par(input, messages, label):
     sessions = [Session(input, f"try{t + 1}", THINK, max_len=MAX_LEN) for t in range(ROUNDS)]
     runs = await _gather(*[_turn(x, messages, BUDGET) for x in sessions])
-    res = await _gather(*[judge_code(label, "" if cut else extract_cpp(text)) for text, cut, _ in runs])
+    res = await _gather(*[judge_code(label, "" if cut else extract_cpp(_ans(text))) for text, cut, _ in runs])
     s = [r["score"] for r in res]
     gen = [_gen(x) for x in sessions]
     rec = {"game": "par", "s": s}

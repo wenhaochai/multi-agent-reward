@@ -138,7 +138,12 @@ print("[ok] reward tables")
 # 2) parsing: tasks (also </task N>), code blocks (line-anchored, cpp-tagged for tests), output rule
 t = O.parse_tasks("<task 1>in thinking</task></think>\n<task 2> B </task 2><task 3>C</task><task 9>x</task>", 4)
 assert t == [O.NO_TASK, "B", "C", O.NO_TASK], t
-assert O.last_block("```cpp\nint a;\n```\nthen\n```cpp\nint b;\n```") == "int b;"
+assert O.last_block("x</think>```cpp\nint a;\n```\nthen\n```cpp\nint b;\n```") == "int b;"
+# no answer, no score (2026-10-07): a reply that never closed its reasoning submits nothing, adopts nothing, has no tasks
+assert O.last_block("```cpp\nint a;\n```\nthen\n```cpp\nint b;\n```") == ""
+assert O._ans("draft ```cpp\nint a;\n```") == "" and O.parse_adopt("<adopt 1/>", 3) is None
+assert O.parse_tasks("<task 1>A</task><task 2>B</task>", 2) == [O.NO_TASK, O.NO_TASK]
+assert O._visible("still thinking ```cpp\nint a;\n```", False) == "(empty)"
 assert O.last_block("x</think>no code here, just ideas") == ""
 assert O.last_block("x</think>```text\n3\n```\nThen:\n```cpp\nint main(){}\n```") == "int main(){}"
 assert O.last_block("x</think>```cpp\nint main(){}\n```\nTest:\n```\n5\n1 2\n```") == "int main(){}"

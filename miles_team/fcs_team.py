@@ -39,6 +39,10 @@ Eval: MA_FT_EVAL_MATES teammates (default MA_FT_MATES; a solo-trained run sets 3
 sample.metadata["ft_mode"] == "solo" plays one agent on the solo prompt (reward s: the weights as a single
 agent); otherwise the full game, returning the lead's sample with reward S. Episode stats (ft_*) ride on the lead's
 sample metadata; log_rollout / log_eval average them into rollout/ft_* and eval/<set>/ft_*.
+
+Scoring rule kept on purpose (2026-10-07): the v1 team study (solocm, mix50, shared, indiv) judges the code of a
+cut-off or unclosed reply (FrontierSmith's strip_think), as its solo arm solocm did, so its arms stay comparable;
+the solo EasyPPO reward (fcs_rm) and the fcs_oracle games score such a reply 0 from 2026-10-07.
 """
 from __future__ import annotations
 
