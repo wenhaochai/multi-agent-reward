@@ -12,11 +12,13 @@ Every FCS_RM_TRACE_EVERY-th judged sample (default 32; 0 = off) is written in fu
 (<run> = the parent of --save): response, finish reason, extracted code, status, score; tools/read_traces.py reads it.
 """
 import asyncio
+import functools
 import json
 import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from miles_team.fcs_judge import CASE_WORKERS, job_cpus, judge
 
@@ -145,7 +147,21 @@ def _sem():
         # default: the job's own cores (sched_getaffinity, not the node's cpu_count), 8 kept for SGLang
         n = int(os.environ.get("FCS_RM_CONCURRENCY", max(1, (job_cpus() - 8) // CASE_WORKERS)))
         _SEM = asyncio.Semaphore(n)
+        _SEM.size = n
     return _SEM
+
+
+_POOL = None
+
+
+def _thread(fn, *a):
+    """Run fn in this module's own thread pool. asyncio.to_thread uses the loop's default executor, which Python sizes
+    at min(32, os.cpu_count() + 4) = 32 on every node, so FCS_RM_CONCURRENCY=56 judged at most 32 programs at once
+    (audit 2026-10-07). The pool has a thread per semaphore slot plus 8 for traces."""
+    global _POOL
+    if _POOL is None:
+        _POOL = ThreadPoolExecutor(max_workers=_sem().size + 8, thread_name_prefix="fcs-rm")
+    return asyncio.get_running_loop().run_in_executor(_POOL, functools.partial(fn, *a))
 
 
 _TRACE_EVERY = int(os.environ.get("FCS_RM_TRACE_EVERY", "32"))
@@ -176,9 +192,9 @@ def _trace(args, sample, reward: float) -> None:
 
 async def _one(sample, args=None) -> float:
     async with _sem():
-        reward = await asyncio.to_thread(score, sample.response or "", sample.label)
+        reward = await _thread(score, sample.response or "", sample.label)
         if args is not None and _TRACE_EVERY:
-            await asyncio.to_thread(_trace, args, sample, reward)
+            await _thread(_trace, args, sample, reward)
         return reward
 
 
@@ -209,7 +225,7 @@ async def judge_code(problem_dir: str, code: str) -> dict:
     also when the caller is cancelled (an aborted episode): a cancelled await would otherwise free the slot while the
     judge keeps running, and the extra judges oversubscribe the node (wall-limit kills elsewhere)."""
     async with _sem():
-        fut = asyncio.ensure_future(asyncio.to_thread(judge_full, problem_dir, code))
+        fut = asyncio.ensure_future(_thread(judge_full, problem_dir, code))
         try:
             return await asyncio.shield(fut)
         except asyncio.CancelledError:

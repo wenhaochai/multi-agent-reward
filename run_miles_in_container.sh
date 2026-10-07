@@ -57,6 +57,31 @@ echo "[miles-run] train args: $*"
 # runs/<run>/extra_args, whitespace-separated flags, '#' lines ignored, appended last (argparse: the last flag wins)
 EXTRA=()
 [ -f "$RUN_DIR/extra_args" ] && read -r -a EXTRA <<< "$(grep -v '^#' "$RUN_DIR/extra_args" | tr '\n' ' ')"
+# the last value of a flag over the train args and the extra args (argparse: the last one wins)
+ALL=("$@" "${EXTRA[@]}")
+argval() { local v="" a prev=""; for a in "${ALL[@]}"; do [ "$prev" = "$1" ] && v=$a; prev=$a; done; echo "$v"; }
+# A segment that died in an eval (wall time, CSES idle kill, OOM) leaves a checkpoint K at an eval step with no
+# "eval K" line in any log of the run; the next segment resumes after it and would never redo it. Check that here, in
+# every segment (audit 2026-10-07: an afternotok check job covered one run only and read only the actor tracker;
+# ckpt_consistency above has already put both trackers on their common iteration).
+TRK=$RUN_DIR/ckpt/latest_checkpointed_iteration.txt
+if [ -f "$TRK" ]; then
+  K=$(cat "$TRK"); EVERY=$(argval --eval-interval); NR=$(argval --num-rollout)
+  LOGS=$(ls "$B"/logs/miles-"$RUN_NAME"-[0-9]*.out 2>/dev/null | grep -v -- "-$SLURM_JOB_ID.out" || true)
+  LOST=0
+  if [ -n "$EVERY" ] && [ $(( (K + 1) % EVERY )) -eq 0 ] && { [ -z "$LOGS" ] || ! grep -aq "metrics.py:[0-9]* - eval $K:" $LOGS; }; then
+    LOST=1
+  fi
+  # the run already reached its last rollout: nothing to train, and miles evaluates before training only when a rollout
+  # is left (train.py: num_rollout > start_rollout_id), so a lost final eval cannot be redone here: exit, say so
+  if [ -n "$NR" ] && [ $((K + 1)) -ge "$NR" ]; then
+    [ $LOST -eq 1 ] && echo "[miles-run] WARNING: final eval $K was lost; evaluate checkpoint $K offline"
+    echo "[miles-run] run complete at checkpoint $K of $NR rollouts: nothing to do"; exit 0
+  fi
+  if [ $LOST -eq 1 ] && [ ! -f "$RUN_DIR/eval_before_train_once" ]; then
+    touch "$RUN_DIR/eval_before_train_once"; echo "[miles-run] eval $K was lost by an earlier segment: redo it before training"
+  fi
+fi
 # runs/<run>/eval_before_train_once: this segment evaluates before training (miles labels it with the resumed checkpoint's
 # rollout, so it redoes an eval a cancelled segment lost) despite --skip-eval-before-train; the file is used up
 if [ -f "$RUN_DIR/eval_before_train_once" ]; then
