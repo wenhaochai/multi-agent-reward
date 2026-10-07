@@ -82,7 +82,8 @@ if [ -f "$TRK" ]; then
     [ $LOST -eq 1 ] && echo "[miles-run] WARNING: final eval $K was lost; evaluate checkpoint $K offline"
     if ls "$RUN_DIR"/eval_pending/eval_*.pt >/dev/null 2>&1; then
       echo "[miles-run] judging the evals left pending: $(cd "$RUN_DIR/eval_pending" && ls eval_*.pt | tr '\n' ' ')"
-      python3 -m miles_team.fcs_rm --score-pending "$RUN_DIR"
+      # the GPUs idle meanwhile (Della cancels after 90 min at 0%): bounded, and a failure only warns
+      timeout 80m python3 -m miles_team.fcs_rm --score-pending "$RUN_DIR" || echo "[miles-run] WARNING: judging the pending evals failed or timed out"
     fi
     echo "[miles-run] run complete at checkpoint $K of $NR rollouts: nothing to do"; exit 0
   fi

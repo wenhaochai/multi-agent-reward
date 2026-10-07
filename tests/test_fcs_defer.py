@@ -34,14 +34,14 @@ class Grab(logging.Handler):
 logging.getLogger().addHandler(Grab())
 tracking.log = lambda args, d, step_key: ROWS.append(dict(d))
 JUDGED = []
-R.score = lambda resp, label: JUDGED.append(label) or (int(label[1:]) % 7) / 10  # deterministic fake judge
+R.score = lambda resp, label, pool=None: JUDGED.append(label) or (int(label[1:]) % 7) / 10  # deterministic fake judge
 tmp = tempfile.mkdtemp()
 ARGS = Namespace(save=f"{tmp}/run/ckpt", num_rollout=20, custom_eval_rollout_log_function_path="miles_team.fcs_rm.log_eval",
                  log_passrate=False, n_samples_per_eval_prompt=2, rollout_batch_size=4, n_samples_per_prompt=2,
                  global_batch_size=8, use_dynamic_global_batch_size=False, advantage_estimator="ppo",
                  eval_reward_key=None, reward_key=None, use_session_server=False, num_steps_per_rollout=None,
                  sglang_speculative_algorithm=None, ci_test=False, ci_tito_special_token_count_threshold=None,
-                 custom_rollout_log_function_path=None, load_debug_rollout_data=None, log_reward_category=None,
+                 custom_rollout_log_function_path="miles_team.fcs_rm.log_rollout", load_debug_rollout_data=None, log_reward_category=None,
                  rollout_num_gpus=8, wandb_always_use_train_step=False)
 CODE = "```cpp\nint main(){}\n```"
 
@@ -73,11 +73,11 @@ def inline(rid):
 
 
 def same(row, ref):
-    row = {k: v for k, v in row.items() if k != "eval/deferred_score_minutes"}
-    assert row == ref, (row, ref)
+    assert row == ref and list(row) == list(ref), (row, ref)  # same keys, same order, same values
 
 
 ref_row, ref_line = inline(9)
+ref_row_rewards = eval_data(defer=False)["fcs_val"]["rewards"]
 assert ref_line.startswith("metrics.py:") and " - eval 9: {" in ref_line, ref_line
 expect = sum((int(f"p{i}"[1:]) % 7) / 10 for i in range(12) if i % 4 and i % 5 != 3) / 12
 assert abs(ref_row["eval/fcs_val"] - expect) < 1e-12, (ref_row, expect)
@@ -119,13 +119,20 @@ assert len(ROWS) == 1
 same(ROWS[0], ref19)
 print("[ok] pending eval of an earlier segment == inline eval")
 
-# 4) the run's last eval: judged and logged at once
+# 4) the run's last eval: judged inline as before; first the evals still pending are judged and logged
+ref17, _ = inline(17)
 ref_last, _ = inline(19)
+R._save_pending(f"{tmp}/run/eval_pending/eval_17.pt", 17, ARGS, eval_data(), {})
 LINES.clear(); ROWS.clear()
-assert R.log_eval(19, ARGS, eval_data(), {}) is True and len(ROWS) == 1
-same(ROWS[0], ref_last)
+R.log_rollout(19, ARGS, [], {}, 1.0)  # the rollout before the last eval
+d = eval_data()
+assert not R._deferred(d) and d["fcs_val"]["rewards"] != [0.0] * 12  # judged inline
+M.log_eval_rollout_data(19, ARGS, d, {})  # what miles calls; log_eval settles the pending ones first, then miles logs
+assert [r["eval/step"] for r in ROWS] == [17, 19], [r["eval/step"] for r in ROWS]
+same(ROWS[0], ref17); same(ROWS[1], ref_last)
 assert not glob.glob(f"{tmp}/run/eval_pending/*.pt")
-print("[ok] last eval judged at once == inline eval")
+R._final_next = False
+print("[ok] last eval judged inline == inline eval; a pending eval is settled before it")
 
 # 5) no deferred samples: miles logs as usual
 assert R.log_eval(4, ARGS, eval_data(defer=False), {}) is False
@@ -142,4 +149,24 @@ assert line and line[0].startswith("metrics.py:")
 logged = eval(line[0].split(" - eval 4: ", 1)[1], {"nan": float("nan")})
 assert logged["eval/fcs_val"] == ref4["eval/fcs_val"] and not glob.glob(f"{tmp}/run/eval_pending/*.pt")
 print("[ok] offline scorer logs the same line")
+# 7) misconfigured: without our rollout log function nothing is deferred (miles would log the placeholders)
+a = copy.copy(ARGS); a.custom_rollout_log_function_path = None
+s0 = eval_data(defer=False)["fcs_val"]["samples"][1]
+s0.metadata[R.DEFER_KEY], s0.reward = 1, None
+assert asyncio.run(R.fcs_rm(a, s0)) == (int("1") % 7) / 10 and not s0.metadata.get("fcs_deferred")
+print("[ok] misconfigured run judges inline")
+
+# 8) a corrupt pending file is set aside, training goes on
+open(f"{tmp}/run/eval_pending/eval_7.pt", "wb").write(b"not a torch file")
+R._resumed = False
+assert R.log_rollout(8, ARGS, [], {}, 1.0) is False
+assert os.path.exists(f"{tmp}/run/eval_pending/eval_7.pt.failed") and not os.path.exists(f"{tmp}/run/eval_pending/eval_7.pt")
+print("[ok] corrupt pending eval set aside")
+
+# 9) the save fails (disk full): judged at once, miles logs it
+save, R._save_pending = R._save_pending, lambda *a: (_ for _ in ()).throw(OSError(28, "No space left on device"))
+d = eval_data()
+assert R.log_eval(9, ARGS, d, {}) is False and not R._deferred(d) and d["fcs_val"]["rewards"] == ref_row_rewards
+R._save_pending = save
+print("[ok] a failed save falls back to inline judging")
 print("test_fcs_defer: ALL OK")

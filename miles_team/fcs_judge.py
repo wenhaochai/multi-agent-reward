@@ -424,7 +424,9 @@ def _case_pool() -> ThreadPoolExecutor:
     return _POOL
 
 
-def judge(problem_dir, source: str, case_workers: int = CASE_WORKERS) -> dict:
+def judge(problem_dir, source: str, case_workers: int = CASE_WORKERS, pool: ThreadPoolExecutor | None = None) -> dict:
+    """pool: run the compile and every case in this executor instead (fcs_rm's background eval keeps its own slots,
+    so its cases never queue ahead of training's in the shared pool)."""
     prob = load_problem(Path(problem_dir))
     if not prob["cases"]:
         return {"score": 0.0, "status": "no cases", "cases": []}
@@ -436,15 +438,16 @@ def judge(problem_dir, source: str, case_workers: int = CASE_WORKERS) -> dict:
             return subprocess.run(COMPILE + ["-o", str(sol), str(work / "sol.cpp")], capture_output=True, text=True,
                                   errors="replace", timeout=120, env={**_CLEAN_ENV, "TMPDIR": str(work)},
                                   preexec_fn=_limits(600, None, sandbox=_compile_sandbox(work)))
-        r = _case_pool().submit(compile_).result() if CASE_POOL else compile_()
+        slots = pool or (_case_pool() if CASE_POOL else None)
+        r = slots.submit(compile_).result() if slots else compile_()
         if r.returncode != 0:
             infra = r.returncode < 0 or any(m in r.stderr for m in _INFRA_MARKERS)
             return {"score": 0.0, "status": "infra error" if infra else "compile error", "cases": [],
                     "msg": r.stderr[:1 << 21], "infra": infra}  # whole compiler output (up to 2 MiB)
         helper = _compile_helper(prob["dir"], prob["interactor"] if prob["interactive"] else prob["checker"])
         fn = _case_interactive if prob["interactive"] else _case_classic
-        if CASE_POOL:   # leaf tasks only (no slot waits on another), so the shared pool cannot deadlock
-            futs = [_case_pool().submit(_safe, fn, prob, sol, helper, c, work) for c in prob["cases"]]
+        if slots:   # leaf tasks only (no slot waits on another), so the pool cannot deadlock
+            futs = [slots.submit(_safe, fn, prob, sol, helper, c, work) for c in prob["cases"]]
             res = [f.result() for f in futs]
         else:
             with ThreadPoolExecutor(max_workers=max(1, case_workers)) as ex:

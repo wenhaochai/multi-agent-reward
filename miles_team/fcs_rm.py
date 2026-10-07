@@ -167,12 +167,12 @@ def extract_cpp(response_text: str, rule: str | None = None) -> str:
     return code
 
 
-def score(response: str, problem_dir: str) -> float:
+def score(response: str, problem_dir: str, pool=None) -> float:
     code = extract_cpp(response or "")
     if not code:
         return 0.0
     try:
-        r = judge(problem_dir, code)
+        r = judge(problem_dir, code, pool=pool)
         if r.get("infra"):  # a case or the compile could not run (fork / disk / sandbox): scored 0, made visible
             print(f"[fcs_rm] JUDGE-INFRA {problem_dir}: {r.get('status')} {(r.get('msg') or '')[-200:]}"[:500],
                   file=sys.stderr, flush=True)
@@ -237,7 +237,7 @@ DEFER_KEY = "fcs_defer_score"  # eval data metadata: judge this sample after tra
 
 async def _one(sample, args=None) -> float:
     meta = getattr(sample, "metadata", None)
-    if isinstance(meta, dict) and meta.get(DEFER_KEY) and getattr(args, "save", None):
+    if isinstance(meta, dict) and meta.get(DEFER_KEY) and _deferring(args):
         meta["fcs_deferred"] = True  # placeholder; log_eval judges it
         return 0.0
     async with _sem():
@@ -290,11 +290,37 @@ async def fcs_rm(args, sample, **kwargs):
 
 
 # ---- eval scoring after training resumes --------------------------------------------------------------------------
-_BG_WORKERS = int(os.environ.get("FCS_EVAL_BG_WORKERS", "16"))  # beside training's 56: the judge limits CPU time (wall 2x), so 72 on 64 cores keep verdicts
+# Background judging has its own slots (FCS_EVAL_BG_SLOTS compiles and cases at once, FCS_EVAL_BG_PROGRAMS programs),
+# so its cases never queue ahead of training's in fcs_judge's shared pool; the judge limits CPU time (wall 2x), so the
+# extra slots beside training's leave verdicts as they were (review 2026-10-07).
+_BG_SLOTS = int(os.environ.get("FCS_EVAL_BG_SLOTS", "16"))
+_BG_PROGRAMS = int(os.environ.get("FCS_EVAL_BG_PROGRAMS", "8"))
+_BG_POOL = None
 _bg: list[threading.Thread] = []
-_ready: "queue.Queue[tuple]" = queue.Queue()  # (rollout_id, data, extra_metrics, path): judged, to log on miles' loop
+_ready: "queue.Queue[tuple]" = queue.Queue()  # (rollout_id, args, data, extra_metrics, path): judged, to log on miles' loop
 _resumed = False
+_final_next = False  # set by log_rollout: the eval after this rollout is the run's last, judged inline as before
 _scoring: set[str] = set()
+_ME = "miles_team.fcs_rm."
+
+
+def _deferring(args) -> bool:
+    """Defer only when both log functions are ours (else miles would log the placeholder zeros) and not for the run's
+    last eval."""
+    return (getattr(args, "save", None) is not None and not _final_next
+            and getattr(args, "custom_eval_rollout_log_function_path", None) == _ME + "log_eval"
+            and getattr(args, "custom_rollout_log_function_path", None) == _ME + "log_rollout")
+
+
+def _bg_pool() -> ThreadPoolExecutor:
+    global _BG_POOL
+    if _BG_POOL is None:
+        _BG_POOL = ThreadPoolExecutor(max_workers=max(1, _BG_SLOTS), thread_name_prefix="fcs-eval-slot")
+    return _BG_POOL
+
+
+def _say(msg: str) -> None:
+    print(f"[fcs_rm] {msg}"[:800], file=sys.stderr, flush=True)
 
 
 def pending_dir(save: str) -> str:
@@ -338,16 +364,27 @@ def _load_pending(path: str):
     return blob["rollout_id"], Namespace(**blob["args"]), data, blob["extra_metrics"]
 
 
-def _judge_one(s) -> float:
-    resp = s.response or ""
-    return score(resp, s.label) if answered(resp, _cut(s)) else 0.0
+def _fail(path: str, why) -> None:
+    """A pending eval that cannot be judged or logged: set aside (the launcher then counts the eval as lost)."""
+    _scoring.discard(path)
+    try:
+        os.replace(path, path + ".failed")
+    except OSError:
+        pass
+    _say(f"pending eval {path} set aside as .failed: {why!r}")
 
 
-def _score(data: dict, workers: int) -> None:
+def _score(data: dict, programs: int, pool=None) -> None:
     """Judge every deferred sample of an eval in place, exactly as _one would have."""
     todo = _deferred(data)
-    with ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="fcs-eval") as ex:
-        rewards = list(ex.map(lambda ki: _judge_one(data[ki[0]]["samples"][ki[1]]), todo))
+
+    def one(ki):
+        s = data[ki[0]]["samples"][ki[1]]
+        resp = s.response or ""
+        return score(resp, s.label, pool) if answered(resp, _cut(s)) else 0.0
+
+    with ThreadPoolExecutor(max_workers=max(1, programs), thread_name_prefix="fcs-eval") as ex:
+        rewards = list(ex.map(one, todo))
     for (k, i), r in zip(todo, rewards):
         s = data[k]["samples"][i]
         s.reward = r
@@ -355,18 +392,19 @@ def _score(data: dict, workers: int) -> None:
         data[k]["rewards"][i] = r
 
 
-def _finish(rollout_id: int, args, data: dict, extra: dict, path: str, started: float) -> None:
-    """Log a judged eval through miles (its line, its W&B row), keep its replies, drop the pending file."""
+def _finish(rollout_id: int, args, data: dict, extra: dict, path: str) -> None:
+    """Keep a judged eval's replies, log it through miles (its line, its W&B row), then drop the pending file: the
+    slow write comes first, so a kill can repeat the log only in the instant between logging and the remove."""
     from miles.ray.rollout.metrics import log_eval_rollout_data
-    extra = dict(extra)
-    extra["eval/deferred_score_minutes"] = (time.time() - started) / 60
-    log_eval_rollout_data(rollout_id, args, data, extra)
-    with gzip.open(path[:-3] + ".jsonl.gz", "wt") as f:
+    keep = path[:-3] + ".jsonl.gz"
+    with gzip.open(keep + ".tmp", "wt") as f:
         for k, v in data.items():
             for s in v["samples"]:
                 f.write(json.dumps({"dataset": k, "index": s.index, "label": s.label, "status": s.status.value,
                                     "response_length": s.response_length, "reward": s.reward,
                                     "response": s.response}) + "\n")
+    os.replace(keep + ".tmp", keep)
+    log_eval_rollout_data(rollout_id, args, data, dict(extra))
     os.remove(path)
     _scoring.discard(path)
 
@@ -374,13 +412,12 @@ def _finish(rollout_id: int, args, data: dict, extra: dict, path: str, started: 
 def _background(rollout_id: int, args, data: dict, extra: dict, path: str) -> None:
     started = time.time()
     try:
-        _score(data, _BG_WORKERS)
-        _ready.put((rollout_id, args, data, extra, path, started))
-        print(f"[fcs_rm] eval {rollout_id}: judged in {(time.time() - started) / 60:.1f} min; logged at the next rollout",
-              file=sys.stderr, flush=True)
+        _score(data, _BG_PROGRAMS, _bg_pool())
+        _ready.put((rollout_id, args, data, extra, path))
+        _say(f"eval {rollout_id}: judged in {(time.time() - started) / 60:.1f} min in the background; logged at the next rollout")
     except Exception as e:  # the pending file stays; the next segment judges it again
         _scoring.discard(path)
-        print(f"[fcs_rm] eval {rollout_id}: background judging failed: {e!r}"[:500], file=sys.stderr, flush=True)
+        _say(f"eval {rollout_id}: background judging failed: {e!r}")
 
 
 def _start(rollout_id: int, args, data: dict, extra: dict, path: str) -> None:
@@ -397,7 +434,14 @@ def _drain() -> None:
             item = _ready.get_nowait()
         except queue.Empty:
             return
-        _finish(*item)
+        try:
+            _finish(*item)
+        except Exception as e:
+            _fail(item[4], e)
+
+
+def _leftovers(args) -> list[str]:
+    return [p for p in sorted(glob.glob(os.path.join(pending_dir(args.save), "eval_*.pt"))) if p not in _scoring]
 
 
 def _resume(args) -> None:
@@ -406,13 +450,29 @@ def _resume(args) -> None:
     if _resumed or not getattr(args, "save", None):
         return
     _resumed = True
-    for path in sorted(glob.glob(os.path.join(pending_dir(args.save), "eval_*.pt"))):
-        if path in _scoring:
+    for path in _leftovers(args):
+        try:
+            rid, _, data, extra = _load_pending(path)
+        except Exception as e:
+            _fail(path, e)
             continue
-        rid, _, data, extra = _load_pending(path)
-        print(f"[fcs_rm] eval {rid}: left pending by an earlier segment; judging it in the background", file=sys.stderr,
-              flush=True)
+        _say(f"eval {rid}: left pending by an earlier segment; judging it in the background")
         _start(rid, args, data, extra, path)
+
+
+def _settle_all(args) -> None:
+    """The run ends after this eval: wait for background evals, log them, and judge any other pending eval here."""
+    for t in _bg:
+        t.join()
+    _drain()
+    for path in _leftovers(args):
+        try:
+            rid, _, data, extra = _load_pending(path)
+            _scoring.add(path)
+            _score(data, _sem().size)
+            _finish(rid, args, data, extra, path)
+        except Exception as e:
+            _fail(path, e)
 
 
 def log_eval(rollout_id, args, data, extra_metrics) -> bool:
@@ -421,29 +481,32 @@ def log_eval(rollout_id, args, data, extra_metrics) -> bool:
     _drain()
     todo = _deferred(data)
     if not todo:
-        return False  # judged already (or never deferred): miles logs it
+        if rollout_id + 1 >= args.num_rollout and getattr(args, "save", None):
+            _settle_all(args)
+        return False  # judged inline (or never deferred): miles logs it
     path = os.path.join(pending_dir(args.save), f"eval_{rollout_id}.pt")
-    _save_pending(path, rollout_id, args, data, extra_metrics or {})
-    if rollout_id + 1 >= args.num_rollout:  # the run's last eval: nothing left to overlap with
-        for t in _bg:
-            t.join()
-        _drain()
-        started = time.time()
-        _scoring.add(path)
-        _score(data, max(_BG_WORKERS, _sem().size))
-        _finish(rollout_id, args, data, extra_metrics or {}, path, started)
-        return True
+    try:
+        _save_pending(path, rollout_id, args, data, extra_metrics or {})
+    except Exception as e:  # cannot keep it for later: judge it here, as inline judging would have, and let miles log
+        _say(f"eval {rollout_id}: could not save for background judging ({e!r}); judging it now")
+        _score(data, _sem().size)
+        return False
     _start(rollout_id, args, data, extra_metrics or {}, path)
-    print(f"[fcs_rm] eval {rollout_id}: {len(todo)} replies saved to {path}; judging them while training goes on",
-          file=sys.stderr, flush=True)
+    _say(f"eval {rollout_id}: {len(todo)} replies saved to {path}; judging them while training goes on")
     return True
 
 
 def log_rollout(rollout_id, args, samples, extra_metrics, rollout_time) -> bool:
     """--custom-rollout-log-function-path: log the evals judged since the last rollout; at the first rollout of a
-    segment, resume the evals an earlier segment left pending. miles then logs the rollout as usual."""
-    _resume(args)
-    _drain()
+    segment, resume the evals an earlier segment left pending; mark the run's last eval to be judged inline. miles then
+    logs the rollout as usual. Never raises: a pending eval that fails is set aside, training goes on."""
+    global _final_next
+    try:
+        _final_next = rollout_id + 1 >= args.num_rollout
+        _resume(args)
+        _drain()
+    except Exception as e:
+        _say(f"log_rollout {rollout_id}: {e!r}")
     return False
 
 
@@ -454,11 +517,13 @@ def score_pending(run_dir: str) -> None:
     logging_utils.configure_logger_raw("rollout_executor")
     tracking.log = lambda *a, **k: None  # no W&B here: relog_wandb takes these evals from the log lines
     for path in sorted(glob.glob(os.path.join(run_dir, "eval_pending", "eval_*.pt"))):
-        rid, a, data, extra = _load_pending(path)
-        a.custom_eval_rollout_log_function_path = None
-        started = time.time()
-        _score(data, _sem().size)
-        _finish(rid, a, data, extra, path, started)
+        try:
+            rid, a, data, extra = _load_pending(path)
+            a.custom_eval_rollout_log_function_path = None
+            _score(data, _sem().size)
+            _finish(rid, a, data, extra, path)
+        except Exception as e:
+            _fail(path, e)
 
 
 if __name__ == "__main__":
