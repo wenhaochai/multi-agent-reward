@@ -7,6 +7,7 @@
 # the train args ("$@").
 set -euo pipefail
 B=/scratch/gpfs/GROUP/USER/project/miles-q38-build
+C=${MQB_CODE:-$B}   # the code (miles_team, tools); runs/ and logs/ stay under $B. A candidate worktree for a smoke
 MILES=${MILES_SRC:-/scratch/gpfs/GROUP/USER/project/miles-q38}
 : "${RUN_NAME:?}" "${SLURM_JOB_ID:?}" "${MILES_MODEL_TYPE:?}"
 RUN_DIR=$B/runs/$RUN_NAME
@@ -18,7 +19,7 @@ MEGATRON=/root/Megatron-LM   # the image's patched Megatron (a namespace package
 # pyfix/ first: the image (radixark/miles:latest, 2026-09-30) ships opentelemetry-api 1.45.0 with sdk/exporters 1.44.0, so
 # Ray's dashboard agent dies at import ('_ExtendedAttributes') and `ray start` times out (smoke 14791336). pyfix holds
 # opentelemetry-api 1.44.0 (tools: pip download + pip install --target, see README), matching the rest.
-export PYTHONPATH=$B/pyfix:$MEGATRON:$MILES:$B${PYTHONPATH:+:$PYTHONPATH}
+export PYTHONPATH=$B/pyfix:$MEGATRON:$MILES:$C${PYTHONPATH:+:$PYTHONPATH}
 export PYTHONUNBUFFERED=1 CUDA_DEVICE_MAX_CONNECTIONS=1 MASTER_ADDR=127.0.0.1 no_proxy=127.0.0.1,localhost
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 RAY_USAGE_STATS_ENABLED=0
 export NCCL_NVLS_ENABLE=$(nvidia-smi topo -m 2>/dev/null | grep -c 'NV[0-9]' | awk '{print ($1 > 0) ? 1 : 0}')
@@ -30,7 +31,7 @@ fi
 echo "[miles-run] $(date -u +%FT%TZ) host=$(hostname) job=$SLURM_JOB_ID run=$RUN_NAME miles=$MILES sha=$(git -C "$MILES" rev-parse --short HEAD) megatron=$MEGATRON"
 # every segment imports the live trees at start: record exactly which code it ran (uncommitted files counted)
 echo "[miles-run] code: miles $(git -C "$MILES" rev-parse --short HEAD) dirty=$(git -C "$MILES" status --porcelain 2>/dev/null | wc -l)" \
-     "repo $(git -C "$B" rev-parse --short HEAD) dirty=$(git -C "$B" status --porcelain --untracked-files=no 2>/dev/null | wc -l)"
+     "repo $(git -C "$C" rev-parse --short HEAD) dirty=$(git -C "$C" status --porcelain --untracked-files=no 2>/dev/null | wc -l)"
 nvidia-smi --query-gpu=index,name,memory.used --format=csv,noheader
 python3 -c "import torch, sglang; print('torch', torch.__version__, 'sglang', sglang.__version__)"
 
@@ -69,13 +70,20 @@ if [ -f "$TRK" ]; then
   K=$(cat "$TRK"); EVERY=$(argval --eval-interval); NR=$(argval --num-rollout)
   LOGS=$(ls "$B"/logs/miles-"$RUN_NAME"-[0-9]*.out 2>/dev/null | grep -v -- "-$SLURM_JOB_ID.out" || true)
   LOST=0
-  if [ -n "$EVERY" ] && [ $(( (K + 1) % EVERY )) -eq 0 ] && { [ -z "$LOGS" ] || ! grep -aq "metrics.py:[0-9]* - eval $K:" $LOGS; }; then
+  # an eval whose replies were saved for judging after training resumed (fcs_rm.log_eval) is not lost: it is judged
+  # from runs/<run>/eval_pending/eval_K.pt, without the GPUs
+  if [ -n "$EVERY" ] && [ $(( (K + 1) % EVERY )) -eq 0 ] && [ ! -f "$RUN_DIR/eval_pending/eval_$K.pt" ] \
+     && { [ -z "$LOGS" ] || ! grep -aq "metrics.py:[0-9]* - eval $K:" $LOGS; }; then
     LOST=1
   fi
   # the run already reached its last rollout: nothing to train, and miles evaluates before training only when a rollout
   # is left (train.py: num_rollout > start_rollout_id), so a lost final eval cannot be redone here: exit, say so
   if [ -n "$NR" ] && [ $((K + 1)) -ge "$NR" ]; then
     [ $LOST -eq 1 ] && echo "[miles-run] WARNING: final eval $K was lost; evaluate checkpoint $K offline"
+    if ls "$RUN_DIR"/eval_pending/eval_*.pt >/dev/null 2>&1; then
+      echo "[miles-run] judging the evals left pending: $(cd "$RUN_DIR/eval_pending" && ls eval_*.pt | tr '\n' ' ')"
+      python3 -m miles_team.fcs_rm --score-pending "$RUN_DIR"
+    fi
     echo "[miles-run] run complete at checkpoint $K of $NR rollouts: nothing to do"; exit 0
   fi
   if [ $LOST -eq 1 ] && [ ! -f "$RUN_DIR/eval_before_train_once" ]; then

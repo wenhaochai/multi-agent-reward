@@ -23,4 +23,4 @@ apptainer exec --nv --contain --cleanenv --writable-tmpfs \
   --env SLURM_JOB_ID="$SLURM_JOB_ID" --env RUN_NAME="$RUN_NAME" --env GPUS="$GPUS" \
   --env MILES_MODEL_TYPE="$MILES_MODEL_TYPE" ${MILES_SRC:+--env MILES_SRC="$MILES_SRC"} ${QTASK:+--env QTASK="$QTASK"} \
   $(for v in $(compgen -e | grep "^MA_\|^FCS_"); do printf -- "--env %s=%q " "$v" "${!v}"; done) \
-  "$B/miles.sif" bash "$B/run_miles_in_container.sh" "$@"
+  ${MQB_CODE:+--env MQB_CODE="$MQB_CODE"} "$B/miles.sif" bash "${MQB_CODE:-$B}/run_miles_in_container.sh" "$@"

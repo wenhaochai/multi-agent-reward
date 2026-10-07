@@ -15,13 +15,27 @@ closed its reasoning (no </think>), scores 0 without being judged, in this solo 
 (answer()). FrontierSmith's strip_think keeps the whole text of an unclosed reply, so the code written inside the
 reasoning was judged; this reward did that until 2026-10-07 (runs switch at their first segment after that).
 FCS_THINK=0 (a non-thinking chat template, whose replies have no </think>) zeroes only the cut-off ones.
+Eval scoring after training resumes (owner 2026-10-07): an eval sample whose metadata has fcs_defer_score
+(tools/make_defer_eval_data.py) gets a placeholder reward of 0, so generation ends without waiting for the judge. The
+eval log function (--custom-eval-rollout-log-function-path miles_team.fcs_rm.log_eval) saves the eval's samples to
+<run>/eval_pending/eval_<K>.pt and judges them in a background thread on the same node, with the same rules, while
+training goes on; the result is logged by miles' own log_eval_rollout_data (the same "metrics.py - eval K:" line and
+W&B row) at the next rollout (--custom-rollout-log-function-path miles_team.fcs_rm.log_rollout), and the eval's
+replies are kept in <run>/eval_pending/eval_<K>.jsonl.gz. The GPUs no longer sit idle while the judge waits out
+interactive cases. A segment that ends before a pending eval is logged leaves its .pt; the next segment judges it at
+its first rollout (python3 -m miles_team.fcs_rm --score-pending <run dir> does it without training). The last eval
+of a run is judged at once (nothing to overlap with).
 """
 import asyncio
 import functools
+import glob
+import gzip
 import json
 import os
+import queue
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -218,7 +232,14 @@ def _trace(args, sample, reward: float) -> None:
         print(f"[fcs_rm] trace failed: {e}"[:300], file=sys.stderr, flush=True)
 
 
+DEFER_KEY = "fcs_defer_score"  # eval data metadata: judge this sample after training resumes
+
+
 async def _one(sample, args=None) -> float:
+    meta = getattr(sample, "metadata", None)
+    if isinstance(meta, dict) and meta.get(DEFER_KEY) and getattr(args, "save", None):
+        meta["fcs_deferred"] = True  # placeholder; log_eval judges it
+        return 0.0
     async with _sem():
         resp = sample.response or ""
         reward = await _thread(score, resp, sample.label) if answered(resp, _cut(sample)) else 0.0
@@ -266,3 +287,180 @@ async def fcs_rm(args, sample, **kwargs):
     if isinstance(sample, list):
         return list(await asyncio.gather(*(_one(s, args) for s in sample)))
     return await _one(sample, args)
+
+
+# ---- eval scoring after training resumes --------------------------------------------------------------------------
+_BG_WORKERS = int(os.environ.get("FCS_EVAL_BG_WORKERS", "16"))  # beside training's 56: the judge limits CPU time (wall 2x), so 72 on 64 cores keep verdicts
+_bg: list[threading.Thread] = []
+_ready: "queue.Queue[tuple]" = queue.Queue()  # (rollout_id, data, extra_metrics, path): judged, to log on miles' loop
+_resumed = False
+_scoring: set[str] = set()
+
+
+def pending_dir(save: str) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(save)), "eval_pending")
+
+
+def _deferred(data: dict) -> list[tuple[str, int]]:
+    return [(k, i) for k, v in data.items() for i, s in enumerate(v.get("samples") or [])
+            if isinstance(getattr(s, "metadata", None), dict) and s.metadata.get("fcs_deferred")]
+
+
+def _plain_args(args) -> dict:
+    """The args a later process needs to log this eval: every value that pickles."""
+    import pickle
+    out = {}
+    for k, v in vars(args).items():
+        try:
+            pickle.dumps(v)
+            out[k] = v
+        except Exception:
+            pass
+    return out
+
+
+def _save_pending(path: str, rollout_id: int, args, data: dict, extra: dict) -> None:
+    import torch
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    blob = {"rollout_id": rollout_id, "extra_metrics": dict(extra), "args": _plain_args(args),
+            "data": {k: {**{f: v[f] for f in v if f != "samples"}, "samples": [s.to_dict() for s in v["samples"]]}
+                     for k, v in data.items()}}
+    torch.save(blob, path + ".tmp")
+    os.replace(path + ".tmp", path)  # a kill mid-write leaves no half file
+
+
+def _load_pending(path: str):
+    import torch
+    from argparse import Namespace
+    from miles.utils.types import Sample
+    blob = torch.load(path, weights_only=False)
+    data = {k: {**v, "samples": [Sample.from_dict(d) for d in v["samples"]]} for k, v in blob["data"].items()}
+    return blob["rollout_id"], Namespace(**blob["args"]), data, blob["extra_metrics"]
+
+
+def _judge_one(s) -> float:
+    resp = s.response or ""
+    return score(resp, s.label) if answered(resp, _cut(s)) else 0.0
+
+
+def _score(data: dict, workers: int) -> None:
+    """Judge every deferred sample of an eval in place, exactly as _one would have."""
+    todo = _deferred(data)
+    with ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="fcs-eval") as ex:
+        rewards = list(ex.map(lambda ki: _judge_one(data[ki[0]]["samples"][ki[1]]), todo))
+    for (k, i), r in zip(todo, rewards):
+        s = data[k]["samples"][i]
+        s.reward = r
+        s.metadata.pop("fcs_deferred", None)
+        data[k]["rewards"][i] = r
+
+
+def _finish(rollout_id: int, args, data: dict, extra: dict, path: str, started: float) -> None:
+    """Log a judged eval through miles (its line, its W&B row), keep its replies, drop the pending file."""
+    from miles.ray.rollout.metrics import log_eval_rollout_data
+    extra = dict(extra)
+    extra["eval/deferred_score_minutes"] = (time.time() - started) / 60
+    log_eval_rollout_data(rollout_id, args, data, extra)
+    with gzip.open(path[:-3] + ".jsonl.gz", "wt") as f:
+        for k, v in data.items():
+            for s in v["samples"]:
+                f.write(json.dumps({"dataset": k, "index": s.index, "label": s.label, "status": s.status.value,
+                                    "response_length": s.response_length, "reward": s.reward,
+                                    "response": s.response}) + "\n")
+    os.remove(path)
+    _scoring.discard(path)
+
+
+def _background(rollout_id: int, args, data: dict, extra: dict, path: str) -> None:
+    started = time.time()
+    try:
+        _score(data, _BG_WORKERS)
+        _ready.put((rollout_id, args, data, extra, path, started))
+        print(f"[fcs_rm] eval {rollout_id}: judged in {(time.time() - started) / 60:.1f} min; logged at the next rollout",
+              file=sys.stderr, flush=True)
+    except Exception as e:  # the pending file stays; the next segment judges it again
+        _scoring.discard(path)
+        print(f"[fcs_rm] eval {rollout_id}: background judging failed: {e!r}"[:500], file=sys.stderr, flush=True)
+
+
+def _start(rollout_id: int, args, data: dict, extra: dict, path: str) -> None:
+    _scoring.add(path)
+    t = threading.Thread(target=_background, args=(rollout_id, args, data, extra, path), daemon=True,
+                         name=f"fcs-eval-{rollout_id}")
+    t.start()
+    _bg.append(t)
+
+
+def _drain() -> None:
+    while True:
+        try:
+            item = _ready.get_nowait()
+        except queue.Empty:
+            return
+        _finish(*item)
+
+
+def _resume(args) -> None:
+    """Pending evals a previous segment left (it ended before logging them): judge them in the background."""
+    global _resumed
+    if _resumed or not getattr(args, "save", None):
+        return
+    _resumed = True
+    for path in sorted(glob.glob(os.path.join(pending_dir(args.save), "eval_*.pt"))):
+        if path in _scoring:
+            continue
+        rid, _, data, extra = _load_pending(path)
+        print(f"[fcs_rm] eval {rid}: left pending by an earlier segment; judging it in the background", file=sys.stderr,
+              flush=True)
+        _start(rid, args, data, extra, path)
+
+
+def log_eval(rollout_id, args, data, extra_metrics) -> bool:
+    """--custom-eval-rollout-log-function-path: defer the judging of an eval whose samples carry fcs_defer_score.
+    Returns True when miles must not log now (the eval is logged once judged)."""
+    _drain()
+    todo = _deferred(data)
+    if not todo:
+        return False  # judged already (or never deferred): miles logs it
+    path = os.path.join(pending_dir(args.save), f"eval_{rollout_id}.pt")
+    _save_pending(path, rollout_id, args, data, extra_metrics or {})
+    if rollout_id + 1 >= args.num_rollout:  # the run's last eval: nothing left to overlap with
+        for t in _bg:
+            t.join()
+        _drain()
+        started = time.time()
+        _scoring.add(path)
+        _score(data, max(_BG_WORKERS, _sem().size))
+        _finish(rollout_id, args, data, extra_metrics or {}, path, started)
+        return True
+    _start(rollout_id, args, data, extra_metrics or {}, path)
+    print(f"[fcs_rm] eval {rollout_id}: {len(todo)} replies saved to {path}; judging them while training goes on",
+          file=sys.stderr, flush=True)
+    return True
+
+
+def log_rollout(rollout_id, args, samples, extra_metrics, rollout_time) -> bool:
+    """--custom-rollout-log-function-path: log the evals judged since the last rollout; at the first rollout of a
+    segment, resume the evals an earlier segment left pending. miles then logs the rollout as usual."""
+    _resume(args)
+    _drain()
+    return False
+
+
+def score_pending(run_dir: str) -> None:
+    """Judge and log a run's pending evals without training (the segment that finds the run complete)."""
+    from miles.utils import logging_utils
+    from miles.utils.tracking_utils import tracking
+    logging_utils.configure_logger_raw("rollout_executor")
+    tracking.log = lambda *a, **k: None  # no W&B here: relog_wandb takes these evals from the log lines
+    for path in sorted(glob.glob(os.path.join(run_dir, "eval_pending", "eval_*.pt"))):
+        rid, a, data, extra = _load_pending(path)
+        a.custom_eval_rollout_log_function_path = None
+        started = time.time()
+        _score(data, _sem().size)
+        _finish(rid, a, data, extra, path, started)
+
+
+if __name__ == "__main__":
+    assert sys.argv[1] == "--score-pending", "python3 -m miles_team.fcs_rm --score-pending <run dir>"
+    score_pending(sys.argv[2])
