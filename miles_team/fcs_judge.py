@@ -82,6 +82,7 @@ COMPILE = ["g++", "-O2", "-pipe", "-static", "-s", "-std=gnu++17"]
 STDOUT_MAX = 128 << 20
 OK_EXIT, POINTS_EXIT = 0, 7
 _RATIO = re.compile(r"Ratio: ([\d.]+)")  # the official engine's regex (val keeps its quirks)
+_JS_FLOAT = re.compile(r"\d+(?:\.\d*)?|\.\d+")  # what parseFloat reads from a run of digits and dots
 _RATIO_FULL = re.compile(r"Ratio:\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?|[-+]?inf(?:inity)?|[-+]?nan)", re.I)
 _INFRA_MARKERS = ("No space left on device", "Resource temporarily unavailable", "Cannot allocate memory",
                   "cannot fork", "virtual memory exhausted", "Too many open files")
@@ -91,8 +92,12 @@ SANDBOX = os.environ.get("FCS_SANDBOX", "1") == "1"
 def _ratio(msg: str, trusted: bool, ok: bool, train: bool) -> float:
     """A case's ratio from a checker / interactor message (trusted = it exited 0 or 7)."""
     if not train:
+        # the official parseRatio: JS parseFloat of the [\d.]+ capture, i.e. its longest decimal prefix ("0.000000." of
+        # val 154's interactor is 0, not a float() error that the case pool turned into an infra zero: audit 2026-10-07);
+        # no number at all (".") falls back to accepted / not accepted
         m = _RATIO.search(msg) if trusted else None
-        return float(m.group(1)) if m else (1.0 if ok else 0.0)
+        v = _JS_FLOAT.match(m.group(1)) if m else None
+        return float(v.group(0)) if v else (1.0 if ok else 0.0)
     m = _RATIO_FULL.search(msg) if trusted else None
     if not m:
         return 1.0 if ok else 0.0
