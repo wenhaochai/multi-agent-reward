@@ -4,6 +4,10 @@
 #SBATCH --nodes=1 --ntasks=1 --cpus-per-task=64 --mem=64G
 #SBATCH --output=/scratch/gpfs/GROUP/USER/project/miles-q38-build/logs/eval-defer-regate-%j.out
 set -euo pipefail
+# /tmp on a compute node is small and shared (owner rule 2026-10-08): this job's temp files, compiles and caches go to
+# a job dir on /scratch, bound into any container as TMPDIR, removed at exit
+export TMPDIR=/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID; export APPTAINERENV_TMPDIR=$TMPDIR
+mkdir -p "$TMPDIR"; trap 'rm -rf "/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID"' EXIT
 # The eval-defer gate again, on a CPU node, over the outputs of a smoke whose own part passed and whose gate failed in
 # the gate itself (job 15204506: the gate's re-judge ran out of apptainer's session /tmp, and it expected 172 kept
 # replies and a kept file for the inline last eval). RAN is the candidate the smoke ran (its code line); CAND is the
@@ -21,7 +25,7 @@ test "$(git -C /scratch/gpfs/GROUP/USER/project/miles-easyppo rev-parse HEAD | c
 DEFER=(--eval-prompt-data fcs_val $B/data/fcs_val172_defer.jsonl
        --custom-eval-rollout-log-function-path miles_team.fcs_rm.log_eval
        --custom-rollout-log-function-path miles_team.fcs_rm.log_rollout)
-GT=${TMPDIR:-/tmp}/eval_defer_gate_$SLURM_JOB_ID; mkdir -p "$GT"
+GT=$TMPDIR/eval_defer_gate; mkdir -p "$GT"
 rc=0
 apptainer exec --contain --cleanenv --bind /scratch/gpfs/GROUP/USER --bind "$GT":/tmp --env MQB_CODE=$MQB_CODE \
   $B/miles.sif python3 $MQB_CODE/tools/eval_defer_gate.py "$LOG" $B/runs/$R "$RAN" "$MILES_SHA" || rc=$?

@@ -13,8 +13,14 @@ MILES=${MILES_SRC:-/scratch/gpfs/GROUP/USER/project/miles-q38}
 RUN_DIR=$B/runs/$RUN_NAME
 mkdir -p "$RUN_DIR"
 exec > >(tee -a "$RUN_DIR/console.log") 2>&1
-export HOME=/tmp/home TRITON_CACHE_DIR=/tmp/home/.cache/triton
-mkdir -p "$HOME"
+# /tmp on a compute node is small and shared by every job there (owner rule 2026-10-08): temp files, compiles, the judge
+# and the caches go to a job dir on /scratch (sbatch_miles.sh makes it and binds it; jobs queued before that change get
+# it here), removed when this script exits. Ray alone stays on /tmp (below): its unix socket paths must stay < 108 bytes
+JT=/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID${QTASK:+_q$QTASK}
+export TMPDIR=$JT HOME=$JT/home TRITON_CACHE_DIR=$JT/home/.cache/triton SGLANG_CACHE_DIR=$JT/home/.cache/sglang
+export TORCHINDUCTOR_CACHE_DIR=$JT/torchinductor FCS_JUDGE_TMP=$JT FCS_JUDGE_CACHE=$JT/fcs_judge_cache
+mkdir -p "$HOME" "$FCS_JUDGE_CACHE"
+echo "[miles-run] TMPDIR=$TMPDIR (judge, compiles, caches); Ray on /tmp"
 MEGATRON=/root/Megatron-LM   # the image's patched Megatron (a namespace package: megatron.__file__ is None)
 # pyfix/ first: the image (radixark/miles:latest, 2026-09-30) ships opentelemetry-api 1.45.0 with sdk/exporters 1.44.0, so
 # Ray's dashboard agent dies at import ('_ExtendedAttributes') and `ray start` times out (smoke 14791336). pyfix holds
@@ -44,7 +50,7 @@ ray start --head --node-ip-address 127.0.0.1 --num-gpus "${GPUS:-8}" --port=$P -
   --ray-client-server-port=$((P + 5)) --runtime-env-agent-port=$((P + 6)) --node-manager-port=$((P + 7)) \
   --object-manager-port=$((P + 8)) --include-dashboard=false --disable-usage-stats --temp-dir="$RAY_TMP"
 export RAY_ADDRESS=127.0.0.1:$P
-trap 'pkill -9 -u "$(id -u)" -f -- "$RAY_TMP" 2>/dev/null || true' EXIT
+trap 'pkill -9 -u "$(id -u)" -f -- "$RAY_TMP" 2>/dev/null || true; echo "[miles-run] TMPDIR at exit: $(du -sh "$JT" 2>/dev/null | cut -f1); /tmp: $(du -sh /tmp 2>/dev/null | cut -f1)"; rm -rf "/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID${QTASK:+_q$QTASK}"' EXIT
 
 # a wall-clock kill between the actor save and the critic save leaves the two trackers at different iterations, which
 # fails miles' restored-rollout assert in every chained segment: point both at their newest common iteration first

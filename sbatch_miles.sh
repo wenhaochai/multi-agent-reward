@@ -10,13 +10,19 @@ set -euo pipefail
 B=/scratch/gpfs/GROUP/USER/project/miles-q38-build
 : "${RUN_NAME:?}" "${GPUS:?}" "${MILES_MODEL_TYPE:?}"
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
-JOBTMP=${TMPDIR:-/tmp}/miles_$SLURM_JOB_ID${QTASK:+_q$QTASK}   # QTASK: a queue-worker task
-mkdir -p "$JOBTMP"
-trap 'rm -rf "$JOBTMP"' EXIT
+# /tmp on a compute node is small and shared (owner rule 2026-10-08): the job's temp dir is on /scratch, bound into the
+# container as TMPDIR (run_miles_in_container.sh puts the judge and the caches there). The container's /tmp holds only
+# Ray's session dir (unix socket paths must stay < 108 bytes); it is a per-job dir on the node, removed at exit too
+[ -n "$SLURM_JOB_ID" ]
+export TMPDIR=/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID${QTASK:+_q$QTASK}   # QTASK: a queue-worker task
+export APPTAINERENV_TMPDIR=$TMPDIR
+JOBTMP=/tmp/miles_$SLURM_JOB_ID${QTASK:+_q$QTASK}
+mkdir -p "$TMPDIR" "$JOBTMP"
+trap 'rm -rf "/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID${QTASK:+_q$QTASK}" "/tmp/miles_$SLURM_JOB_ID${QTASK:+_q$QTASK}"' EXIT
 echo "[sbatch] $(date -u +%FT%TZ) node=$(hostname) job=$SLURM_JOB_ID run=$RUN_NAME gpus=$GPUS"
 apptainer exec --nv --contain --cleanenv --writable-tmpfs \
   --bind /scratch/gpfs/GROUP/USER \
-  --bind "$JOBTMP":/tmp \
+  --bind "$JOBTMP":/tmp --bind "$TMPDIR" \
   --bind /dev/shm \
   --bind "$B/cache/root":/root/.cache \
   --env PYTHONNOUSERSITE=1 --env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" \

@@ -4,6 +4,10 @@
 #SBATCH --nodes=1 --ntasks=1 --gres=gpu:8 --cpus-per-task=64 --mem=640G
 #SBATCH --output=/scratch/gpfs/GROUP/USER/project/miles-q38-build/logs/miles-fcs_easyppo_smoke_q9b-fcs-sft-%j.out
 set -euo pipefail
+# /tmp on a compute node is small and shared (owner rule 2026-10-08): this job's temp files, compiles and caches go to
+# a job dir on /scratch, bound into any container as TMPDIR, removed at exit
+export TMPDIR=/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID; export APPTAINERENV_TMPDIR=$TMPDIR
+mkdir -p "$TMPDIR"; trap 'rm -rf "/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID"' EXIT
 # Gate for eval judged after training resumes (miles_team.fcs_rm.log_eval; packing rule 2026-10-07: smoke and gate in
 # one job, each task through packed_task.sh, ledger logs/packed/<job>.tsv). Task 1: the solo EasyPPO smoke
 # (submit_fcs.sh SMOKE=1, 4 rollouts, evals after rollouts 1 and 3) with the candidate code (MQB_CODE), the eval set
@@ -32,10 +36,10 @@ $T smoke - other 8 60m -- bash $MQB_CODE/sbatch_miles.sh "${ARGS[@]}" "${DEFER[@
   --disable-wandb-random-suffix || rc=$?
 # the gate re-judges eval 1: its compiles need a real /tmp (under --contain, /tmp is apptainer's small session tmpfs;
 # job 15204506 ran out of space there)
-GT=${TMPDIR:-/tmp}/eval_defer_gate_$SLURM_JOB_ID; mkdir -p "$GT"
+GT=$TMPDIR/eval_defer_gate; mkdir -p "$GT"
 [ $rc -eq 0 ] && { $T gate - other 0 15m -- apptainer exec --contain --cleanenv --bind /scratch/gpfs/GROUP/USER \
   --bind "$GT":/tmp --env MQB_CODE=$MQB_CODE $B/miles.sif python3 $MQB_CODE/tools/eval_defer_gate.py "$LOG" $B/runs/$R "$CAND" "$MILES_SHA" || rc=$?; }
-rm -r "${TMPDIR:-/tmp}/eval_defer_gate_$SLURM_JOB_ID" 2>/dev/null || true
+rm -r "$TMPDIR/eval_defer_gate" 2>/dev/null || true
 rm -r "$B/runs/fcs_easyppo_smoke_q9b-fcs-sft/ckpt" "$B/runs/fcs_easyppo_smoke_q9b-fcs-sft/ckpt_critic" 2>/dev/null || true
 [ $rc -eq 0 ] || { echo "eval-defer gate failed (rc=$rc): main and the baselines unchanged"; exit $rc; }
 git -C $B merge --ff-only "$CAND"
