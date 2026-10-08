@@ -1,13 +1,14 @@
 """Gate for eval judged after training resumes (miles_team.fcs_rm.log_eval), on the solo smoke of
 tools/eval_defer_smoke.sbatch (4 rollouts, evals after rollouts 1 and 3, the eval set with fcs_defer_score):
-  1. the smoke ran the candidate code;
+  1. the smoke ran the candidate code on the miles the Frontier-CS runs use (miles-easyppo; job 15182362 ran the
+     image's miles, which lacks the EasyPPO flags);
   2. eval 1 was saved and judged in the background: its "metrics.py - eval 1:" line comes after training went on
      (a "rollout 2" line), and eval 3 (the last) was logged too;
   3. nothing is left pending; each kept eval has every sample, its mean reward equals the logged eval/fcs_val, and an
      unanswered reply (cut off, or no </think>) has reward 0;
   4. judging eval 1's replies again here, alone, gives the same reward for >= 97% of them and a mean within 0.01 (the
      background judge ran beside training's; a time-limit-borderline program may flip).
-  python3 tools/eval_defer_gate.py SMOKE_LOG RUN_DIR CANDIDATE_SHA   (inside miles.sif)"""
+  python3 tools/eval_defer_gate.py SMOKE_LOG RUN_DIR CANDIDATE_SHA MILES_SHA   (inside miles.sif)"""
 import ast
 import glob
 import gzip
@@ -16,7 +17,7 @@ import os
 import re
 import sys
 
-log, run, cand = sys.argv[1], sys.argv[2], sys.argv[3]
+log, run, cand, miles = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 sys.path.insert(0, os.environ.get("MQB_CODE", "/scratch/gpfs/GROUP/USER/project/miles-q38-build"))
 fails = []
 
@@ -29,7 +30,7 @@ def check(ok, what):
 
 lines = open(log, errors="replace").read().splitlines()
 code = next((l for l in lines if "[miles-run] code:" in l), "")
-check(f"repo {cand[:7]}" in code, f"the smoke ran the candidate: {code[-80:]}")
+check(f"repo {cand[:7]}" in code and f"miles {miles[:9]} " in code, f"the smoke ran the candidate on miles {miles[:9]}: {code[-80:]}")
 
 
 def first(pat):

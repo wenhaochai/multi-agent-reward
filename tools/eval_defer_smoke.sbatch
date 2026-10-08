@@ -19,7 +19,11 @@ LOG=$B/logs/miles-$R-$SLURM_JOB_ID.out
 DEFER=(--eval-prompt-data fcs_val $B/data/fcs_val172_defer.jsonl
        --custom-eval-rollout-log-function-path miles_team.fcs_rm.log_eval
        --custom-rollout-log-function-path miles_team.fcs_rm.log_rollout)
-export RUN_NAME=$R GPUS=8 MILES_MODEL_TYPE=qwen3.5-9B MQB_CODE
+# the miles the Frontier-CS runs use (submit_fcs.sh); without it the launcher takes the image's miles, which lacks the
+# EasyPPO flags (job 15182362 failed at argparse)
+MILES_SRC=/scratch/gpfs/GROUP/USER/project/miles-easyppo
+MILES_SHA=$(git -C $MILES_SRC rev-parse HEAD)
+export RUN_NAME=$R GPUS=8 MILES_MODEL_TYPE=qwen3.5-9B MQB_CODE MILES_SRC
 export FCS_RM_CONCURRENCY=56 FCS_CASE_WORKERS=1 FCS_CASE_POOL=1
 mapfile -t ARGS < $B/runs/$R/smoke_args
 rc=0
@@ -27,7 +31,7 @@ $T smoke - other 8 60m -- bash $MQB_CODE/sbatch_miles.sh "${ARGS[@]}" "${DEFER[@
   --use-wandb --wandb-mode offline --wandb-dir $B/runs/$R --wandb-project fcs_easyppo_smoke --wandb-run-id $R-$SLURM_JOB_ID \
   --disable-wandb-random-suffix || rc=$?
 [ $rc -eq 0 ] && { $T gate - other 0 15m -- apptainer exec --contain --cleanenv --bind /scratch/gpfs/GROUP/USER \
-  --env MQB_CODE=$MQB_CODE $B/miles.sif python3 $MQB_CODE/tools/eval_defer_gate.py "$LOG" $B/runs/$R "$CAND" || rc=$?; }
+  --env MQB_CODE=$MQB_CODE $B/miles.sif python3 $MQB_CODE/tools/eval_defer_gate.py "$LOG" $B/runs/$R "$CAND" "$MILES_SHA" || rc=$?; }
 rm -r "$B/runs/fcs_easyppo_smoke_q9b-fcs-sft/ckpt" "$B/runs/fcs_easyppo_smoke_q9b-fcs-sft/ckpt_critic" 2>/dev/null || true
 [ $rc -eq 0 ] || { echo "eval-defer gate failed (rc=$rc): main and the baselines unchanged"; exit $rc; }
 git -C $B merge --ff-only "$CAND"
