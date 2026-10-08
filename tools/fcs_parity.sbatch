@@ -8,7 +8,7 @@ set -euo pipefail
 # /tmp on a compute node is small and shared (owner rule 2026-10-08): this job's temp files, compiles and caches go to
 # a job dir on /scratch, bound into any container as TMPDIR, removed at exit
 export TMPDIR=/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID; export APPTAINERENV_TMPDIR=$TMPDIR
-mkdir -p "$TMPDIR"; trap 'rm -rf "/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID"' EXIT
+mkdir -p "$TMPDIR"; trap 'rm -rf "/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID" || true' EXIT
 B=/scratch/gpfs/GROUP/USER/project/miles-q38-build
 W=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace
 LT=$TMPDIR  # container /tmp under --contain is a tiny tmpfs (parity 14849538: ENOSPC)

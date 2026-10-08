@@ -31,6 +31,8 @@ def check(ok, what):
 
 lines = open(log, errors="replace").read().splitlines()
 code = next((l for l in lines if "[miles-run] code:" in l), "")
+tmpline = next((l for l in lines if "[miles-run] TMPDIR=" in l), "")
+check("/scratch/gpfs/GROUP/USER/tmp/job/" in tmpline, f"the smoke's temp dir is on /scratch: {tmpline.strip()[-90:]}")
 check(f"repo {cand[:7]}" in code and f"miles {miles[:9]} " in code, f"the smoke ran the candidate on miles {miles[:9]}: {code[-80:]}")
 
 

@@ -7,7 +7,7 @@ set -euo pipefail
 # /tmp on a compute node is small and shared (owner rule 2026-10-08): this job's temp files, compiles and caches go to
 # a job dir on /scratch, bound into any container as TMPDIR, removed at exit
 export TMPDIR=/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID; export APPTAINERENV_TMPDIR=$TMPDIR
-mkdir -p "$TMPDIR"; trap 'rm -rf "/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID"' EXIT
+mkdir -p "$TMPDIR"; trap 'rm -rf "/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID" || true' EXIT
 # Gate for a change to the miles worktree the Frontier-CS chains import (packing rule 2026-10-07: smoke and gate in one
 # job, each task through packed_task.sh, ledger logs/packed/<job>.tsv). Task 1: the no-pad team smoke resumes from its
 # own checkpoint with the candidate miles (MILES_SRC) and trains one live rollout. Task 2: tools/resume_fix_gate.py on

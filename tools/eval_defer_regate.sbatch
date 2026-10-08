@@ -7,7 +7,7 @@ set -euo pipefail
 # /tmp on a compute node is small and shared (owner rule 2026-10-08): this job's temp files, compiles and caches go to
 # a job dir on /scratch, bound into any container as TMPDIR, removed at exit
 export TMPDIR=/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID; export APPTAINERENV_TMPDIR=$TMPDIR
-mkdir -p "$TMPDIR"; trap 'rm -rf "/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID"' EXIT
+mkdir -p "$TMPDIR"; trap 'rm -rf "/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID" || true' EXIT
 # The eval-defer gate again, on a CPU node, over the outputs of a smoke whose own part passed and whose gate failed in
 # the gate itself (job 15204506: the gate's re-judge ran out of apptainer's session /tmp, and it expected 172 kept
 # replies and a kept file for the inline last eval). RAN is the candidate the smoke ran (its code line); CAND is the

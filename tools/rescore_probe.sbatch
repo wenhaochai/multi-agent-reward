@@ -7,7 +7,7 @@ set -euo pipefail
 # /tmp on a compute node is small and shared (owner rule 2026-10-08): this job's temp files, compiles and caches go to
 # a job dir on /scratch, bound into any container as TMPDIR, removed at exit
 export TMPDIR=/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID; export APPTAINERENV_TMPDIR=$TMPDIR
-mkdir -p "$TMPDIR"; trap 'rm -rf "/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID"' EXIT
+mkdir -p "$TMPDIR"; trap 'rm -rf "/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID" || true' EXIT
 # re-judge probe answers with the current judge and the last-code-block rule: sbatch tools/rescore_probe.sbatch <probe dirs>
 # judges = the job's cores - 1 (fcs_judge.job_cpus), one case at a time each (the wall limit is 2 x the time limit)
 B=/scratch/gpfs/GROUP/USER/project/miles-q38-build

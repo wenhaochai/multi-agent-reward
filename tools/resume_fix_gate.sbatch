@@ -7,7 +7,7 @@ set -euo pipefail
 # /tmp on a compute node is small and shared (owner rule 2026-10-08): this job's temp files, compiles and caches go to
 # a job dir on /scratch, bound into any container as TMPDIR, removed at exit
 export TMPDIR=/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID; export APPTAINERENV_TMPDIR=$TMPDIR
-mkdir -p "$TMPDIR"; trap 'rm -rf "/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID"' EXIT
+mkdir -p "$TMPDIR"; trap 'rm -rf "/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID" || true' EXIT
 # the actor resume-fix gate: submitted with --dependency=afterok:<resume smoke>; the resumed Frontier-CS chains depend
 # afterok on this job. Checks (tools/resume_fix_gate.py, in miles.sif), then fast-forwards miles-easyppo to the fix.
 #   sbatch --dependency=afterok:<smoke> tools/resume_fix_gate.sbatch <smoke log> <saved actor ckpt iter dir> <fix sha>

@@ -18,7 +18,7 @@ export TMPDIR=/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID${QTASK:+_q$QTASK}  
 export APPTAINERENV_TMPDIR=$TMPDIR
 JOBTMP=/tmp/miles_$SLURM_JOB_ID${QTASK:+_q$QTASK}
 mkdir -p "$TMPDIR" "$JOBTMP"
-trap 'rm -rf "/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID${QTASK:+_q$QTASK}" "/tmp/miles_$SLURM_JOB_ID${QTASK:+_q$QTASK}"' EXIT
+trap 'rm -rf "/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID${QTASK:+_q$QTASK}" "/tmp/miles_$SLURM_JOB_ID${QTASK:+_q$QTASK}" || true' EXIT
 echo "[sbatch] $(date -u +%FT%TZ) node=$(hostname) job=$SLURM_JOB_ID run=$RUN_NAME gpus=$GPUS"
 apptainer exec --nv --contain --cleanenv --writable-tmpfs \
   --bind /scratch/gpfs/GROUP/USER \

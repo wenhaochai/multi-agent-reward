@@ -50,7 +50,9 @@ ray start --head --node-ip-address 127.0.0.1 --num-gpus "${GPUS:-8}" --port=$P -
   --ray-client-server-port=$((P + 5)) --runtime-env-agent-port=$((P + 6)) --node-manager-port=$((P + 7)) \
   --object-manager-port=$((P + 8)) --include-dashboard=false --disable-usage-stats --temp-dir="$RAY_TMP"
 export RAY_ADDRESS=127.0.0.1:$P
-trap 'pkill -9 -u "$(id -u)" -f -- "$RAY_TMP" 2>/dev/null || true; echo "[miles-run] TMPDIR at exit: $(du -sh "$JT" 2>/dev/null | cut -f1); /tmp: $(du -sh /tmp 2>/dev/null | cut -f1)"; rm -rf "/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID${QTASK:+_q$QTASK}"' EXIT
+# the job dir is a bind mount point in here (rm of it fails: smoke 15214649 exited 1 after a good run, since a failing
+# command in an EXIT trap under set -e sets the exit status): empty it; sbatch_miles.sh removes the dir
+trap 'pkill -9 -u "$(id -u)" -f -- "$RAY_TMP" 2>/dev/null || true; echo "[miles-run] TMPDIR at exit: $(du -sh "$JT" 2>/dev/null | cut -f1); /tmp: $(du -sh /tmp 2>/dev/null | cut -f1)"; find "/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID${QTASK:+_q$QTASK}" -mindepth 1 -delete 2>/dev/null || true' EXIT
 
 # a wall-clock kill between the actor save and the critic save leaves the two trackers at different iterations, which
 # fails miles' restored-rollout assert in every chained segment: point both at their newest common iteration first
