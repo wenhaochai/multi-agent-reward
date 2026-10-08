@@ -4,8 +4,9 @@ tools/eval_defer_smoke.sbatch (4 rollouts, evals after rollouts 1 and 3, the eva
      image's miles, which lacks the EasyPPO flags);
   2. eval 1 was saved and judged in the background: its "metrics.py - eval 1:" line comes after training went on
      (a "rollout 2" line), and eval 3 (the last) was logged too;
-  3. nothing is left pending; each kept eval has every sample, its mean reward equals the logged eval/fcs_val, and an
-     unanswered reply (cut off, or no </think>) has reward 0;
+  3. the smoke logged no judge error; nothing is left pending; eval 1 kept all 170 replies (172 problems, 2 over the
+     prompt limit), its mean reward equals the logged eval/fcs_val, and an unanswered reply (cut off, or no </think>)
+     has reward 0 (eval 3, the last, is judged inline and keeps no file);
   4. judging eval 1's replies again here, alone, gives the same reward for >= 97% of them and a mean within 0.01 (the
      background judge ran beside training's; a time-limit-borderline program may flip).
   python3 tools/eval_defer_gate.py SMOKE_LOG RUN_DIR CANDIDATE_SHA MILES_SHA   (inside miles.sif)"""
@@ -51,10 +52,16 @@ for i in (ev1, ev3):
         logged[k] = ast.literal_eval(re.sub(r"(?<![\w'\"])(-?)(nan|inf)\b", r"'\1\2'", lines[i].split(f"- eval {k}: ", 1)[1]))
 from miles_team.fcs_rm import answered, score  # noqa: E402
 
-for k in (1, 3):
+# the smoke itself judged without infrastructure errors (job 15204506: the gate's own re-judge below ran out of /tmp)
+smoke_end = next((i for i, l in enumerate(lines) if l.startswith(("ok   ", "FAIL "))), len(lines))
+errs = [l for l in lines[:smoke_end] if "JUDGE-ERROR" in l]
+check(not errs, f"no judge errors in the smoke ({len(errs)}){': ' + errs[0][:120] if errs else ''}")
+# only background evals keep their replies; the last eval (3) is judged inline and logged by miles (checked above).
+# 170 of the 172 validation problems fit the prompt limit (miles drops the other 2)
+for k in (1,):
     f = f"{run}/eval_pending/eval_{k}.jsonl.gz"
     rows = [json.loads(l) for l in gzip.open(f, "rt")] if os.path.exists(f) else []
-    check(len(rows) == 172, f"eval {k}: {len(rows)} kept replies")
+    check(len(rows) == 170, f"eval {k}: {len(rows)} kept replies (170 expected)")
     if rows and k in logged:
         m = sum(r["reward"] for r in rows) / len(rows)
         check(abs(m - logged[k]["eval/fcs_val"]) < 1e-9, f"eval {k}: kept mean {m:.6f} == logged {logged[k]['eval/fcs_val']:.6f}")

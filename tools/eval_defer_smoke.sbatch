@@ -30,8 +30,12 @@ rc=0
 $T smoke - other 8 60m -- bash $MQB_CODE/sbatch_miles.sh "${ARGS[@]}" "${DEFER[@]}" \
   --use-wandb --wandb-mode offline --wandb-dir $B/runs/$R --wandb-project fcs_easyppo_smoke --wandb-run-id $R-$SLURM_JOB_ID \
   --disable-wandb-random-suffix || rc=$?
+# the gate re-judges eval 1: its compiles need a real /tmp (under --contain, /tmp is apptainer's small session tmpfs;
+# job 15204506 ran out of space there)
+GT=${TMPDIR:-/tmp}/eval_defer_gate_$SLURM_JOB_ID; mkdir -p "$GT"
 [ $rc -eq 0 ] && { $T gate - other 0 15m -- apptainer exec --contain --cleanenv --bind /scratch/gpfs/GROUP/USER \
-  --env MQB_CODE=$MQB_CODE $B/miles.sif python3 $MQB_CODE/tools/eval_defer_gate.py "$LOG" $B/runs/$R "$CAND" "$MILES_SHA" || rc=$?; }
+  --bind "$GT":/tmp --env MQB_CODE=$MQB_CODE $B/miles.sif python3 $MQB_CODE/tools/eval_defer_gate.py "$LOG" $B/runs/$R "$CAND" "$MILES_SHA" || rc=$?; }
+rm -r "${TMPDIR:-/tmp}/eval_defer_gate_$SLURM_JOB_ID" 2>/dev/null || true
 rm -r "$B/runs/fcs_easyppo_smoke_q9b-fcs-sft/ckpt" "$B/runs/fcs_easyppo_smoke_q9b-fcs-sft/ckpt_critic" 2>/dev/null || true
 [ $rc -eq 0 ] || { echo "eval-defer gate failed (rc=$rc): main and the baselines unchanged"; exit $rc; }
 git -C $B merge --ff-only "$CAND"
