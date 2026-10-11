@@ -32,7 +32,11 @@ export NCCL_NVLS_ENABLE=$(nvidia-smi topo -m 2>/dev/null | grep -c 'NV[0-9]' | a
 # runs/<run>/extra_env: KEY=VALUE lines ('#' ignored), exported before `ray start` so every Ray worker sees them (e.g.
 # FCS_EXTRACT=longest pins a run that started under the old code-block rule)
 if [ -f "$RUN_DIR/extra_env" ]; then
-  while IFS= read -r kv; do case "$kv" in ''|'#'*) ;; *) export "$kv"; echo "[miles-run] extra env: $kv" ;; esac; done < "$RUN_DIR/extra_env"
+  # a last line without a newline counts; CR and trailing ' # comments' are dropped (audit 2026-10-11)
+  while IFS= read -r kv || [ -n "$kv" ]; do
+    kv=${kv%$'\r'}; kv=${kv%%[[:space:]]#*}; kv=${kv%"${kv##*[![:space:]]}"}
+    case "$kv" in ''|'#'*) ;; *) export "$kv"; echo "[miles-run] extra env: $kv" ;; esac
+  done < "$RUN_DIR/extra_env"
 fi
 echo "[miles-run] $(date -u +%FT%TZ) host=$(hostname) job=$SLURM_JOB_ID run=$RUN_NAME miles=$MILES sha=$(git -C "$MILES" rev-parse --short HEAD) megatron=$MEGATRON"
 # every segment imports the live trees at start: record exactly which code it ran (uncommitted files counted)
@@ -65,7 +69,7 @@ echo "[miles-run] train args: $*"
 # per-run overrides for jobs already queued (their args are fixed at submit; this script is read at job start):
 # runs/<run>/extra_args, whitespace-separated flags, '#' lines ignored, appended last (argparse: the last flag wins)
 EXTRA=()
-[ -f "$RUN_DIR/extra_args" ] && read -r -a EXTRA <<< "$(grep -v '^#' "$RUN_DIR/extra_args" | tr '\n' ' ')"
+[ -f "$RUN_DIR/extra_args" ] && read -r -a EXTRA <<< "$(grep -v '^#' "$RUN_DIR/extra_args" | sed 's/\r$//; s/[[:space:]]#.*//' | tr '\n' ' ')"
 # the last value of a flag over the train args and the extra args (argparse: the last one wins)
 ALL=("$@" "${EXTRA[@]}")
 argval() { local v="" a prev=""; for a in "${ALL[@]}"; do [ "$prev" = "$1" ] && v=$a; prev=$a; done; echo "$v"; }

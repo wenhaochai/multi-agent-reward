@@ -6,6 +6,7 @@
 set -euo pipefail
 # /tmp on a compute node is small and shared (owner rule 2026-10-08): this job's temp files, compiles and caches go to
 # a job dir on /scratch, bound into any container as TMPDIR, removed at exit
+: "${SLURM_JOB_ID:?}"   # an empty id would point TMPDIR and the EXIT rm at tmp/job/ itself
 export TMPDIR=/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID; export APPTAINERENV_TMPDIR=$TMPDIR
 mkdir -p "$TMPDIR"; trap 'rm -rf "/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID" || true' EXIT
 # Gate for eval judged after training resumes (miles_team.fcs_rm.log_eval; packing rule 2026-10-07: smoke and gate in

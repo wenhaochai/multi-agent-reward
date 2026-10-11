@@ -20,6 +20,9 @@ JOBTMP=/tmp/miles_$SLURM_JOB_ID${QTASK:+_q$QTASK}
 mkdir -p "$TMPDIR" "$JOBTMP"
 trap 'rm -rf "/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID${QTASK:+_q$QTASK}" "/tmp/miles_$SLURM_JOB_ID${QTASK:+_q$QTASK}" || true' EXIT
 echo "[sbatch] $(date -u +%FT%TZ) node=$(hostname) job=$SLURM_JOB_ID run=$RUN_NAME gpus=$GPUS"
+# MA_*/FCS_* reach the container as APPTAINERENV_* (passes --cleanenv verbatim; --env %q turned "0,1,3" into "0\,1\,3",
+# audit 2026-10-11); each is logged, since a variable exported in the submitting shell also lands here
+for v in $(compgen -e | grep "^MA_\|^FCS_"); do export "APPTAINERENV_$v=${!v}"; echo "[sbatch] env $v=${!v}"; done
 apptainer exec --nv --contain --cleanenv --writable-tmpfs \
   --bind /scratch/gpfs/GROUP/USER \
   --bind "$JOBTMP":/tmp --bind "$TMPDIR" \
@@ -28,5 +31,4 @@ apptainer exec --nv --contain --cleanenv --writable-tmpfs \
   --env PYTHONNOUSERSITE=1 --env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" \
   --env SLURM_JOB_ID="$SLURM_JOB_ID" --env RUN_NAME="$RUN_NAME" --env GPUS="$GPUS" \
   --env MILES_MODEL_TYPE="$MILES_MODEL_TYPE" ${MILES_SRC:+--env MILES_SRC="$MILES_SRC"} ${QTASK:+--env QTASK="$QTASK"} \
-  $(for v in $(compgen -e | grep "^MA_\|^FCS_"); do printf -- "--env %s=%q " "$v" "${!v}"; done) \
   ${MQB_CODE:+--env MQB_CODE="$MQB_CODE"} "$B/miles.sif" bash "${MQB_CODE:-$B}/run_miles_in_container.sh" "$@"
