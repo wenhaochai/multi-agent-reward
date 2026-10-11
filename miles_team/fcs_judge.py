@@ -5,7 +5,7 @@ and rlimits, so RL rewards on Della match what the judge server would return.
 Rules copied from the official engine:
   * cases: n_cases per subtask from config.yaml (prefix/suffix default '' / '.in' / '.ans', numbered from 1), plus every
     other complete <n>.in + <n>.ans (or .out) pair in testdata/ at the last subtask's limits;
-  * compile: g++ -O2 -pipe -static -s -std=gnu++17; a compile error scores 0;
+  * compile: g++ -O2 -pipe -std=gnu++17 (we add -static -s); a compile error scores 0;
   * run: CPU time <= the case time limit, wall <= 2x, address space and stack <= the memory limit, stdout <= 128 MiB;
     anything else (TLE, MLE, runtime error, non-zero exit) scores the case 0;
   * classic: checker `chk in.txt out.txt ans.txt` (10 s CPU, 256 MiB); interactive: the program and
@@ -27,7 +27,12 @@ Deviations, all from the 2026-10-04 audit:
     ("infra": True) instead of passing as plain zeros;
   * a program may create at most ~128 more tasks (the official procLimit): RLIMIT_NPROC counts all of the user's tasks,
     so the limit is set to the user's current task count + 128 (counted at most every 5 s), which stops a fork bomb
-    from starving the training job and leaves single-threaded programs untouched.
+    from starving the training job and leaves single-threaded programs untouched;
+  * training problems read the LAST "Ratio:" of a trusted message (official: the first): frontiersmith_104's checker
+    puts a raw output line before its own "Ratio: 0", so a program that prints "Ratio: 1" got 1.0 (audit 2026-10-11);
+  * Landlock ABI >= 6 also scopes signals: a program cannot signal anything outside its sandbox (kill(getppid()) or
+    kill(-1) reached the trainer before; audit 2026-10-11);
+  * g++ gets a 2 GiB address space and the task limit (official: 512 MiB, 10 s CPU, 50 processes).
 usage: judge(problem_dir, cpp_source) -> {"score": 0-100, "status": ..., "cases": [...], "infra": bool}
 """
 from __future__ import annotations
@@ -98,10 +103,10 @@ def _ratio(msg: str, trusted: bool, ok: bool, train: bool) -> float:
         m = _RATIO.search(msg) if trusted else None
         v = _JS_FLOAT.match(m.group(1)) if m else None
         return float(v.group(0)) if v else (1.0 if ok else 0.0)
-    m = _RATIO_FULL.search(msg) if trusted else None
-    if not m:
+    ms = _RATIO_FULL.findall(msg) if trusted else []   # the checker's own Ratio is its last one (see the header)
+    if not ms:
         return 1.0 if ok else 0.0
-    v = float(m.group(1))
+    v = float(ms[-1])
     return min(1.0, max(0.0, v)) if math.isfinite(v) else 0.0
 
 
@@ -210,6 +215,11 @@ if SANDBOX and not LANDLOCK_ABI:
     print("[fcs_judge] WARNING: Landlock is unavailable here: untrusted code runs without a file sandbox",
           file=sys.stderr, flush=True)
 _HANDLED = {1: _FS_ALL_V1, 2: (1 << 14) - 1}.get(LANDLOCK_ABI, (1 << 15) - 1)  # ABI 2 adds REFER, 3 TRUNCATE
+_SCOPE_SIGNAL = 1 << 1  # LANDLOCK_SCOPE_SIGNAL (ABI 6): no signals to processes outside the domain
+if SANDBOX and 0 < LANDLOCK_ABI < 6:
+    import sys
+    print(f"[fcs_judge] WARNING: Landlock ABI {LANDLOCK_ABI} < 6: untrusted code can signal the trainer",
+          file=sys.stderr, flush=True)
 
 
 def _landlock_rules(rules):
@@ -223,8 +233,11 @@ def _landlock_rules(rules):
 
 def _restrict(rules):
     """In the child (preexec): allow only `rules` [(path, access)], deny every other handled file access."""
-    attr = ctypes.create_string_buffer(struct.pack("<Q", _HANDLED))
-    rs = _libc.syscall(_LL_CREATE, attr, ctypes.c_size_t(8), ctypes.c_uint32(0))
+    if LANDLOCK_ABI >= 6:   # struct landlock_ruleset_attr {handled_access_fs, handled_access_net, scoped}
+        attr = ctypes.create_string_buffer(struct.pack("<QQQ", _HANDLED, 0, _SCOPE_SIGNAL))
+    else:
+        attr = ctypes.create_string_buffer(struct.pack("<Q", _HANDLED))
+    rs = _libc.syscall(_LL_CREATE, attr, ctypes.c_size_t(len(attr.raw)), ctypes.c_uint32(0))
     if rs < 0:
         raise OSError(ctypes.get_errno(), "landlock_create_ruleset")
     try:
@@ -437,7 +450,8 @@ def judge(problem_dir, source: str, case_workers: int = CASE_WORKERS, pool: Thre
         def compile_():
             return subprocess.run(COMPILE + ["-o", str(sol), str(work / "sol.cpp")], capture_output=True, text=True,
                                   errors="replace", timeout=120, env={**_CLEAN_ENV, "TMPDIR": str(work)},
-                                  preexec_fn=_limits(600, None, sandbox=_compile_sandbox(work)))
+                                  preexec_fn=_limits(600, 2 << 30, stack_b=1 << 30, sandbox=_compile_sandbox(work),
+                                                     nproc=_nproc_limit()))
         slots = pool or (_case_pool() if CASE_POOL else None)
         r = slots.submit(compile_).result() if slots else compile_()
         if r.returncode != 0:
