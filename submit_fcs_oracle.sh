@@ -18,7 +18,7 @@
 # Shared value pretraining: PRETRAIN=1 runs the 10 critic-only rollouts of GAME once (runs/fcs_vp_oracle_<game>_...),
 #   dumped; VP=1 VP_DEP=<its jid> makes an arm replay them, relabeled with its reward (fcs_oracle.post_process).
 # Usage: GAME=... REWARD=... [SUB_TESTS=3] [SEED=42] [RUN_TAG=<suffix for a separate run dir>] [NUM_ROLLOUT] [EVAL_EVERY] [N_EVAL] [BUDGET] [MODEL] [SMOKE=1] [PRETRAIN=1]
-#        [VP=1 VP_DEP=jid] [QOS] [TIME] [DEP] [NICE] [MILES_SRC=<worktree>] [EXTRA_ARGS="..."] [DRY=1] bash submit_fcs_oracle.sh
+#        [VP=1 VP_DEP=jid] [QOS] [TIME] [DEP] [NICE] [MILES_SRC=<worktree>] [EXTRA_ARGS="..."] [DRY=1] [EMIT=<dir>] bash submit_fcs_oracle.sh
 #   SMOKE=1: 2 rollouts of 2 prompts x 1 episode, 4096-token turns, 16-problem val sets of the game at the end.
 set -euo pipefail
 B=/scratch/gpfs/GROUP/USER/project/miles-q38-build
@@ -127,6 +127,13 @@ dep=(); [ -n "${DEP:-}" ] && dep+=(afterany:"$DEP"); [ -n "${VP_DEP:-}" ] && dep
   echo "VP=1: $VPR has no rollout $((CO - 1)) dump yet; pass VP_DEP=<its jid>" >&2; exit 1; }
 echo "$R: ${fo[*]} rb=$RB ns=$NS gbs=$GBS cgbs=$CGBS maxtok=$MAXTOK evals=${EVS[*]} miles=$(git -C $MILES_SRC rev-parse --short HEAD) repo=$(git -C $B rev-parse --short HEAD)"
 [ -n "${DRY:-}" ] && { echo "  ${args[*]}"; exit 0; }
+# EMIT=<dir>: write the run name, its env (KEY=VALUE lines) and args (one per line) for a packed job
+# (tools/packed_oracle.sbatch) instead of submitting
+if [ -n "${EMIT:-}" ]; then
+  mkdir -p "$EMIT" $B/runs/$R; echo "$R" > "$EMIT/run"
+  printf '%s\n' "${envs[@]}" > "$EMIT/env"; printf '%s\n' "${args[@]}" > "$EMIT/args"
+  exit 0
+fi
 mkdir -p $B/runs/$R
 unset $(compgen -e | grep '^MA_' || true)   # only this run's MA_* reach the job
 jid=$(env "${envs[@]}" sbatch --parsable --partition=pli-c --account=group --qos=$QOS --time=$TIME "${sb[@]}" \
