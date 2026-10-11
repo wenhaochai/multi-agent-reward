@@ -11,6 +11,13 @@ C=${MQB_CODE:-$B}   # the code (miles_team, tools); runs/ and logs/ stay under $
 MILES=${MILES_SRC:-/scratch/gpfs/GROUP/USER/project/miles-q38}
 : "${RUN_NAME:?}" "${SLURM_JOB_ID:?}" "${MILES_MODEL_TYPE:?}"
 RUN_DIR=$B/runs/$RUN_NAME
+# runs/<run>/smoke_job names the packed job (tools/packed_oracle.sbatch) whose smoke copy gates this run: no segment
+# trains unless that smoke's ledger line exited 0 (later segments are afterany, so they start even after a failed smoke)
+if [ -f "$RUN_DIR/smoke_job" ]; then
+  sj=$(cat "$RUN_DIR/smoke_job")
+  src=$(awk -F'\t' '$1 == "smoke" {print $7}' "$B/logs/packed/$sj.tsv" 2>/dev/null | tail -1)
+  [ "$src" = 0 ] || { echo "[miles-run] the smoke of job $sj did not pass (exit '${src:-none}'): not training"; exit 1; }
+fi
 mkdir -p "$RUN_DIR"
 exec > >(tee -a "$RUN_DIR/console.log") 2>&1
 # /tmp on a compute node is small and shared by every job there (owner rule 2026-10-08): temp files, compiles, the judge
