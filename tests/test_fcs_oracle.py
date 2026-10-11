@@ -124,6 +124,7 @@ rec = {"game": "team", "S": 0.6, "tests": [[0.2], [0.5, 0.1], [], [0.3]], "S_min
 assert O.rewards("team", "shared", rec) == [0.6] * 6
 assert all(close(a, b) for a, b in zip(O.rewards("team", "bonus", rec), [0.6, 0.6, 0.7, 0.85, 0.6, 0.75]))
 assert all(close(a, b) for a, b in zip(O.rewards("team", "diff", rec), [0.6, 0.6, 0.0, 0.2, 0.0, 0.1]))
+assert all(close(a, b) for a, b in zip(O.rewards("team", "diff", {**rec, "S_ref": 0.7}), [0.6, 0.6, 0.1, 0.3, 0.1, 0.2]))
 try:
     O.rewards("team", "diff", {**rec, "S_minus": None})
     raise SystemExit("diff without counterfactuals must fail")
@@ -243,6 +244,26 @@ assert "Try DP B." not in cf[1].split("Your subagents reported back")[-1] and ou
 assert len(real) == 10 and [round(o.reward, 4) for o in real[:2]] == [1.0, 1.0]
 O.REWARD = "shared"
 print("[ok] diff: counterfactuals not trained, removed subagent not adoptable")
+
+# 4c) MA_FO_CF_K=2: subagent j gets mean(S, one more full-context final) - mean(two counterfactual finals); the extra
+# finals are generated in the order cf1_1, cf1_2, ..., cf4_2, ref2 and none is trained on
+O.REWARD, O.CF_K = "diff", 2
+cf_codes = ["A", "C", "D", "D", "A", "A", "C", "D"]
+out = play(plan=[(PLAN_TXT, "stop")], sub=SUBS,
+           final=[(cpp("int main(){D;}"), "stop")] + [(cpp(f"int main(){{{x};}}"), "stop") for x in cf_codes]
+           + [(cpp("int main(){A;}"), "stop")])
+real = [o for o in out if not o.metadata.get("fo_pad")]
+sc = {"A": sA, "C": sC, "D": sD}
+want_minus = [(sc[cf_codes[2 * j]] + sc[cf_codes[2 * j + 1]]) / 2 for j in range(4)]
+want_ref = (sD + sA) / 2
+fo = out[0].metadata["fo"]
+assert all(close(a, b) for a, b in zip(fo["S_minus"], want_minus)), (fo["S_minus"], want_minus)
+assert close(fo["S_ref"], want_ref) and close(out[0].metadata["fo_S_ref"], want_ref)
+assert all(close(a, b) for a, b in zip(O.rewards("team", "diff", fo), [sD, sD] + [want_ref - m for m in want_minus]))
+assert len(real) == 10, len(real)
+assert sorted({round(o.reward, 6) for o in real[2:]}) == sorted({round(want_ref - m, 6) for m in want_minus})
+O.REWARD, O.CF_K = "shared", 1
+print("[ok] diff with MA_FO_CF_K=2: means on both sides, extra finals not trained")
 
 # 4b) adoption reuses the judged result; an adopt of a subagent with no tests submits nothing (no judge call)
 JUDGED = []

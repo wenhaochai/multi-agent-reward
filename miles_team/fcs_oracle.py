@@ -26,6 +26,10 @@ Rewards (MA_FO_REWARD; s = a judged score in [0, 1]):
                 (MA_FO_SUBS extra lead turns,
                 generated and judged but never trained on; also computed when MA_FO_CF=1, e.g. by the shared-value
                 producer, so a diff run can relabel replayed rollouts)
+                MA_FO_CF_K = k > 1 (audit 2026-10-11, owner: a less noisy diff): subagent j gets mean(full) - mean(-j),
+                where full = S and k - 1 more lead finals from the same context and -j = k counterfactual finals; one
+                sample per side made S - S_-j mostly the lead's resampling noise (subagents that did nothing got the
+                same spread as those that tested programs)
   seq   shared  every round gets s_last;  indiv  s_t;  diff  max(0, s_t - max_{i<t} s_i)
   par   shared  max_t s_t;  indiv  s_t (plain single-agent RL);  diff  V - max_{i!=t} s_i
 
@@ -69,6 +73,7 @@ REPORT_BUDGET = int(os.environ.get("MA_FO_REPORT_BUDGET", "16384"))
 REPORT_CHARS = int(os.environ.get("MA_FO_REPORT_CHARS", "6000"))
 BONUS = float(os.environ.get("MA_FO_BONUS", "0.5"))
 CF = os.environ.get("MA_FO_CF", "0") == "1"
+CF_K = int(os.environ.get("MA_FO_CF_K", "1"))  # samples per side of the difference reward (see the header)
 TRACE_DIR = os.environ.get("MA_FO_TRACE_DIR", "")
 TRACE_EVERY = int(os.environ.get("MA_FO_TRACE_EVERY", "32"))
 GAMES = ("team", "seq", "par")
@@ -197,7 +202,8 @@ def rewards(game: str, arm: str, rec: dict) -> list[float]:
             return [S, S] + [S + BONUS * x for x in top]
         if arm == "diff":
             assert rec.get("S_minus") is not None, "diff needs the counterfactual finals (MA_FO_CF=1 when generating)"
-            return [S, S] + [S - m for m in rec["S_minus"]]
+            ref = rec.get("S_ref", S)  # mean(S, k - 1 more full-context finals) when MA_FO_CF_K > 1
+            return [S, S] + [ref - m for m in rec["S_minus"]]
     else:
         s = rec["s"]
         V = s[-1] if game == "seq" else max(s)
@@ -438,17 +444,23 @@ async def _team(input, messages, label):
     final_msgs = head + [{"role": "user", "content": FEEDBACK.format(blocks="\n\n".join(blocks))}]
     _, ftext, fcut, fseg, adopted, fres = await _final(input, lead, final_msgs, subr, label)
     S = fres["score"]
-    S_minus, cf_gen, cf_trace = None, 0, []
+    S_minus, S_ref, cf_gen, cf_trace = None, None, 0, []
     if (REWARD == "diff" or CF) and not input.evaluation:
+        k = max(1, CF_K)
         # subagent j's work is gone from the counterfactual: its block says so and its programs cannot be adopted
-        cfs = await _gather(*[_final(
-            input, f"cf{j + 1}",
-            head + [{"role": "user", "content": FEEDBACK.format(blocks="\n\n".join(
-                NOT_AVAILABLE.format(j=j + 1) if i == j else b for i, b in enumerate(blocks)))}],
-            [{**r, "tests": []} if i == j else r for i, r in enumerate(subr)], label) for j in range(n)])
-        S_minus = [c[5]["score"] for c in cfs]
-        cf_gen = sum(_gen(c[0]) for c in cfs)
-        cf_trace = [_tt(f"cf{j + 1}", c[1], c[2], c[5]) for j, c in enumerate(cfs)]
+        cf_args = [(f"cf{j + 1}" + (f"_{i + 1}" if k > 1 else ""),
+                    head + [{"role": "user", "content": FEEDBACK.format(blocks="\n\n".join(
+                        NOT_AVAILABLE.format(j=j + 1) if b_i == j else b for b_i, b in enumerate(blocks)))}],
+                    [{**r, "tests": []} if r_i == j else r for r_i, r in enumerate(subr)]) for j in range(n) for i in range(k)]
+        # k - 1 more finals from the full context: with S they estimate the expected final score
+        ref_args = [(f"ref{i + 2}", final_msgs, subr) for i in range(k - 1)]
+        outs = await _gather(*[_final(input, name, msgs, sr, label) for name, msgs, sr in cf_args + ref_args])
+        cfs, refs = outs[:n * k], outs[n * k:]
+        S_minus = [sum(c[5]["score"] for c in cfs[j * k:(j + 1) * k]) / k for j in range(n)]
+        if k > 1:
+            S_ref = (S + sum(c[5]["score"] for c in refs)) / k
+        cf_gen = sum(_gen(c[0]) for c in outs)
+        cf_trace = [_tt(name, c[1], c[2], c[5]) for (name, _, _), c in zip(cf_args + ref_args, outs)]
     tests = [[x["score"] for _, x in r["tests"]] for r in subr]
     best = max((x for t in tests for x in t), default=0.0)
     gen_sub = [_gen(r["sess"]) for r in subr]
@@ -456,6 +468,8 @@ async def _team(input, messages, label):
     lead_gen = _gen(lead)
     final_prompt = _prompt_len(lead, fseg)
     rec = {"game": "team", "S": S, "tests": tests, "adopted": adopted, "S_minus": S_minus}
+    if S_ref is not None:
+        rec["S_ref"] = S_ref
     info = {"fo_S": S, "fo_best_test": best, "fo_beat": float(S > best), "fo_adopt": float(adopted is not None),
             "fo_sub_tests": sum(map(len, tests)) / n, "fo_sub_notest": sum(not t for t in tests) / n,
             "fo_tasks_ok": sum(t != NO_TASK for t in tasks) / n, "fo_plan_cut": float(pcut),
@@ -470,7 +484,9 @@ async def _team(input, messages, label):
             "fo_cf_tokens": cf_gen,
             "fo_judge_infra_error": float(fres["infra_error"] or any(x["infra_error"] for r in subr for _, x in r["tests"]))}
     if S_minus is not None:
-        info["fo_sub_marginal"] = sum(S - m for m in S_minus) / n
+        info["fo_sub_marginal"] = sum((S if S_ref is None else S_ref) - m for m in S_minus) / n
+        if S_ref is not None:
+            info["fo_S_ref"] = S_ref
     # turns with their reward index: plan 0, final 1, every turn of subagent j 2 + j
     turns = [(lead, pseg, 0), (lead, fseg, 1)] + [(r["sess"], sg, 2 + j) for j, r in enumerate(subr) for sg in r["segs"]]
     trace = ([_tt("plan", ptext, pcut, None, tasks=tasks)] + [t for r in subr for t in r["trace"]]
