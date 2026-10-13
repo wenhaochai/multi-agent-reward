@@ -14,10 +14,12 @@ T0=$(date +%s)
 B=/scratch/gpfs/GROUP/USER/project/miles-q38-build
 PT=/scratch/gpfs/GROUP/USER/tools/packed_task.sh
 export PACKED_LEDGER_DIR=$B/logs/packed
+NT=0
 task() {  # task NAME RECORD_RUN KIND LIMIT EMIT_DIR
-  local -a E A; mapfile -t E < "$5/env"; mapfile -t A < "$5/args"
+  # QTASK is a number: run_miles_in_container.sh puts it in the Ray port arithmetic (QTASK=smoke killed 15375871)
+  local -a E A; mapfile -t E < "$5/env"; mapfile -t A < "$5/args"; NT=$((NT + 1))
   echo "[packed] $(date -u +%FT%TZ) task $1 run $(cat "$5/run") limit $4"
-  env "${E[@]}" MQB_CODE="$MQB_CODE" QTASK="$1" bash "$PT" "$1" "$2" "$3" 8 "$4" -- bash "$MQB_CODE/sbatch_miles.sh" "${A[@]}"
+  env "${E[@]}" MQB_CODE="$MQB_CODE" QTASK="$NT" bash "$PT" "$1" "$2" "$3" 8 "$4" -- bash "$MQB_CODE/sbatch_miles.sh" "${A[@]}"
 }
 task smoke - other 100m "$SMOKE_DIR" || { echo "[packed] smoke failed: no training"; exit 1; }
 task train "$(cat "$MAIN_DIR/run")" main "$(( ${JOB_WALL_S:-86400} - ($(date +%s) - T0) - 900 ))s" "$MAIN_DIR"
