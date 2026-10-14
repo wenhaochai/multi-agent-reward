@@ -104,6 +104,10 @@ def emit(src, game, n, name, out, rounds, smoke, given, o=None):
     a = setf(a, "--save", f"{rdir}/ckpt")
     a = setf(a, "--critic-save", f"{rdir}/ckpt_critic")
     a = setf(a, "--num-rollout", "0")
+    # the source checkpoint holds the training run's LR/WD schedule; --num-rollout 0 gives 0 decay iterations, and Megatron
+    # asserts the two match on load (15522985). Eval-only takes no optimizer step, so the class values win.
+    if "--override-opt_param-scheduler" not in a:
+        a.append("--override-opt_param-scheduler")
     data = (o.smoke_data if smoke else o.data) if (o is not None and o.data) else (SMOKE_DATA if smoke else DATA)[game]
     a = setf(a, "--eval-prompt-data", f"fo_{game}", data)
     a = setf(a, "--n-samples-per-eval-prompt", str(n))
