@@ -13,6 +13,10 @@ Logs before 2026-10-11 (2e75d3b) do not print the job's MA_/FCS_ env: give it wi
 submit_fcs_oracle.sh version that submitted the source run (its fo=(...) array); the source's extra_env still applies.
 
   python3 tools/make_evalonly.py SRC_RUN GAME N TAG OUT_DIR [--rounds R] [--env K=V ...]
+      [--fresh] [--module M] [--data PATH --smoke-data PATH] [--set K=V ...] [--smoke-set K=V ...]
+  --fresh: the untrained initialization (--load/--critic-load point at the new, empty run dir); --module M: the game
+  module's generate/log_eval/log_rollout (e.g. fcs_agent); --data/--smoke-data: the eval sets; --set/--smoke-set: env
+  added after the source's (both copies / the smoke only).
   e.g. python3 tools/make_evalonly.py fcs_oracle_team_bonus_q9b-fcs-sft_s42 team 4 ev4 /scratch/.../evalonly/bonus
 """
 import argparse
@@ -72,7 +76,7 @@ def setf(args, flag, *vals):
     return out + [flag, *vals]
 
 
-def emit(src, game, n, name, out, rounds, smoke, given):
+def emit(src, game, n, name, out, rounds, smoke, given, o=None):
     args, env, miles, log = source_config(src)
     assert not (env and given), "the log prints the env: do not give it"
     env = env or given
@@ -85,15 +89,23 @@ def emit(src, game, n, name, out, rounds, smoke, given):
             if line and not line.startswith("#"):
                 extra += shlex.split(line)
     a = args + extra
+    rdir = f"{B}/runs/{name}"
     for f in ("--load", "--critic-load"):
         assert f in a and a[a.index(f) + 1].startswith(sdir), (f, "must load the source run")
-    rdir = f"{B}/runs/{name}"
+    if o is not None and o.fresh:
+        a = setf(a, "--load", f"{rdir}/ckpt")
+        a = setf(a, "--critic-load", f"{rdir}/ckpt_critic")
+    if o is not None and o.module:
+        for f, fn in (("--custom-generate-function-path", "generate"), ("--custom-eval-rollout-log-function-path", "log_eval"),
+                      ("--custom-rollout-log-function-path", "log_rollout")):
+            a = setf(a, f, f"miles_team.{o.module}.{fn}")
     for f, nv in (("--replay-rollout-data", 1), ("--replay-rollout-until", 1), ("--skip-eval-before-train", 0)):
         a = drop(a, f, nv)
     a = setf(a, "--save", f"{rdir}/ckpt")
     a = setf(a, "--critic-save", f"{rdir}/ckpt_critic")
     a = setf(a, "--num-rollout", "0")
-    a = setf(a, "--eval-prompt-data", f"fo_{game}", (SMOKE_DATA if smoke else DATA)[game])
+    data = (o.smoke_data if smoke else o.data) if (o is not None and o.data) else (SMOKE_DATA if smoke else DATA)[game]
+    a = setf(a, "--eval-prompt-data", f"fo_{game}", data)
     a = setf(a, "--n-samples-per-eval-prompt", str(n))
     a = setf(a, "--wandb-dir", rdir)
     a = setf(a, "--wandb-group", name)
@@ -104,6 +116,10 @@ def emit(src, game, n, name, out, rounds, smoke, given):
         e["MA_FO_ROUNDS"] = str(rounds)
     if smoke:
         e.update(SMOKE_ENV)
+    if o is not None:
+        e.update(dict(kv.split("=", 1) for kv in o.set))
+        if smoke:
+            e.update(dict(kv.split("=", 1) for kv in o.smoke_set))
     base = {"MILES_SRC": miles, "RUN_NAME": name, "GPUS": "8", "MILES_MODEL_TYPE": "qwen3.5-9B"}
     os.makedirs(out, exist_ok=True); os.makedirs(rdir, exist_ok=True)
     if os.path.exists(f"{sdir}/extra_env"):
@@ -119,14 +135,18 @@ def emit(src, game, n, name, out, rounds, smoke, given):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("src"); p.add_argument("game", choices=("team", "seq", "par")); p.add_argument("n", type=int)
+    p.add_argument("src"); p.add_argument("game", choices=("team", "seq", "par", "agent")); p.add_argument("n", type=int)
     p.add_argument("tag"); p.add_argument("out"); p.add_argument("--rounds", type=int)
     p.add_argument("--env", nargs="*", default=[])
+    p.add_argument("--fresh", action="store_true"); p.add_argument("--module")
+    p.add_argument("--data"); p.add_argument("--smoke-data")
+    p.add_argument("--set", nargs="*", default=[]); p.add_argument("--smoke-set", nargs="*", default=[])
     o = p.parse_args()
     given = dict(kv.split("=", 1) for kv in o.env)
-    stem = o.src.replace("fcs_oracle_", "")
-    emit(o.src, o.game, o.n, f"fcs_evalonly_{o.tag}_{stem}", f"{o.out}/main", o.rounds, False, given)
-    emit(o.src, o.game, 1, f"fcs_evalonly_smoke_{o.tag}_{stem}", f"{o.out}/smoke", o.rounds, True, given)
+    assert not o.data or o.smoke_data, "--data needs --smoke-data"
+    stem = o.src.replace("fcs_oracle_", "") if not o.fresh else "sft"
+    emit(o.src, o.game, o.n, f"fcs_evalonly_{o.tag}_{stem}", f"{o.out}/main", o.rounds, False, given, o)
+    emit(o.src, o.game, 1, f"fcs_evalonly_smoke_{o.tag}_{stem}", f"{o.out}/smoke", o.rounds, True, given, o)
 
 
 if __name__ == "__main__":
