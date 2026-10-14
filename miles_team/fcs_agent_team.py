@@ -9,8 +9,9 @@ git name, so git blame of the final program says who wrote each line. An agent's
 (steps, tokens, context, three format errors in a row), the hidden tests judge the repo's solution.cpp once, if at
 least one agent submitted (otherwise the team scores 0, as a lone mini-swe-agent without a submission does).
 
-Rewards (MA_AG_REWARD, training): shared (every agent's steps get the team score S) or blame (agent j's steps get
-S x its share of the final program's lines). Env: MA_AG_N (4) and fcs_agent's MA_AG_* limits, per agent.
+Rewards (MA_AG_REWARD, training): shared (every agent's steps get the team reward R = S - MA_AG_MU x c, where c is the
+minutes all commands ran; owner 2026-10-13) or blame (agent j gets R x its share of the final program's lines; the owner
+withdrew blame credit as a design on 2026-10-13, so it stays off). Env: MA_AG_N (4) and fcs_agent's MA_AG_* limits, per agent.
 --custom-generate-function-path miles_team.fcs_agent_team.generate
 """
 from __future__ import annotations
@@ -161,7 +162,7 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
     os.makedirs(work)
     loop = asyncio.get_running_loop()
     rng = random.Random(f"{label}:{input.sample.index}:{getattr(input.sample, 'group_index', 0)}")
-    rounds, order_log = 0, []
+    rounds, order_log, run_s = 0, [], 0.0
     try:
         await loop.run_in_executor(A._POOL, repo_init, work)
         while any(not a.done for a in agents):
@@ -173,6 +174,7 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
             order_log.append([a.name for a, _ in todo])
             for k, (a, cmd) in enumerate(todo):
                 out = await loop.run_in_executor(A._POOL, A.run_command, cmd, work)
+                run_s += out["seconds"]
                 await loop.run_in_executor(A._POOL, commit_as, work, a.name, a.steps)
                 a.observe(cmd, out, rounds, k)
         final = None
@@ -185,9 +187,10 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
         shutil.rmtree(work, ignore_errors=True)
     res = await judge_code(label, final) if final and final.strip() else None
     S = res["score"] if res else 0.0
+    R = S - A.MU * run_s / 60   # the team reward: the score minus the cost of every agent's command run time
     gens = [a.gen() for a in agents]
     top = max(shares.values()) if shares else 0.0
-    info = {"fo_S": S, "fo_ag_n": N, "fo_ag_rounds": rounds,
+    info = {"fo_S": S, "fo_R": R, "fo_ag_run_min": run_s / 60, "fo_ag_n": N, "fo_ag_rounds": rounds,
             "fo_ag_submitted": sum(a.exit == "Submitted" for a in agents) / N,
             "fo_ag_steps": sum(a.steps for a in agents) / N, "fo_ag_format_errors": sum(a.fmt_total for a in agents) / N,
             "fo_ag_cut": sum(a.cut_n for a in agents) / N, "fo_ag_timeouts": sum(a.timeouts for a in agents) / N,
@@ -195,11 +198,11 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
             "fo_ag_no_code": float(res is None), "fo_ag_top_author": top, "fo_ag_authors": len(shares),
             "fo_tokens": sum(gens), "fo_latency": max(gens),
             "fo_judge_infra_error": float(bool(res and res["infra_error"]))}
-    A._trace({"time": round(time.time(), 1), "eval": input.evaluation, "game": "agent_team", "label": label, "S": S,
+    A._trace({"time": round(time.time(), 1), "eval": input.evaluation, "game": "agent_team", "label": label, "S": S, "R": R, "run_min": run_s / 60,
               "status": res["status"] if res else "no submission", "rounds": rounds, "order": order_log,
               "blame": shares, "git_log": log, "final": final,
               "agents": [{"name": a.name, "exit": a.exit, "steps": a.steps, "turns": a.turns} for a in agents]})
-    return agents, S, shares, info
+    return agents, R, shares, info
 
 
 def _reward(S: float, shares: dict, name: str) -> float:

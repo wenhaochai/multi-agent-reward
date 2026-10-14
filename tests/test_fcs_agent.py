@@ -17,6 +17,7 @@ check(not pt.startswith("You are a competitive programmer") and not pt.endswith(
 hidden = os.path.join(row["label"], "testdata")
 with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as w:
     r = A.run_command("echo hello && pwd", w); check(r["returncode"] == 0 and "hello" in r["output"], "echo")
+    r = A.run_command("sleep 1.2", w); check(1.1 < r["seconds"] < 3, f"run time measured: {r['seconds']:.2f} s")
     r = A.run_command("cat > a.cpp <<'EOF'\n#include <cstdio>\nint main(){int a,b;scanf(\"%d %d\",&a,&b);printf(\"%d\\n\",a+b);}\nEOF\ng++ -O2 -std=gnu++17 -o a a.cpp && echo '2 3' | ./a", w)
     check(r["returncode"] == 0 and r["output"].strip().endswith("5"), "compile and run: " + r["output"][-80:])
     r = A.run_command(f"ls {hidden} | head -2; cat {hidden}/* 2>&1 | head -2", w)

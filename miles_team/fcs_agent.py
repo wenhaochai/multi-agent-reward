@@ -47,6 +47,7 @@ MAX_LEN = int(os.environ.get("MA_AG_MAX_LEN", "65536"))
 TIMEOUT = int(os.environ.get("MA_AG_TIMEOUT", "60"))
 TRACE_DIR = os.environ.get("MA_AG_TRACE_DIR", "")
 THINK = os.environ.get("MA_AG_THINK", "1") == "1"
+MU = float(os.environ.get("MA_AG_MU", "0"))   # reward cost per minute of command run time (owner 2026-10-13: R = S - mu c)
 MAX_FORMAT_ERRORS = 3
 CMD_MEM = 4 << 30            # address space of a command and its children (g++ -O2 of a large file fits)
 OUT_CHARS = 10000            # mini-swe-agent's elision threshold
@@ -268,7 +269,15 @@ def _preexec(work: str, nproc: int):
 
 
 def run_command(command: str, work: str) -> dict:
-    """One action in the episode's work dir (blocking; run in _POOL). mini-swe-agent's output dict."""
+    """One action in the episode's work dir (blocking; run in _POOL). mini-swe-agent's output dict, plus "seconds",
+    the command's wall time (the run time that the reward charges)."""
+    t0 = time.monotonic()
+    out = _run_command(command, work)
+    out["seconds"] = time.monotonic() - t0
+    return out
+
+
+def _run_command(command: str, work: str) -> dict:
     env = {"PATH": "/usr/bin:/bin", "LANG": "C", "HOME": work, "TMPDIR": work, "PAGER": "cat", "MANPAGER": "cat",
            "LESS": "-R", "PIP_PROGRESS_BAR": "off", "TQDM_DISABLE": "1"}
     try:
@@ -319,7 +328,7 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
     work = os.path.join(base, "agent", uuid.uuid4().hex)
     os.makedirs(work)
     loop = asyncio.get_running_loop()
-    steps, fmt_run, fmt_total, timeouts, gpp, cut_n = 0, 0, 0, 0, 0, 0
+    steps, fmt_run, fmt_total, timeouts, gpp, cut_n, run_s = 0, 0, 0, 0, 0, 0, 0.0
     exit_status, submission, turns, segs = "", None, [], []
     try:
         while True:
@@ -356,6 +365,7 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
             gpp += bool(re.search(r"\bg\+\+\b", cmd))
             out = await loop.run_in_executor(_POOL, run_command, cmd, work)
             timeouts += "timed out" in out["exception_info"]
+            run_s += out["seconds"]
             lines = out["output"].lstrip().splitlines(keepends=True)
             turns.append({**rec, "command": cmd, "returncode": out["returncode"], "output": out["output"][:20000],
                           "exception": out["exception_info"]})
@@ -366,9 +376,10 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
     finally:
         shutil.rmtree(work, ignore_errors=True)
     res = await judge_code(label, submission) if submission and submission.strip() else None
-    score = res["score"] if res else 0.0
+    S = res["score"] if res else 0.0
+    score = S - MU * run_s / 60
     gen = _gen(sess)
-    info = {"fo_S": score, "fo_ag_submitted": float(exit_status == "Submitted"), "fo_ag_steps": steps,
+    info = {"fo_S": S, "fo_R": score, "fo_ag_run_min": run_s / 60, "fo_ag_submitted": float(exit_status == "Submitted"), "fo_ag_steps": steps,
             "fo_ag_format_errors": fmt_total, "fo_ag_cut": cut_n, "fo_ag_timeouts": timeouts, "fo_ag_gpp": gpp,
             "fo_ag_compile_fail": float(res is not None and res["status"] == "compile error"),
             "fo_ag_no_code": float(res is None), "fo_tokens": gen, "fo_latency": gen,
@@ -376,7 +387,7 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
             **{f"fo_ag_exit_{e}": float(exit_status == e) for e in
                ("Submitted", "LimitsExceeded", "TokensExceeded", "ContextExceeded", "RepeatedFormatError")},
             "fo_judge_infra_error": float(bool(res and res["infra_error"]))}
-    _trace({"time": round(time.time(), 1), "eval": input.evaluation, "game": "agent", "label": label, "S": score,
+    _trace({"time": round(time.time(), 1), "eval": input.evaluation, "game": "agent", "label": label, "S": S, "R": score, "run_min": run_s / 60,
             "status": res["status"] if res else "no submission", "exit": exit_status, "steps": steps,
             "submission": submission, "turns": turns})
     return sess, segs, score, info
