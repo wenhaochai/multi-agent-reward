@@ -49,6 +49,7 @@ import signal
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -295,21 +296,28 @@ def _compile_sandbox(work: Path):
 _CLEAN_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C"}
 NPROC_MARGIN = 128  # the official engine's procLimit
 _ucount = [0.0, 0]
+_ulock = threading.Lock()
 
 
 def _nproc_limit() -> int:
-    """The user's current task count (threads included, as RLIMIT_NPROC counts them) + NPROC_MARGIN; 5 s cache."""
-    now = time.monotonic()
-    if now - _ucount[0] > 5:
-        uid, n = os.getuid(), 0
-        for p in os.listdir("/proc"):
-            if p.isdigit():
-                try:
-                    if os.stat(f"/proc/{p}").st_uid == uid:
-                        n += len(os.listdir(f"/proc/{p}/task"))
-                except OSError:
-                    pass
-        _ucount[0], _ucount[1] = now, n
+    """The user's current task count (threads included, as RLIMIT_NPROC counts them) + NPROC_MARGIN; 5 s cache.
+    One thread refreshes it while the others keep the cached count: when every case thread rescanned /proc at each
+    expiry (1454 stats each, the GIL handed back after every one), 40-60 of the 88 judge slots sat in this scan and the
+    eval's GPUs idled (15523396). Only the first call waits, since a count of 0 would leave a limit of 128 tasks."""
+    if time.monotonic() - _ucount[0] > 5 and _ulock.acquire(blocking=_ucount[0] == 0.0):
+        try:
+            if time.monotonic() - _ucount[0] > 5:
+                uid, n = os.getuid(), 0
+                for p in os.listdir("/proc"):
+                    if p.isdigit():
+                        try:
+                            if os.stat(f"/proc/{p}").st_uid == uid:
+                                n += len(os.listdir(f"/proc/{p}/task"))
+                        except OSError:
+                            pass
+                _ucount[1], _ucount[0] = n, time.monotonic()
+        finally:
+            _ulock.release()
     return _ucount[1] + NPROC_MARGIN
 
 
