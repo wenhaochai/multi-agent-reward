@@ -38,6 +38,19 @@ from miles.utils.types import Sample
 from . import team_core as C
 
 MAX_LEN = int(os.environ.get("MA_TM_MAX_LEN", "32768"))  # molt --data.max_len: a session's context cap
+
+# Cap on this process's in-flight /generate calls (0 = no cap). httpx queues calls beyond its pool limit, and httpcore
+# rescans that whole queue on every request, so 8160 concurrent calls (par eval, 680 episodes x 12 tries) spun the
+# event loop for 40 min with the GPUs at 0% (15523393). Keep it below the pool limit, sglang_server_concurrency x engines.
+INFLIGHT = int(os.environ.get("MA_HTTP_INFLIGHT", "0"))
+_SEMS: dict = {}
+
+
+def _inflight() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    if loop not in _SEMS:
+        _SEMS[loop] = asyncio.Semaphore(INFLIGHT)
+    return _SEMS[loop]
 PAD_EVEN = os.environ.get("MA_TM_PAD_EVEN", "1") == "1"
 
 
@@ -95,7 +108,11 @@ class Session:
         if payload is None:
             self.last_messages = messages
             return "", True
-        output = await post(self.url, payload)
+        if INFLIGHT:
+            async with _inflight():
+                output = await post(self.url, payload)
+        else:
+            output = await post(self.url, payload)
         finish = output["meta_info"]["finish_reason"]["type"]
         if finish == "abort":
             raise Aborted(self.name)
