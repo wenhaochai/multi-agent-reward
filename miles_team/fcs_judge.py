@@ -42,12 +42,15 @@ import fcntl
 import hashlib
 import math
 import os
+import pickle
+import queue
 import re
 import resource
 import shutil
 import signal
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -450,6 +453,122 @@ def _case_pool() -> ThreadPoolExecutor:
     return _POOL
 
 
+# FCS_CASE_PROC=1 (the default): every compile and test case runs in a small worker process, not in the caller. A Popen
+# with a preexec_fn forks its caller, and fork copies the caller's page tables while it holds the caller's mmap lock. In
+# the rollout process (13.5 GB resident, 319 threads) 40-88 of the 88 case threads sat in lock_mm_and_find_vma, page
+# faults waiting for that lock, so interactors waited seconds for their program and the team_bonus eval 15523392 judged
+# 98 of 680 episodes in 13 h with one request per engine. The thread slots above still decide what runs and in what
+# order; a worker only runs one call at a time. Workers are plain `python3 -c` children (started with vfork, as they need
+# no preexec_fn) that read pickled calls on stdin: multiprocessing would import the caller's __main__ (Ray's worker
+# script) in each of them. At most FCS_CASE_PROCS workers (default: the job's cores); a worker that dies is replaced
+# and its call retried once.
+CASE_PROC = os.environ.get("FCS_CASE_PROC", "1") == "1"
+_idle: "queue.LifoQueue" = queue.LifoQueue()
+_wlock = threading.Lock()
+_made = [0]
+
+
+class _WorkerDied(Exception):
+    pass
+
+
+class _Worker:
+    def __init__(self):
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in sys.path if p)}
+        self.p = subprocess.Popen([sys.executable, "-c", f"from {__name__} import _serve; _serve()"],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
+
+    def call(self, fn, a):
+        data = pickle.dumps((fn, a))
+        try:
+            self.p.stdin.write(struct.pack("<Q", len(data)) + data)
+            self.p.stdin.flush()
+            hdr = self.p.stdout.read(8)
+            if len(hdr) < 8:
+                raise _WorkerDied(f"case worker exited ({self.p.poll()})")
+            ok, v = pickle.loads(self.p.stdout.read(struct.unpack("<Q", hdr)[0]))
+        except (OSError, EOFError, pickle.UnpicklingError) as e:
+            raise _WorkerDied(f"case worker lost: {e}") from e
+        if not ok:
+            raise v
+        return v
+
+    def close(self):
+        try:
+            self.p.kill()
+            self.p.wait()
+        except OSError:
+            pass
+
+
+def _serve():
+    """A case worker's loop: a call is an 8-byte length and a pickled (fn, args); the reply is (True, value) or
+    (False, exception), framed the same way. Its stdout becomes its stderr, so a stray print cannot break the framing."""
+    rd, wr = os.fdopen(os.dup(0), "rb"), os.fdopen(os.dup(1), "wb")
+    os.dup2(2, 1)
+    os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
+    while True:
+        hdr = rd.read(8)
+        if len(hdr) < 8:
+            return
+        fn, a = pickle.loads(rd.read(struct.unpack("<Q", hdr)[0]))
+        try:
+            out = pickle.dumps((True, fn(*a)))
+        except BaseException as e:
+            try:
+                out = pickle.dumps((False, e))
+            except Exception:
+                out = pickle.dumps((False, RuntimeError(repr(e)[:2000])))
+        wr.write(struct.pack("<Q", len(out)) + out)
+        wr.flush()
+
+
+def _take() -> _Worker:
+    try:
+        return _idle.get_nowait()
+    except queue.Empty:
+        pass
+    with _wlock:
+        if _made[0] < (int(os.environ.get("FCS_CASE_PROCS", "0")) or job_cpus()):
+            _made[0] += 1
+            try:
+                return _Worker()
+            except BaseException:
+                _made[0] -= 1
+                raise
+    return _idle.get()
+
+
+def _in_proc(fn, *a):
+    """fn(*a) in a case worker (FCS_CASE_PROC=0: in this thread). fn must be a module-level function, and fn, its
+    arguments and its result must pickle."""
+    if not CASE_PROC:
+        return fn(*a)
+    for attempt in (0, 1):
+        w = _take()
+        try:
+            v = w.call(fn, a)
+        except _WorkerDied:
+            w.close()
+            with _wlock:
+                _made[0] -= 1
+            if attempt:
+                raise
+            continue
+        except BaseException:
+            _idle.put(w)   # fn's own exception: the worker is fine
+            raise
+        _idle.put(w)
+        return v
+
+
+def _compile(work: Path, sol: Path):
+    return subprocess.run(COMPILE + ["-o", str(sol), str(work / "sol.cpp")], capture_output=True, text=True,
+                          errors="replace", timeout=120, env={**_CLEAN_ENV, "TMPDIR": str(work)},
+                          preexec_fn=_limits(600, 2 << 30, stack_b=1 << 30, sandbox=_compile_sandbox(work),
+                                             nproc=_nproc_limit()))
+
+
 def judge(problem_dir, source: str, case_workers: int = CASE_WORKERS, pool: ThreadPoolExecutor | None = None) -> dict:
     """pool: run the compile and every case in this executor instead (fcs_rm's background eval keeps its own slots,
     so its cases never queue ahead of training's in the shared pool)."""
@@ -460,13 +579,8 @@ def judge(problem_dir, source: str, case_workers: int = CASE_WORKERS, pool: Thre
     try:
         (work / "sol.cpp").write_text(source)
         sol = work / "sol"
-        def compile_():
-            return subprocess.run(COMPILE + ["-o", str(sol), str(work / "sol.cpp")], capture_output=True, text=True,
-                                  errors="replace", timeout=120, env={**_CLEAN_ENV, "TMPDIR": str(work)},
-                                  preexec_fn=_limits(600, 2 << 30, stack_b=1 << 30, sandbox=_compile_sandbox(work),
-                                                     nproc=_nproc_limit()))
         slots = pool or (_case_pool() if CASE_POOL else None)
-        r = slots.submit(compile_).result() if slots else compile_()
+        r = slots.submit(_in_proc, _compile, work, sol).result() if slots else _in_proc(_compile, work, sol)
         if r.returncode != 0:
             infra = r.returncode < 0 or any(m in r.stderr for m in _INFRA_MARKERS)
             return {"score": 0.0, "status": "infra error" if infra else "compile error", "cases": [],
@@ -474,11 +588,11 @@ def judge(problem_dir, source: str, case_workers: int = CASE_WORKERS, pool: Thre
         helper = _compile_helper(prob["dir"], prob["interactor"] if prob["interactive"] else prob["checker"])
         fn = _case_interactive if prob["interactive"] else _case_classic
         if slots:   # leaf tasks only (no slot waits on another), so the pool cannot deadlock
-            futs = [slots.submit(_safe, fn, prob, sol, helper, c, work) for c in prob["cases"]]
+            futs = [slots.submit(_case, fn, prob, sol, helper, c, work) for c in prob["cases"]]
             res = [f.result() for f in futs]
         else:
             with ThreadPoolExecutor(max_workers=max(1, case_workers)) as ex:
-                res = list(ex.map(lambda c: _safe(fn, prob, sol, helper, c, work), prob["cases"]))
+                res = list(ex.map(lambda c: _case(fn, prob, sol, helper, c, work), prob["cases"]))
         ratios = [r for r, _ in res]
         infos = [i for _, i in res]
         return {"score": 100.0 * sum(ratios) / len(ratios), "status": "done", "cases": ratios, "case_info": infos,
@@ -491,4 +605,12 @@ def _safe(fn, *a):
     try:
         return fn(*a)
     except Exception as e:  # the case could not run (fork / pipe / disk / sandbox): an infrastructure failure
+        return 0.0, f"INFRA exception: {e}"[:200]
+
+
+def _case(fn, *a):
+    """One case in a worker process; a pool that failed twice is an infrastructure failure too."""
+    try:
+        return _in_proc(_safe, fn, *a)
+    except Exception as e:
         return 0.0, f"INFRA exception: {e}"[:200]
