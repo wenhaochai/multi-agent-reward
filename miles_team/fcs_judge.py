@@ -372,6 +372,15 @@ def _case_classic_run(prob, sol: Path, chk: Path, case, work: Path) -> float:
     return ratio, f"chk={r.returncode} cpu={cpu:.2f}/{tl} {msg.strip()[:120]}"
 
 
+def _own_hwm() -> int:
+    """This process's peak resident set in bytes (VmHWM)."""
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("VmHWM:"):
+                return int(line.split()[1]) << 10
+    return 0
+
+
 def _case_interactive_run(prob, sol: Path, inter: Path, case, work: Path) -> float:
     inp, outp, t, mem = case
     td = prob["dir"] / "testdata"
@@ -408,6 +417,11 @@ def _case_interactive_run(prob, sol: Path, inter: Path, case, work: Path) -> flo
     imsg = err.read().decode(errors="replace")
     err.close()
     mle = bool(peak) and peak[0] > ml
+    if mle and _own_hwm() > ml:
+        # ru_maxrss includes what the program's process held before exec, a copy of this one: from the rollout process
+        # (13.5 GB) every interactive case read as an MLE and scored 0, in every job since 78994b9 (2026-10-03). A case
+        # worker holds about 20 MiB; a caller this large cannot measure the program, so the case is an infra failure
+        raise RuntimeError(f"peak RSS unmeasurable: the judge holds {_own_hwm() >> 20} MiB, over the {ml >> 20} MiB limit")
     sub_ok = not skilled and scode == 0 and scpu <= tl and not mle
     inter_scoring = not ikilled and icode in (OK_EXIT, POINTS_EXIT)
     info = (f"sol code={scode} cpu={scpu:.2f}/{tl} rss={peak[0] >> 20 if peak else -1}MiB/{ml >> 20} killed={skilled}; "
