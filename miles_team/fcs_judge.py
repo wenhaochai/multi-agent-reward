@@ -326,13 +326,18 @@ def _wait(p: subprocess.Popen, wall_s: float, rss: list | None = None):
     rss, if given, receives the peak resident set in bytes."""
     deadline = time.monotonic() + wall_s
     while True:
+        # the clock is read before wait4, so a kill means the program still ran after its deadline. Read after wait4,
+        # a thread that stalled between the two (seconds, when the rollout process forked under contention) killed a
+        # program that had ended in 20 ms and scored the case 0 (ev4 2026-10-14: programs at 0 in the job score 6.9 to
+        # 33 offline)
+        late = time.monotonic() > deadline
         pid, status, ru = os.wait4(p.pid, os.WNOHANG)
         if pid:
             p.returncode = os.waitstatus_to_exitcode(status)
             if rss is not None:
                 rss.append(ru.ru_maxrss * 1024)
             return p.returncode, ru.ru_utime + ru.ru_stime, False
-        if time.monotonic() > deadline:
+        if late:
             try:
                 os.killpg(p.pid, signal.SIGKILL)
             except ProcessLookupError:
