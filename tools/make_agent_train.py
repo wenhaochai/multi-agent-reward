@@ -1,0 +1,86 @@
+"""EMIT dirs (run, env, args) for RL training of one agent in mini-swe-agent (owner step 2, 2026-10-16: the agentic
+single-agent baseline; reward R = S, MA_AG_MU=0 by popup). The base is the agentic probe's config
+(tmp/agentic/probe_sft, itself the par_indiv run's: same model, parallelism, context and the paper's Frontier-CS EasyPPO
+values), which loads the SFT weights from an empty --load dir. Changed for training:
+  main   --num-rollout 60 (the first 10 train only the critic, as every oracle arm), --prompt-data fcs_train190_team.jsonl
+         (owner 2026-10-13: the 10 weak problems dropped; none is interactive), 16 problems x 6 episodes per rollout (the
+         probe's), validation every 20 rollouts on the 98 classic val problems x 2 episodes, --save-interval 5 (the
+         post-save hook keeps the latest), own run dir, W&B ids and trace dirs, every episode traced.
+  smoke  the same code path at toy size: 3 rollouts (1 critic-only), 2 problems x 2 episodes, 8 steps of 4096 tokens,
+         eval on 8 classic problems x 1 after rollout 1 and at the end, save every rollout (a resume is exercised by
+         the main task's first segment only when it loads the smoke's dirs, which it does not: the smoke has its own).
+  python3 tools/make_agent_train.py NAME OUT_DIR    e.g. fcs_agent_solo_q9b-fcs-sft_s42 /scratch/.../tmp/agentic/solo_s42"""
+import os
+import shutil
+import sys
+
+B = "/scratch/gpfs/GROUP/USER/project/miles-q38-build"
+D = f"{B}/data"
+PROBE = "/scratch/gpfs/GROUP/USER/tmp/agentic/probe_sft"
+
+
+def setv(a, flag, *vals):
+    """Set every occurrence of flag to vals (the launcher reads the last one; keep them equal)."""
+    idx = [i for i, x in enumerate(a) if x == flag]
+    if not idx:
+        return a + [flag, *vals]
+    for i in idx:
+        a[i + 1:i + 1 + len(vals)] = list(vals)
+    return a
+
+
+def drop(a, flag, n=0):
+    while flag in a:
+        i = a.index(flag)
+        del a[i:i + 1 + n]
+    return a
+
+
+def emit(part, name, out):
+    src = f"{PROBE}/{'smoke' if part == 'smoke' else 'main'}"
+    a = [x for x in open(f"{src}/args").read().split("\n") if x != ""]
+    env = [x for x in open(f"{src}/env").read().split("\n") if x != ""]
+    old = open(f"{src}/run").read().strip()
+    rdir = f"{B}/runs/{name}"
+    a = [x.replace(f"{B}/runs/{old}", rdir) for x in a]
+    env = [x.replace(f"{B}/runs/{old}", rdir) for x in env]
+    a = drop(a, "--override-opt_param-scheduler")   # eval-only fix: a training run's scheduler must match its ckpt
+    a = setv(a, "--wandb-group", name)
+    a = setv(a, "--wandb-run-id", name)
+    a = setv(a, "--prompt-data", f"{D}/fcs_train190_team.jsonl")
+    if part == "smoke":
+        a = setv(a, "--num-rollout", "3")
+        a = setv(a, "--num-critic-only-steps", "1")
+        a = setv(a, "--rollout-batch-size", "2")
+        a = setv(a, "--n-samples-per-prompt", "2")
+        a = setv(a, "--eval-interval", "1")
+        a = setv(a, "--save-interval", "1")
+        a = setv(a, "--eval-prompt-data", "fo_agent", f"{D}/fcs_val_classic_agent_smoke8.jsonl")
+        a = setv(a, "--n-samples-per-eval-prompt", "1")
+    else:
+        a = setv(a, "--num-rollout", "60")
+        a = setv(a, "--num-critic-only-steps", "10")
+        a = setv(a, "--rollout-batch-size", "16")
+        a = setv(a, "--n-samples-per-prompt", "6")
+        a = setv(a, "--eval-interval", "20")
+        a = setv(a, "--save-interval", "5")
+        a = setv(a, "--eval-prompt-data", "fo_agent", f"{D}/fcs_val_classic_agent.jsonl")
+        a = setv(a, "--n-samples-per-eval-prompt", "2")
+    keep = [e for e in env if not e.startswith(("RUN_NAME=", "MA_AG_MU=", "MA_FO_TRACE_EVERY="))]
+    env = [f"RUN_NAME={name}"] + keep + ["MA_AG_MU=0", "MA_FO_TRACE_EVERY=1"]
+    os.makedirs(out, exist_ok=False)
+    open(f"{out}/args", "w").write("\n".join(a) + "\n")
+    open(f"{out}/env", "w").write("\n".join(env) + "\n")
+    open(f"{out}/run", "w").write(name + "\n")
+    assert not any(old in x for x in a + env), "a probe path is left"
+    print(part, name, len(a), "args ->", out)
+
+
+if __name__ == "__main__":
+    name, out = sys.argv[1], sys.argv[2]
+    if os.path.exists(out):
+        sys.exit(f"{out} exists: remove it by hand first")
+    smoke = name.replace("fcs_agent_", "fcs_agent_smoke_", 1)
+    assert smoke != name
+    emit("smoke", smoke, f"{out}/smoke")
+    emit("main", name, f"{out}/main")
