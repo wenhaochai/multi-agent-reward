@@ -30,4 +30,4 @@ task smoke - other 100m "$SMOKE_DIR" || { echo "[packed] smoke failed: no traini
 task train "$(cat "$MAIN_DIR/run")" main "$(( ${JOB_WALL_S:-86400} - ($(date +%s) - T0) - 900 ))s" "$MAIN_DIR"
 # only the host fetches: a fetched copy that fetched again ran guests under its own --time and killed one (15686944
 # inside 15625117 fetched 15696862, exit 143 at the guest's wall, 2026-10-16); the host's loop continues after it
-[[ -z ${FETCHED_JOB_ID:-} ]] && bash /scratch/gpfs/GROUP/USER/tools/fetch_pending.sh
+if [[ -z ${FETCHED_JOB_ID:-} ]]; then bash /scratch/gpfs/GROUP/USER/tools/fetch_pending.sh; fi   # not a && list: its 1 would be the exit status
