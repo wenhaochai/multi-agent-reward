@@ -5,6 +5,8 @@
 #   submit_packed_oracle.sh NAME SMOKE_DIR MAIN_DIR [TIME [JOB_WALL_S [sbatch args...]]]
 #   TIME defaults to 24:00:00 and JOB_WALL_S to 86400; a JOB_WALL_S below TIME caps the main task and leaves the rest
 #   of the 24 h to fetched jobs. Prints the job id.
+#   A short job a host may fetch: pass --comment=fetchable among the sbatch args; the copy then also gets the
+#   #FETCHABLE line that fetch_pending.sh requires (rule 2026-10-15 22:50).
 set -euo pipefail
 name=$1 smoke=$2 main=$3 time=${4:-24:00:00} wall=${5:-86400}; shift $(( $# < 5 ? $# : 5 ))
 code=$(cd "$(dirname "$0")/.." && pwd)
@@ -14,5 +16,8 @@ out=$dir/$name.$(date +%Y%m%d-%H%M%S).sbatch
 awk -v e="PACKED_BAKED=1 SMOKE_DIR=$smoke MAIN_DIR=$main MQB_CODE=$code JOB_WALL_S=$wall" \
   '{print} /^set -euo pipefail$/ && !done {print e; done=1}' "$code/tools/packed_oracle.sbatch" > "$out"
 grep -q '^PACKED_BAKED=1 ' "$out"
+if [[ " $* " == *" --comment=fetchable "* ]]; then
+  sed -i '1a #FETCHABLE: settings baked in by submit_packed_oracle.sh, no --export' "$out"
+fi
 sbatch --parsable --partition=pli-c --account=group --qos=pli-short --time="$time" --gres=gpu:8 --cpus-per-task=96 \
   --mem=900G --job-name="miles-$name" "$@" "$out"
