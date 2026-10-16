@@ -31,7 +31,10 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
+from copy import deepcopy
+
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
+from miles.utils.types import Sample
 
 from .fcs_cmd import CMD_MEM, TIMEOUT, run_command  # noqa: F401 (tests use A.run_command)
 from .fcs_rm import answer, judge_code
@@ -276,7 +279,7 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
                 continue
             fmt_run = 0
             cmd = actions[0]
-            gpp += bool(re.search(r"\bg\+\+\b", cmd))
+            gpp += bool(re.search(r"\bg\+\+(?=\s|$)", cmd))   # \b after "++" needs a word character: always 0 before
             out = await loop.run_in_executor(_POOL, run_command, cmd, work)
             timeouts += "timed out" in out["exception_info"]
             run_s += out["seconds"]
@@ -308,12 +311,26 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
 
 
 async def generate(input: GenerateFnInput) -> GenerateFnOutput:
+    """An engine abort, an empty episode or (in training) a judge infrastructure error returns an ABORTED sample, as
+    fcs_oracle.generate does: miles drops it and resubmits the group instead of ending the run."""
+    try:
+        return await _generate(input)
+    except Aborted:
+        s = deepcopy(input.sample)
+        s.status = Sample.Status.ABORTED
+        return GenerateFnOutput(samples=s)
+
+
+async def _generate(input: GenerateFnInput) -> GenerateFnOutput:
     meta = input.sample.metadata or {}
     messages = meta.get("messages")
     assert messages, "fcs_agent needs the raw chat in sample.metadata['messages']"
     sess, segs, score, info = await episode(input, messages, input.sample.label)
     if not segs:
         raise Aborted("empty episode")
+    if info.get("fo_judge_infra_error") and not input.evaluation:
+        # the submission could not be judged (fork / disk / sandbox): its 0 is not the policy's (fcs_oracle does the same)
+        raise Aborted("judge infrastructure error")
     if input.evaluation:  # the last step stands for the episode, scored by the submission
         out = sess.segments[segs[-1]]
         out.reward = float(score)

@@ -4,9 +4,10 @@ single-agent baseline; reward R = S, MA_AG_MU=0 by popup). The base is the agent
 values), which loads the SFT weights from an empty --load dir. Changed for training:
   main   --num-rollout 60 (the first 10 train only the critic, as every oracle arm), --prompt-data fcs_train190_team.jsonl
          (owner 2026-10-13: the 10 weak problems dropped; none is interactive), 16 problems x 6 episodes per rollout (the
-         probe's), validation every 20 rollouts on the 98 classic val problems x 2 episodes, --save-interval 5 (the
-         post-save hook keeps the latest), own run dir, W&B ids and trace dirs, every episode traced.
-  smoke  the same code path at toy size: 3 rollouts (1 critic-only), 2 problems x 2 episodes, 8 steps of 4096 tokens,
+         probe's), validation every 20 rollouts on the 98 classic val problems x 2 episodes, --skip-eval-before-train,
+         --save-interval 3 (the post-save hook keeps the latest), own run dir, W&B ids and trace dirs, every episode
+         traced, and the probe's runs/<run>/extra_env (NVLS off, judge pool) in the new run dir.
+  smoke  the same code path at toy size: 3 rollouts (1 critic-only), 2 problems x 2 episodes, 8 steps of 12288 tokens (32768 per episode),
          eval on 8 classic problems x 1 after rollout 1 and at the end, save every rollout (a resume is exercised by
          the main task's first segment only when it loads the smoke's dirs, which it does not: the smoke has its own).
   python3 tools/make_agent_train.py NAME OUT_DIR    e.g. fcs_agent_solo_q9b-fcs-sft_s42 /scratch/.../tmp/agentic/solo_s42"""
@@ -63,12 +64,20 @@ def emit(part, name, out):
         a = setv(a, "--rollout-batch-size", "16")
         a = setv(a, "--n-samples-per-prompt", "6")
         a = setv(a, "--eval-interval", "20")
-        a = setv(a, "--save-interval", "5")
+        a = setv(a, "--save-interval", "3")       # review 2026-10-16: a wall kill loses at most 3 rollouts
+        if "--skip-eval-before-train" not in a:     # the probe dropped it (eval-only); without it every segment re-evaluates
+            a.append("--skip-eval-before-train")
         a = setv(a, "--eval-prompt-data", "fo_agent", f"{D}/fcs_val_classic_agent.jsonl")
         a = setv(a, "--n-samples-per-eval-prompt", "2")
     keep = [e for e in env if not e.startswith(("RUN_NAME=", "MA_AG_MU=", "MA_FO_TRACE_EVERY="))]
     env = [f"RUN_NAME={name}"] + keep + ["MA_AG_MU=0", "MA_FO_TRACE_EVERY=1"]
+    if part == "smoke":   # at 4096 tokens per step the probe smoke never submitted: the training episodes must reach the judge
+        env = [e for e in env if not e.startswith(("MA_AG_TURN=", "MA_AG_TOKENS="))] + ["MA_AG_TURN=12288", "MA_AG_TOKENS=32768"]
     os.makedirs(out, exist_ok=False)
+    # runs/<run>/extra_env (exported before ray start): NVLS off as in every run since 2026-10-08 (CUDA 999 after wake_up)
+    # and the judge's shared pool of 56 slots (eval tails); the probe never trained, so it never hit the first case
+    os.makedirs(rdir, exist_ok=True)
+    shutil.copy(f"{B}/runs/{old}/extra_env", f"{rdir}/extra_env")
     open(f"{out}/args", "w").write("\n".join(a) + "\n")
     open(f"{out}/env", "w").write("\n".join(env) + "\n")
     open(f"{out}/run", "w").write(name + "\n")

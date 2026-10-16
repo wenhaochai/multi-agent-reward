@@ -6,9 +6,10 @@
 #      copy, then the first training segment, then fetch_pending.sh); runs/<run>/smoke_job names it, so every later
 #      segment is gated on its smoke ledger line (run_miles_in_container.sh)
 #   3. NSEG resume segments, sbatch_miles.sh afterany on the previous job (a segment that finds the run complete exits)
-#   bash tools/submit_agent_solo.sh EMIT_DIR [NSEG=2]
+#   bash tools/submit_agent_solo.sh EMIT_DIR [NSEG=3]   (review 2026-10-16: ~29M training tokens per rollout; a segment
+#   that finds the run complete exits at once)
 set -euo pipefail
-O=$1 nseg=${2:-2}
+O=$1 nseg=${2:-3}
 code=$(cd "$(dirname "$0")/.." && pwd)
 B=/scratch/gpfs/GROUP/USER/project/miles-q38-build
 name=$(cat "$O/main/run") smoke=$(cat "$O/smoke/run")
@@ -18,6 +19,7 @@ if [[ ! -d $cp_dir ]]; then
   mkdir -p "$cp_dir"
   for f in run env args; do sed "s/$smoke/${smoke}_cp/g" "$O/smoke/$f" > "$cp_dir/$f"; done
 fi
+mkdir -p "$B/runs/${smoke}_cp" && cp -n "$B/runs/$smoke/extra_env" "$B/runs/${smoke}_cp/extra_env"   # NVLS off, judge pool
 mapfile -t E < "$cp_dir/env"; mapfile -t A < "$cp_dir/args"
 cp_job=$(env "${E[@]}" MQB_CODE="$code" sbatch --parsable --partition=pli-c --account=group --qos=pli-cp --time=01:45:00 \
   --gres=gpu:8 --cpus-per-task=96 --mem=900G --job-name="miles-$(cat "$cp_dir/run")" "$code/sbatch_miles.sh" "${A[@]}")
