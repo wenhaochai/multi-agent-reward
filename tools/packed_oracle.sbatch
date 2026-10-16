@@ -2,13 +2,18 @@
 # One packed job (D9, owner 2026-10-07): the smoke copy of an oracle arm, then its first training segment, each through
 # packed_task.sh (the record splits the job's H100-hours by its ledger). A failed smoke ends the job before training.
 #   SMOKE_DIR, MAIN_DIR: EMIT dirs of submit_fcs_oracle.sh (run, env, args); MQB_CODE: the code worktree
-#   JOB_WALL_S: the job's --time in seconds (default 24 h); the training task gets the rest minus 15 min, so its ledger
-#   line is written before Slurm ends the job
+#   JOB_WALL_S: the training task's wall in seconds from job start (default 24 h); it gets the rest minus 15 min, so its
+#   ledger line is written before Slurm ends the job
+# Submit it through submit_packed_oracle.sh, which writes these settings into a copy of this script: fetch_pending.sh
+# (owner 2026-10-15) runs a fetched job's batch script without its --export environment, in the host's environment.
+# The job ends with fetch_pending.sh, which runs my pending fetchable jobs in the time left.
 #SBATCH --account=group
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --output=/scratch/gpfs/GROUP/USER/project/miles-q38-build/logs/%x-%j.out
 set -euo pipefail
+# a fetched copy without baked settings would read the host job's SMOKE_DIR and MAIN_DIR and rerun the host's run
+[[ -n ${FETCHED_JOB_ID:-} && ${PACKED_BAKED:-} != 1 ]] && { echo "[packed] fetched without baked settings: refusing"; exit 1; }
 T0=$(date +%s)
 : "${SLURM_JOB_ID:?}" "${SMOKE_DIR:?}" "${MAIN_DIR:?}" "${MQB_CODE:?}"
 B=/scratch/gpfs/GROUP/USER/project/miles-q38-build
@@ -23,3 +28,4 @@ task() {  # task NAME RECORD_RUN KIND LIMIT EMIT_DIR
 }
 task smoke - other 100m "$SMOKE_DIR" || { echo "[packed] smoke failed: no training"; exit 1; }
 task train "$(cat "$MAIN_DIR/run")" main "$(( ${JOB_WALL_S:-86400} - ($(date +%s) - T0) - 900 ))s" "$MAIN_DIR"
+bash /scratch/gpfs/GROUP/USER/tools/fetch_pending.sh

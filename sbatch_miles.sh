@@ -14,11 +14,13 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 # container as TMPDIR (run_miles_in_container.sh puts the judge and the caches there). The container's /tmp holds only
 # Ray's session dir (unix socket paths must stay < 108 bytes); it is a per-job dir on the node, removed at exit too
 [ -n "$SLURM_JOB_ID" ]
-export TMPDIR=/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID${QTASK:+_q$QTASK}   # QTASK: a queue-worker task
+# a run fetched by a host job (fetch_pending.sh) keeps the host's SLURM_JOB_ID: key its dirs and ports on its own id
+JID=${FETCHED_JOB_ID:-$SLURM_JOB_ID}
+export TMPDIR=/scratch/gpfs/GROUP/USER/tmp/job/$JID${QTASK:+_q$QTASK}   # QTASK: a queue-worker task
 export APPTAINERENV_TMPDIR=$TMPDIR
-JOBTMP=/tmp/miles_$SLURM_JOB_ID${QTASK:+_q$QTASK}
+JOBTMP=/tmp/miles_$JID${QTASK:+_q$QTASK}
 mkdir -p "$TMPDIR" "$JOBTMP"
-trap 'rm -rf "/scratch/gpfs/GROUP/USER/tmp/job/$SLURM_JOB_ID${QTASK:+_q$QTASK}" "/tmp/miles_$SLURM_JOB_ID${QTASK:+_q$QTASK}" || true' EXIT
+trap 'rm -rf "/scratch/gpfs/GROUP/USER/tmp/job/$JID${QTASK:+_q$QTASK}" "/tmp/miles_$JID${QTASK:+_q$QTASK}" || true' EXIT
 echo "[sbatch] $(date -u +%FT%TZ) node=$(hostname) job=$SLURM_JOB_ID run=$RUN_NAME gpus=$GPUS"
 # MA_*/FCS_* reach the container as APPTAINERENV_* (passes --cleanenv verbatim; --env %q turned "0,1,3" into "0\,1\,3",
 # audit 2026-10-11); each is logged, since a variable exported in the submitting shell also lands here
@@ -29,6 +31,6 @@ apptainer exec --nv --contain --cleanenv --writable-tmpfs \
   --bind /dev/shm \
   --bind "$B/cache/root":/root/.cache \
   --env PYTHONNOUSERSITE=1 --env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" \
-  --env SLURM_JOB_ID="$SLURM_JOB_ID" --env RUN_NAME="$RUN_NAME" --env GPUS="$GPUS" \
+  --env SLURM_JOB_ID="$JID" --env RUN_NAME="$RUN_NAME" --env GPUS="$GPUS" \
   --env MILES_MODEL_TYPE="$MILES_MODEL_TYPE" ${MILES_SRC:+--env MILES_SRC="$MILES_SRC"} ${QTASK:+--env QTASK="$QTASK"} \
   ${MQB_CODE:+--env MQB_CODE="$MQB_CODE"} "$B/miles.sif" bash "${MQB_CODE:-$B}/run_miles_in_container.sh" "$@"
