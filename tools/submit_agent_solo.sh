@@ -1,5 +1,6 @@
 #!/bin/bash
 # Submit the agentic single-agent RL run (owner step 2, 2026-10-16) from the EMIT dirs of tools/make_agent_train.py:
+#   (the smoke and the segments read the submit shell and the host heads a chain: none is marked fetchable, rule 2026-10-17)
 #   1. a quick smoke on pli-cp under its own run name (a copy of the smoke EMIT with "_cp" in the name, so it never
 #      shares a run dir with the packed job's smoke copy)
 #   2. the packed 24 h host job on pli-short (tools/packed_oracle.sbatch through submit_packed_oracle.sh: its own smoke
@@ -23,7 +24,7 @@ mkdir -p "$B/runs/${smoke}_cp" && cp -n "$B/runs/$smoke/extra_env" "$B/runs/${sm
 mapfile -t E < "$cp_dir/env"; mapfile -t A < "$cp_dir/args"
 cp_job=$(env "${E[@]}" MQB_CODE="$code" sbatch --parsable --partition=pli-c --account=group --qos=pli-cp --time=01:45:00 \
   --gres=gpu:8 --cpus-per-task=96 --mem=900G --job-name="miles-$(cat "$cp_dir/run")" "$code/sbatch_miles.sh" "${A[@]}")
-host=$(bash "$code/tools/submit_packed_oracle.sh" "$name" "$O/smoke" "$O/main")
+host=$(bash "$code/tools/submit_packed_oracle.sh" "$name" "$O/smoke" "$O/main" 24:00:00 86400 --no-fetchable)   # heads the chain
 mkdir -p "$B/runs/$name" && echo "$host" > "$B/runs/$name/smoke_job"
 mapfile -t E < "$O/main/env"; mapfile -t A < "$O/main/args"
 prev=$host segs=()
