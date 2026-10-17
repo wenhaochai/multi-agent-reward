@@ -2,9 +2,9 @@
 single-agent baseline; reward R = S, MA_AG_MU=0 by popup). The base is the agentic probe's config
 (tmp/agentic/probe_sft, itself the par_indiv run's: same model, parallelism, context and the paper's Frontier-CS EasyPPO
 values), which loads the SFT weights from an empty --load dir. Changed for training:
-  main   --num-rollout 60 (the first 10 train only the critic, as every oracle arm), --prompt-data fcs_train190_team.jsonl
-         (owner 2026-10-13: the 10 weak problems dropped; none is interactive), 16 problems x 6 episodes per rollout (the
-         probe's), validation every 20 rollouts on the 98 classic val problems x 2 episodes, --skip-eval-before-train,
+  main   --num-rollout 60 (the first 10 train only the critic, as every oracle arm), --prompt-data fcs_train200v2_team.jsonl
+         (user 2026-10-17: the 200 problems with FrontierSmith PR #4's fixed checkers; none is interactive), 16 problems x 6
+         episodes per rollout (the probe's), validation every 20 rollouts on the 98 classic val problems x 2 episodes, --skip-eval-before-train,
          --save-interval 3 (the post-save hook keeps the latest), own run dir, W&B ids and trace dirs, every episode
          traced, and the probe's runs/<run>/extra_env (NVLS off, judge pool) in the new run dir.
   smoke  the same code path at toy size: 3 rollouts (1 critic-only), 2 problems x 2 episodes, 8 steps of 12288 tokens (32768 per episode),
@@ -48,7 +48,7 @@ def emit(part, name, out):
     a = drop(a, "--override-opt_param-scheduler")   # eval-only fix: a training run's scheduler must match its ckpt
     a = setv(a, "--wandb-group", name)
     a = setv(a, "--wandb-run-id", name)
-    a = setv(a, "--prompt-data", f"{D}/fcs_train190_team.jsonl")
+    a = setv(a, "--prompt-data", f"{D}/fcs_train200v2_team.jsonl")   # user 2026-10-17: FrontierSmith PR #4 data
     if part == "smoke":
         a = setv(a, "--num-rollout", "3")
         a = setv(a, "--num-critic-only-steps", "1")
