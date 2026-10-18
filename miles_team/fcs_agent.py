@@ -16,7 +16,7 @@ is our policy through miles' sglang router: every step is one new segment render
 and command, reasoning dropped), so a 40-step episode does not carry 40 steps of reasoning tokens.
 
 --custom-generate-function-path miles_team.fcs_agent.generate (eval sets: metadata.messages = the problem prompt)
-Env: MA_AG_STEPS (40), MA_AG_TURN (16384 tokens per step), MA_AG_TOKENS (131072 generated per episode), MA_AG_MAX_LEN
+Env: MA_AG_STEPS (40; 0 = no step limit, and the prompt then names none), MA_AG_TURN (16384 tokens per step), MA_AG_TOKENS (131072 generated per episode), MA_AG_MAX_LEN
 (65536 context), MA_AG_TIMEOUT (60 s per command), MA_AG_TRACE_DIR, MA_AG_THINK (1).
 """
 from __future__ import annotations
@@ -40,7 +40,7 @@ from .fcs_cmd import CMD_MEM, TIMEOUT, run_command  # noqa: F401 (tests use A.ru
 from .fcs_rm import answer, judge_code
 from .team_rollout import Aborted, Session
 
-STEPS = int(os.environ.get("MA_AG_STEPS", "40"))
+STEPS = int(os.environ.get("MA_AG_STEPS", "40"))   # 0: no step limit (user 2026-10-18); the token budget and the context end the episode
 TURN = int(os.environ.get("MA_AG_TURN", "16384"))
 TOKENS = int(os.environ.get("MA_AG_TOKENS", "131072"))
 MAX_LEN = int(os.environ.get("MA_AG_MAX_LEN", "65536"))
@@ -105,7 +105,7 @@ This workflow should be done step-by-step so that you can iterate on your soluti
 3. Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
    However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load \
 environment variables from files
-4. Each command may run for at most {timeout} seconds. You have at most {steps} steps.
+4. Each command may run for at most {timeout} seconds.{steps}
 
 ## Formatting your response
 
@@ -240,7 +240,8 @@ def _trace(rec: dict) -> None:
 async def episode(input: GenerateFnInput, messages: list, label: str):
     sess = Session(input, "agent", THINK, max_len=MAX_LEN)
     chat = [{"role": "system", "content": SYSTEM},
-            {"role": "user", "content": INSTANCE.format(problem=problem_text(messages), timeout=TIMEOUT, steps=STEPS)}]
+            {"role": "user", "content": INSTANCE.format(problem=problem_text(messages), timeout=TIMEOUT,
+                                                         steps=f" You have at most {STEPS} steps." if STEPS > 0 else "")}]
     base = os.environ.get("TMPDIR", "/tmp")
     work = os.path.join(base, "agent", uuid.uuid4().hex)
     os.makedirs(work)
@@ -249,7 +250,7 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
     exit_status, submission, turns, segs = "", None, [], []
     try:
         while True:
-            if steps >= STEPS:
+            if STEPS > 0 and steps >= STEPS:
                 exit_status = "LimitsExceeded"; break
             if _gen(sess) >= TOKENS:
                 exit_status = "TokensExceeded"; break
