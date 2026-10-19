@@ -95,6 +95,13 @@ def emit(src, game, n, name, out, rounds, smoke, given, o=None):
     if o is not None and o.fresh:
         a = setf(a, "--load", f"{rdir}/ckpt")
         a = setf(a, "--critic-load", f"{rdir}/ckpt_critic")
+    # the eval-only path still builds and loads the critic, though eval never reads it; the critics of the finished runs
+    # were deleted (owner 2026-10-18), and a missing iter dir kills init (15794440): then the critic starts from the HF
+    # checkpoint, as in --fresh
+    cl = a[a.index("--critic-load") + 1]
+    tracker = f"{cl}/latest_checkpointed_iteration.txt"
+    if cl.startswith(sdir) and (not os.path.exists(tracker) or not os.path.isdir(f"{cl}/iter_{int(open(tracker).read()):07d}")):
+        a = setf(a, "--critic-load", f"{rdir}/ckpt_critic")
     if o is not None and o.module:
         for f, fn in (("--custom-generate-function-path", "generate"), ("--custom-eval-rollout-log-function-path", "log_eval"),
                       ("--custom-rollout-log-function-path", "log_rollout")):
