@@ -27,7 +27,10 @@ task() {  # task NAME RECORD_RUN KIND LIMIT EMIT_DIR
   env "${E[@]}" MQB_CODE="$MQB_CODE" QTASK="$NT" bash "$PT" "$1" "$2" "$3" 8 "$4" -- bash "$MQB_CODE/sbatch_miles.sh" "${A[@]}"
 }
 task smoke - other 100m "$SMOKE_DIR" || { echo "[packed] smoke failed: no training"; exit 1; }
-task train "$(cat "$MAIN_DIR/run")" main "$(( ${JOB_WALL_S:-86400} - ($(date +%s) - T0) - 900 ))s" "$MAIN_DIR"
+rc=0; task train "$(cat "$MAIN_DIR/run")" main "$(( ${JOB_WALL_S:-86400} - ($(date +%s) - T0) - 900 ))s" "$MAIN_DIR" || rc=$?
+# PACKED_STRICT=1 (a producer that afterok jobs wait on): end with the training task's status, before fetch_pending,
+# so a failed producer never releases its dependents and they do not wait for the host's leftover hours
+[[ ${PACKED_STRICT:-} == 1 ]] && { echo "[packed] strict: exit $rc"; exit $rc; }
 # only the host fetches: a fetched copy that fetched again ran guests under its own --time and killed one (15686944
 # inside 15625117 fetched 15696862, exit 143 at the guest's wall, 2026-10-16); the host's loop continues after it
 if [[ -z ${FETCHED_JOB_ID:-} ]]; then bash /scratch/gpfs/GROUP/USER/tools/fetch_pending.sh; fi   # not a && list: its 1 would be the exit status

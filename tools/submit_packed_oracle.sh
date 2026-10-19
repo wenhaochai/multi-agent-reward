@@ -6,7 +6,8 @@
 #   TIME defaults to 24:00:00 and JOB_WALL_S to 86400; a JOB_WALL_S below TIME caps the main task and leaves the rest
 #   of the 24 h to fetched jobs. Prints the job id.
 #   Fetchable by default (owner rule 2026-10-17): the job gets --comment=fetchable and the copy the #FETCHABLE line
-#   that fetch_pending.sh requires. Pass --no-fetchable for a job that heads a dependency chain (its segments wait on
+#   that fetch_pending.sh requires. PACKED_STRICT=1 bakes strict mode: the job ends with the training task's status and
+#   runs no fetch_pending (a producer that afterok jobs wait on). Pass --no-fetchable for a job that heads a dependency chain (its segments wait on
 #   its id and gate on its ledger, runs/<run>/smoke_job, which a fetched run writes under the host's id).
 set -euo pipefail
 fetch=1; args=(); for a in "$@"; do if [[ $a == --no-fetchable ]]; then fetch=0; else args+=("$a"); fi; done; set -- "${args[@]}"
@@ -15,7 +16,7 @@ code=$(cd "$(dirname "$0")/.." && pwd)
 for d in "$smoke" "$main"; do for f in run env args; do [[ -s $d/$f ]] || { echo "missing $d/$f" >&2; exit 1; }; done; done
 dir=/scratch/gpfs/GROUP/USER/project/miles-q38-build/logs/packed/scripts; mkdir -p "$dir"
 out=$dir/$name.$(date +%Y%m%d-%H%M%S).sbatch
-awk -v e="PACKED_BAKED=1 SMOKE_DIR=$smoke MAIN_DIR=$main MQB_CODE=$code JOB_WALL_S=$wall" \
+awk -v e="PACKED_BAKED=1 SMOKE_DIR=$smoke MAIN_DIR=$main MQB_CODE=$code JOB_WALL_S=$wall${PACKED_STRICT:+ PACKED_STRICT=1}" \
   '{print} /^set -euo pipefail$/ && !done {print e; done=1}' "$code/tools/packed_oracle.sbatch" > "$out"
 grep -q '^PACKED_BAKED=1 ' "$out"
 if (( fetch )); then
