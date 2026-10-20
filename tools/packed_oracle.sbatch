@@ -27,6 +27,11 @@ task() {  # task NAME RECORD_RUN KIND LIMIT EMIT_DIR
   env "${E[@]}" MQB_CODE="$MQB_CODE" QTASK="$NT" bash "$PT" "$1" "$2" "$3" 8 "$4" -- bash "$MQB_CODE/sbatch_miles.sh" "${A[@]}"
 }
 task smoke - other 100m "$SMOKE_DIR" || { echo "[packed] smoke failed: no training"; exit 1; }
+# a fetched head (owner 2026-10-20: every job runs in a host) writes its ledger under the host's SLURM_JOB_ID, but its
+# segments gate on runs/<run>/smoke_job = its own job id (run_miles_in_container.sh): copy the smoke line there too
+if [[ -n ${FETCHED_JOB_ID:-} ]]; then
+  awk -F'\t' '$1 == "smoke"' "$PACKED_LEDGER_DIR/$SLURM_JOB_ID.tsv" | tail -1 >> "$PACKED_LEDGER_DIR/$FETCHED_JOB_ID.tsv"
+fi
 task train "$(cat "$MAIN_DIR/run")" main "$(( ${JOB_WALL_S:-86400} - ($(date +%s) - T0) - 900 ))s" "$MAIN_DIR"
 # only the host fetches: a fetched copy that fetched again ran guests under its own --time and killed one (15686944
 # inside 15625117 fetched 15696862, exit 143 at the guest's wall, 2026-10-16); the host's loop continues after it
