@@ -24,8 +24,10 @@ import shutil
 import subprocess
 import time
 import uuid
+from copy import deepcopy
 
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
+from miles.utils.types import Sample
 
 from . import fcs_agent as A
 from .fcs_rm import answer, judge_code
@@ -233,17 +235,31 @@ def _reward(S: float, shares: dict, name: str) -> float:
 
 
 async def generate(input: GenerateFnInput) -> GenerateFnOutput:
+    """As fcs_agent.generate (review 2026-10-16 there; ported for the swarm RL run, 2026-10-20): an engine abort, an empty
+    episode or (in training) a judge infrastructure error returns an ABORTED sample, which miles drops and resubmits,
+    instead of ending the run."""
+    try:
+        return await _generate(input)
+    except Aborted:
+        s = deepcopy(input.sample)
+        s.status = Sample.Status.ABORTED
+        return GenerateFnOutput(samples=s)
+
+
+async def _generate(input: GenerateFnInput) -> GenerateFnOutput:
     meta = input.sample.metadata or {}
     messages = meta.get("messages")
     assert messages, "fcs_agent_team needs the raw chat in sample.metadata['messages']"
-    agents, S, shares, info = await episode(input, messages, input.sample.label)
+    agents, R, shares, info = await episode(input, messages, input.sample.label)   # R = S - MU x run minutes
     segs = [(a, i) for a in agents for i in a.segs]
     if not segs:
         raise Aborted("empty episode")
+    if info.get("fo_judge_infra_error") and not input.evaluation:
+        raise Aborted("judge infrastructure error")   # its 0 is not the policy's (fcs_agent and fcs_oracle do the same)
     if input.evaluation:
         a, i = segs[-1]
         out = a.sess.segments[i]
-        out.reward = float(S)
+        out.reward = float(R)
         out.metadata = {**(out.metadata or {}), **info}
         return GenerateFnOutput(samples=out)
     rollout_id = input.sample.rollout_id if input.sample.rollout_id is not None else input.sample.index
@@ -251,7 +267,7 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     samples = []
     for a, i in segs:
         s = a.sess.segments[i]
-        s.reward, s.rollout_id, s.group_index = float(_reward(S, shares, a.name)), rollout_id, g
+        s.reward, s.rollout_id, s.group_index = float(_reward(R, shares, a.name)), rollout_id, g
         samples.append(s)
     samples[0].metadata = {**samples[0].metadata, **info}
     return GenerateFnOutput(samples=samples)
