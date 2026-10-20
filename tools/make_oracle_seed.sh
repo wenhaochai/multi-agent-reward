@@ -6,7 +6,9 @@
 # settings the s42 arms carried at their end (logs/<arm>-<job>.out train args and runs/<arm>/extra_{env,args}):
 #   no-pad training (--variable-rollout-samples GBS --bshd-pad-per-sample), NCCL_DEBUG=WARN, NCCL_NVLS_ENABLE=0,
 #   MA_FO_CF_K=4 for the difference arm, training data fcs_train200_team (owner: the same 200 problems for a fair
-#   comparison, 2026-10-11)
+#   comparison, 2026-10-11) with the checkers s42 trained against: labels point to frontiersmith-200-166c8be, a worktree
+#   pinned before FrontierSmith PR #4 (merged into the shared checkout 2026-10-17; it changed the checker, tests or
+#   statement of 10 training problems: 5 18 52 58 100 106 108 125 183 185; review 2026-10-19)
 # Changed from s42, none of them in the training math:
 #   in-training eval on the arm's own game, the 98 classic val problems x 1 (owner 2026-10-08: interactive skipped; the
 #     cfk4 run switched to classic sets on 2026-10-14); step 0 is not re-evaluated (--skip-eval-before-train): the SFT
@@ -22,7 +24,7 @@ B=/scratch/gpfs/GROUP/USER/project/miles-q38-build D=$B/data
 nccl=$'# CUDA 999 / hang after wake_up (fcs_oracle.yaml cuda999_nvls_2026_10_08), as the s42 arms ended\nNCCL_DEBUG=WARN\nNCCL_NVLS_ENABLE=0'
 emit() {  # emit ARM PART GBS EXTRA_ENV KEY=VALUE... (the submit_fcs_oracle.sh settings)
   local arm=$1 part=$2 gbs=$3 xenv=$4; shift 4
-  local dir=$out/$arm/$part xa="--variable-rollout-samples $gbs --bshd-pad-per-sample"
+  local dir=$out/$arm/$part xa="--variable-rollout-samples $gbs --bshd-pad-per-sample --prompt-data $D/fcs_train200_team_fs166c8be.jsonl"
   if [[ $part == main ]]; then
     local game; game=$(printf '%s\n' "$@" | sed -n 's/^GAME=//p')
     case " $* " in *" PRETRAIN=1 "*) xa+=" --skip-eval-before-train" ;;

@@ -21,7 +21,9 @@ vp=$(cat "$O/vp/main/run")
 prod=$(run env PACKED_STRICT=1 bash "$code/tools/submit_packed_oracle.sh" "$vp" "$O/vp/smoke" "$O/vp/main" 10:00:00 36000 --no-fetchable)
 [[ -n ${DRY:-} ]] || echo "$prod" > "$B/runs/$vp/smoke_job"
 echo "producer $vp $prod"
-for spec in team_shared:2:prod team_bonus:2:prod team_diff_cfk4:3: seq_shared:2: par_indiv:2:; do
+# segments: a host may run a fetchable-partial segment for only 3 h, and s42 bonus needed ~44 h; a segment that finds
+# the run complete exits in ~1 min (review 2026-10-19)
+for spec in team_shared:4:prod team_bonus:4:prod team_diff_cfk4:5: seq_shared:4: par_indiv:4:; do
   IFS=: read -r a nseg dep <<< "$spec"
   n=$(cat "$O/$a/main/run")
   extra=(); [[ $dep == prod ]] && extra=(--dependency=afterok:$prod)

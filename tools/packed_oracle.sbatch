@@ -31,6 +31,9 @@ rc=0; task train "$(cat "$MAIN_DIR/run")" main "$(( ${JOB_WALL_S:-86400} - ($(da
 # PACKED_STRICT=1 (a producer that afterok jobs wait on): end with the training task's status, before fetch_pending,
 # so a failed producer never releases its dependents and they do not wait for the host's leftover hours
 [[ ${PACKED_STRICT:-} == 1 ]] && { echo "[packed] strict: exit $rc"; exit $rc; }
+# a training task that crashed (not done, not its wall: 124) ends the host at once, so the next segment (afterany)
+# resumes from the last checkpoint instead of waiting out the host's 24 h (review 2026-10-19)
+if [[ $rc -ne 0 && $rc -ne 124 ]]; then echo "[packed] train task failed (rc $rc): no fetch_pending"; exit $rc; fi
 # only the host fetches: a fetched copy that fetched again ran guests under its own --time and killed one (15686944
 # inside 15625117 fetched 15696862, exit 143 at the guest's wall, 2026-10-16); the host's loop continues after it
 if [[ -z ${FETCHED_JOB_ID:-} ]]; then bash /scratch/gpfs/GROUP/USER/tools/fetch_pending.sh; fi   # not a && list: its 1 would be the exit status
