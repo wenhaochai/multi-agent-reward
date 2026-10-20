@@ -10,7 +10,9 @@
 #   runs no fetch_pending (a producer that afterok jobs wait on). Pass --no-fetchable for a job that heads a dependency chain (its segments wait on
 #   its id and gate on its ledger, runs/<run>/smoke_job, which a fetched run writes under the host's id).
 set -euo pipefail
-fetch=1; args=(); for a in "$@"; do if [[ $a == --no-fetchable ]]; then fetch=0; else args+=("$a"); fi; done; set -- "${args[@]}"
+fetch=1 comment=fetchable; args=()
+for a in "$@"; do case $a in --no-fetchable) fetch=0 ;; --partial) comment=fetchable-partial ;; *) args+=("$a") ;; esac; done
+set -- "${args[@]}"
 name=$1 smoke=$2 main=$3 time=${4:-24:00:00} wall=${5:-86400}; shift $(( $# < 5 ? $# : 5 ))
 code=$(cd "$(dirname "$0")/.." && pwd)
 for d in "$smoke" "$main"; do for f in run env args; do [[ -s $d/$f ]] || { echo "missing $d/$f" >&2; exit 1; }; done; done
@@ -21,7 +23,7 @@ awk -v e="PACKED_BAKED=1 SMOKE_DIR=$smoke MAIN_DIR=$main MQB_CODE=$code JOB_WALL
 grep -q '^PACKED_BAKED=1 ' "$out"
 if (( fetch )); then
   sed -i '1a #FETCHABLE: settings baked in by submit_packed_oracle.sh, no --export' "$out"
-  set -- "$@" --comment=fetchable
+  set -- "$@" --comment=$comment
 fi
 sbatch --parsable --partition=pli-c --account=group --qos=pli-short --time="$time" --gres=gpu:8 --cpus-per-task=96 \
   --mem=900G --job-name="miles-$name" "$@" "$out"
