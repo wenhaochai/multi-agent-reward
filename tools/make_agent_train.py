@@ -10,7 +10,10 @@ values), which loads the SFT weights from an empty --load dir. Changed for train
   smoke  the same code path at toy size: 3 rollouts (1 critic-only), 2 problems x 2 episodes, 8 steps of 12288 tokens (32768 per episode),
          eval on 8 classic problems x 1 after rollout 1 and at the end, save every rollout (a resume is exercised by
          the main task's first segment only when it loads the smoke's dirs, which it does not: the smoke has its own).
-  python3 tools/make_agent_train.py NAME OUT_DIR [SEED=S] [STEPS=K] [SAVE=K]    e.g. fcs_agent_solo_q9b-fcs-sft_s42 /scratch/.../tmp/agentic/solo_s42"""
+  swarm (user 2026-10-20 popup): N=4 plays miles_team.fcs_agent_team (N agents in one shared repo, shared reward R = S),
+  SCORE=last_submit judges the last submitter's snapshot, RB=4 problems per rollout (4 x 6 x 4 agents = the 96 agent
+  sessions of the lone agent's 16 x 6); the eval plays the same swarm.
+  python3 tools/make_agent_train.py NAME OUT_DIR [SEED=S] [STEPS=K] [SAVE=K] [N=4 SCORE=last_submit RB=4]    e.g. fcs_agent_solo_q9b-fcs-sft_s42 /scratch/.../tmp/agentic/solo_s42"""
 import os
 import shutil
 import sys
@@ -77,6 +80,12 @@ def emit(part, name, out):
         a = setv(a, "--rollout-seed", OVR["SEED"])
     if "SAVE" in OVR and part != "smoke":
         a = setv(a, "--save-interval", OVR["SAVE"])
+    if "N" in OVR:   # the swarm: same log functions (fcs_agent_team re-exports fcs_agent's)
+        a = setv(a, "--custom-generate-function-path", "miles_team.fcs_agent_team.generate")
+        env = [e for e in env if not e.startswith(("MA_AG_N=", "MA_AG_REWARD=", "MA_AG_SCORE="))] + [
+            f"MA_AG_N={OVR['N']}", "MA_AG_REWARD=shared", f"MA_AG_SCORE={OVR.get('SCORE', 'repo')}"]
+    if "RB" in OVR and part != "smoke":
+        a = setv(a, "--rollout-batch-size", OVR["RB"])
     if "STEPS" in OVR:
         env = [e for e in env if not e.startswith("MA_AG_STEPS=")] + [f"MA_AG_STEPS={OVR['STEPS']}"]
     if part == "smoke":   # at 4096 tokens per step the probe smoke never submitted: the training episodes must reach the judge
@@ -98,7 +107,7 @@ if __name__ == "__main__":
     for kv in sys.argv[3:]:   # SEED=S (--seed/--rollout-seed; engines take seed+i, so space seeds >= 8), STEPS=K (MA_AG_STEPS),
         # SAVE=K (main --save-interval; 1 for fetchable-partial segments, user 2026-10-19)
         k, v = kv.split("=", 1)
-        assert k in ("SEED", "STEPS", "SAVE"), kv
+        assert k in ("SEED", "STEPS", "SAVE", "N", "SCORE", "RB"), kv
         OVR[k] = v
     if os.path.exists(out):
         sys.exit(f"{out} exists: remove it by hand first")
