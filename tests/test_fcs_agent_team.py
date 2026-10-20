@@ -24,6 +24,14 @@ with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as w:
     check(abs(sh.get("agent1", 0) - 0.5) < 1e-9 and abs(sh.get("agent2", 0) - 0.5) < 1e-9, "blame: 2 of 4 lines each")
     log = T._git(w, "log", "--format=%an %s").stdout
     check("agent2 agent2 step 1" in log and "agent1 agent1 step 1" in log, "commits under agent names")
+    text, rev = T.snapshot(w)
+    A.run_command("printf 'broken(\\n' > solution.cpp", w)
+    T.commit_as(w, "agent3", 2)
+    sh3 = T.blame_shares(w, "solution.cpp", rev)
+    check("return x - 1;" in text and abs(sh3.get("agent1", 0) - 0.5) < 1e-9 and "agent3" not in sh3,
+          "snapshot: text and blame at the submit commit ignore a later rewrite")
+    A.run_command("git checkout -q HEAD~1 -- solution.cpp", w)
+    T.commit_as(w, "agent3", 3)
     files = T._git(w, "ls-files").stdout.split()
     check(files == ["solution.cpp"], f"only sources committed (binary left out): {files}")
 print("ALL OK" if ok else "SOME FAILED"); sys.exit(0 if ok else 1)

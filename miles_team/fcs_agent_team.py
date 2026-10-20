@@ -34,6 +34,12 @@ from .team_rollout import Aborted, Session
 N = int(os.environ.get("MA_AG_N", "4"))
 REWARD = os.environ.get("MA_AG_REWARD", "shared")
 assert REWARD in ("shared", "blame"), REWARD
+# what the hidden tests judge (user 2026-10-20 popup, after probe 15881283: in 172 of 179 episodes an agent rewrote
+# solution.cpp after another had submitted, and agents that never submitted left unfinished programs that were judged):
+#   repo         solution.cpp at the end of the episode (the first probe)
+#   last_submit  solution.cpp as it was when the last agent to submit issued its submit command
+SCORE = os.environ.get("MA_AG_SCORE", "repo")
+assert SCORE in ("repo", "last_submit"), SCORE
 SOURCES = (".cpp", ".cc", ".h", ".hpp", ".py", ".txt", ".md", ".sh", ".in", ".out", ".ans")  # binaries stay out
 
 # fcs_agent's instance template with the team's situation and submit rule in place of the lone agent's
@@ -87,9 +93,16 @@ def commit_as(work: str, name: str, step: int) -> None:
         _git(work, "commit", "-q", "-m", f"{name} step {step}", env=who)
 
 
-def blame_shares(work: str, path: str = "solution.cpp") -> dict:
+def snapshot(work: str, path: str = "solution.cpp") -> tuple:
+    """(the file's text or "", the commit it is in) right after the harness commit that follows a command."""
+    p = os.path.join(work, path)
+    text = open(p, errors="replace").read() if os.path.isfile(p) else ""
+    return text, _git(work, "rev-parse", "HEAD").stdout.strip()
+
+
+def blame_shares(work: str, path: str = "solution.cpp", rev: str = "HEAD") -> dict:
     """{author: share of the file's non-blank lines}, from git blame of the committed file."""
-    r = _git(work, "blame", "--line-porcelain", "HEAD", "--", path)
+    r = _git(work, "blame", "--line-porcelain", rev, "--", path)
     if r.returncode:
         return {}
     counts, author, nonblank = {}, None, True
@@ -167,7 +180,7 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
     os.makedirs(work)
     loop = asyncio.get_running_loop()
     rng = random.Random(f"{label}:{input.sample.index}:{getattr(input.sample, 'group_index', 0)}")
-    rounds, order_log, run_s = 0, [], 0.0
+    rounds, order_log, run_s, last_snap = 0, [], 0.0, None
     try:
         await loop.run_in_executor(A._POOL, repo_init, work)
         while any(not a.done for a in agents):
@@ -182,11 +195,15 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
                 run_s += out["seconds"]
                 await loop.run_in_executor(A._POOL, commit_as, work, a.name, a.steps)
                 a.observe(cmd, out, rounds, k)
-        final = None
+                if a.exit == "Submitted":   # the submitter's version, after its own command's commit
+                    last_snap = (a.name, *await loop.run_in_executor(A._POOL, snapshot, work))
+        final, rev = None, "HEAD"
         if any(a.exit == "Submitted" for a in agents):
-            p = os.path.join(work, "solution.cpp")
-            final = open(p, errors="replace").read() if os.path.isfile(p) else ""
-        shares = await loop.run_in_executor(A._POOL, blame_shares, work)
+            if SCORE == "last_submit":
+                _, final, rev = last_snap
+            else:
+                final = (await loop.run_in_executor(A._POOL, snapshot, work))[0]
+        shares = await loop.run_in_executor(A._POOL, blame_shares, work, "solution.cpp", rev)
         log = (await loop.run_in_executor(A._POOL, lambda: _git(work, "log", "--format=%an %s").stdout))[-20000:]
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -205,7 +222,8 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
             "fo_judge_infra_error": float(bool(res and res["infra_error"]))}
     A._trace({"time": round(time.time(), 1), "eval": input.evaluation, "game": "agent_team", "label": label, "S": S, "R": R, "run_min": run_s / 60,
               "status": res["status"] if res else "no submission", "rounds": rounds, "order": order_log,
-              "blame": shares, "git_log": log, "final": final,
+              "blame": shares, "git_log": log, "final": final, "score_rule": SCORE,
+              "final_by": last_snap[0] if (SCORE == "last_submit" and last_snap) else None,
               "agents": [{"name": a.name, "exit": a.exit, "steps": a.steps, "turns": a.turns} for a in agents]})
     return agents, R, shares, info
 
