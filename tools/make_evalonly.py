@@ -102,6 +102,8 @@ def emit(src, game, n, name, out, rounds, smoke, given, o=None):
     tracker = f"{cl}/latest_checkpointed_iteration.txt"
     if cl.startswith(sdir) and (not os.path.exists(tracker) or not os.path.isdir(f"{cl}/iter_{int(open(tracker).read()):07d}")):
         a = setf(a, "--critic-load", f"{rdir}/ckpt_critic")
+        if not (o is not None and o.fresh):   # a trained actor without its critic: miles evalonly-critic (a8f2c0cef)
+            miles = "/scratch/gpfs/GROUP/USER/project/miles-easyppo-evalonly"
     if o is not None and o.module:
         for f, fn in (("--custom-generate-function-path", "generate"), ("--custom-eval-rollout-log-function-path", "log_eval"),
                       ("--custom-rollout-log-function-path", "log_rollout")):

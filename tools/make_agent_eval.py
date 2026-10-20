@@ -15,6 +15,7 @@ import sys
 
 B = "/scratch/gpfs/GROUP/USER/project/miles-q38-build"
 PROBE = "/scratch/gpfs/GROUP/USER/tmp/agentic/probe_sft"
+EVAL_MILES = "/scratch/gpfs/GROUP/USER/project/miles-easyppo-evalonly"   # miles evalonly-critic a8f2c0cef
 
 
 def setv(a, flag, *vals):
@@ -37,6 +38,12 @@ def emit(part, name, ckpt, n, out):
     if ckpt != "sft":
         assert os.path.isdir(f"{ckpt}/iter_{int(open(f'{ckpt}/latest_checkpointed_iteration.txt').read()):07d}"), ckpt
         a = setv(a, "--load", ckpt)
+        # a trained checkpoint holds its run's LR/WD schedule (15841612/13 died on Megatron's match assert); its critic
+        # checkpoint is gone, so the eval runs miles evalonly-critic (no actor/critic restored-rollout assert at
+        # --num-rollout 0; the shared miles-easyppo stays untouched for the running chains)
+        if "--override-opt_param-scheduler" not in a:
+            a.append("--override-opt_param-scheduler")
+        env = [e for e in env if not e.startswith("MILES_SRC=")] + [f"MILES_SRC={EVAL_MILES}"]
     a = setv(a, "--critic-load", f"{rdir}/ckpt_critic")
     a = setv(a, "--wandb-group", name)
     a = setv(a, "--wandb-run-id", name)
