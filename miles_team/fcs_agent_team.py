@@ -56,6 +56,13 @@ TEAM_INSTANCE = A.INSTANCE.replace(_LONE_ENV, _TEAM_ENV).replace(_LONE_SUBMIT, _
 assert _TEAM_ENV in TEAM_INSTANCE and _TEAM_SUBMIT in TEAM_INSTANCE
 
 
+def team_prompt(problem: str, name: str) -> str:
+    """The instance message of agent `name`: {name} and {n} are format fields of TEAM_INSTANCE like {problem} (a
+    .replace after .format never ran: .format raised KeyError 'name', job 15877957)."""
+    steps = f" You have at most {A.STEPS} steps." if A.STEPS > 0 else ""   # as fcs_agent: 0 = no step limit, none named
+    return TEAM_INSTANCE.format(problem=problem, timeout=A.TIMEOUT, steps=steps, name=name, n=N)
+
+
 def _git(work: str, *args, env: dict | None = None) -> subprocess.CompletedProcess:
     e = {"PATH": "/usr/bin:/bin", "LANG": "C", "HOME": work, "GIT_CONFIG_NOSYSTEM": "1", **(env or {})}
     return subprocess.run(["git", *args], cwd=work, env=e, capture_output=True, text=True, timeout=60)
@@ -101,9 +108,7 @@ class _Agent:
         self.name = f"agent{j + 1}"
         self.sess = Session(input, self.name, A.THINK, max_len=A.MAX_LEN)
         self.chat = [{"role": "system", "content": A.SYSTEM},
-                     {"role": "user", "content": TEAM_INSTANCE.format(problem=problem, timeout=A.TIMEOUT,
-                                                                     steps=A.STEPS).replace("{name}", self.name)
-                      .replace("{n}", str(N))}]
+                     {"role": "user", "content": team_prompt(problem, self.name)}]
         self.steps = self.fmt_run = self.fmt_total = self.timeouts = self.cut_n = 0
         self.done, self.exit, self.turns, self.segs = False, "", [], []
 
@@ -112,7 +117,7 @@ class _Agent:
 
     async def think(self):
         """One model turn: the command to run, or None (a format error, a limit, or a full context)."""
-        if self.steps >= A.STEPS:
+        if A.STEPS > 0 and self.steps >= A.STEPS:   # 0: no step limit (fcs_agent, user 2026-10-18)
             self.done, self.exit = True, "LimitsExceeded"; return None
         if self.gen() >= A.TOKENS:
             self.done, self.exit = True, "TokensExceeded"; return None

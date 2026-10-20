@@ -8,6 +8,11 @@ def check(c, what):
     print(("PASS " if c else "FAIL ") + what); ok &= bool(c)
 check("one of {n} agents" in T.TEAM_INSTANCE and "`echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`." in T.TEAM_INSTANCE
       and "&& cat solution.cpp" not in T.TEAM_INSTANCE, "team instance template")
+pr = T.team_prompt("Read n {and} print it.", "agent3")
+check("You are agent3, one of 4 agents" in pr and "Read n {and} print it." in pr and "{name}" not in pr
+      and "{n}" not in pr, "team prompt: name, team size and the problem text (braces kept) filled in")
+check(("You have at most %d steps." % A.STEPS in pr) if A.STEPS > 0 else ("You have at most" not in pr),
+      f"team prompt names the step limit only when there is one (MA_AG_STEPS={A.STEPS})")
 with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as w:
     T.repo_init(w)
     A.run_command("printf 'int main(){\\n  return 0;\\n}\\n' > solution.cpp && g++ -o solution solution.cpp", w)
