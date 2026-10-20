@@ -71,9 +71,19 @@ def team_prompt(problem: str, name: str) -> str:
     return TEAM_INSTANCE.format(problem=problem, timeout=A.TIMEOUT, steps=steps, name=name, n=N)
 
 
+# the harness's git runs outside the sandbox (review 2026-10-20): no global config, and no hooks or fsmonitor command that
+# an agent could have written into the repo's .git
+_GIT_SAFE = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
+MAX_COMMIT_BYTES = 1 << 20   # files the harness commits; a large .in/.txt stays uncommitted (git timeout, review 2026-10-20)
+
+
 def _git(work: str, *args, env: dict | None = None) -> subprocess.CompletedProcess:
-    e = {"PATH": "/usr/bin:/bin", "LANG": "C", "HOME": work, "GIT_CONFIG_NOSYSTEM": "1", **(env or {})}
-    return subprocess.run(["git", *args], cwd=work, env=e, capture_output=True, text=True, timeout=60)
+    e = {"PATH": "/usr/bin:/bin", "LANG": "C", "HOME": work, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+         **(env or {})}
+    try:
+        return subprocess.run(["git", *_GIT_SAFE, *args], cwd=work, env=e, capture_output=True, text=True, timeout=60)
+    except (subprocess.TimeoutExpired, OSError) as ex:   # an aborted episode is resubmitted; a crash would end the run
+        raise Aborted(f"harness git {args[:1]}: {type(ex).__name__}") from ex
 
 
 def repo_init(work: str) -> None:
@@ -89,7 +99,8 @@ def commit_as(work: str, name: str, step: int) -> None:
     who = {"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": f"{name}@team", "GIT_COMMITTER_NAME": name,
            "GIT_COMMITTER_EMAIL": f"{name}@team"}
     changed = _git(work, "ls-files", "-z", "--others", "--modified", "--deleted", "--exclude-standard").stdout
-    files = sorted({f for f in changed.split("\0") if f.endswith(SOURCES)})
+    files = sorted({f for f in changed.split("\0") if f.endswith(SOURCES)
+                    and not (os.path.isfile(os.path.join(work, f)) and os.path.getsize(os.path.join(work, f)) > MAX_COMMIT_BYTES)})
     if files:  # (a pathspec that matches nothing would fail the whole add)
         _git(work, "add", "-A", "--", *files, env=who)
         _git(work, "commit", "-q", "-m", f"{name} step {step}", env=who)
@@ -221,6 +232,8 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
             "fo_ag_compile_fail": float(res is not None and res["status"] == "compile error"),
             "fo_ag_no_code": float(res is None), "fo_ag_top_author": top, "fo_ag_authors": len(shares),
             "fo_tokens": sum(gens), "fo_latency": max(gens),
+            **{f"fo_ag_exit_{e}": sum(a.exit == e for a in agents) / N for e in   # shares of agents, as fcs_agent's keys
+               ("Submitted", "LimitsExceeded", "TokensExceeded", "ContextExceeded", "RepeatedFormatError")},
             "fo_judge_infra_error": float(bool(res and res["infra_error"]))}
     A._trace({"time": round(time.time(), 1), "eval": input.evaluation, "game": "agent_team", "label": label, "S": S, "R": R, "run_min": run_s / 60,
               "status": res["status"] if res else "no submission", "rounds": rounds, "order": order_log,
