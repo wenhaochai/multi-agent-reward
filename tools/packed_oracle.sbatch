@@ -27,11 +27,9 @@ task() {  # task NAME RECORD_RUN KIND LIMIT EMIT_DIR
   env "${E[@]}" MQB_CODE="$MQB_CODE" QTASK="$NT" bash "$PT" "$1" "$2" "$3" 8 "$4" -- bash "$MQB_CODE/sbatch_miles.sh" "${A[@]}"
 }
 task smoke - other 100m "$SMOKE_DIR" || { echo "[packed] smoke failed: no training"; exit 1; }
-# a fetched head (owner 2026-10-20: every job runs in a host) writes its ledger under the host's SLURM_JOB_ID, but its
-# segments gate on runs/<run>/smoke_job = its own job id (run_miles_in_container.sh): copy the smoke line there too
-if [[ -n ${FETCHED_JOB_ID:-} ]]; then
-  awk -F'\t' '$1 == "smoke"' "$PACKED_LEDGER_DIR/$SLURM_JOB_ID.tsv" | tail -1 >> "$PACKED_LEDGER_DIR/$FETCHED_JOB_ID.tsv"
-fi
+# a fetched head (owner 2026-10-20: every job runs in a host) gets its smoke ledger line under its own job id, where its
+# segments' smoke gate reads it: packed_task.sh writes ${FETCHED_JOB_ID:-$SLURM_JOB_ID}.tsv (controller, 2026-10-20). An
+# earlier copy from the host's file here died under set -e in a pilot host, which has no ledger file
 rc=0; task train "$(cat "$MAIN_DIR/run")" main "$(( ${JOB_WALL_S:-86400} - ($(date +%s) - T0) - 900 ))s" "$MAIN_DIR" || rc=$?
 # PACKED_STRICT=1 (a producer that afterok jobs wait on): end with the training task's status, before fetch_pending,
 # so a failed producer never releases its dependents and they do not wait for the host's leftover hours
