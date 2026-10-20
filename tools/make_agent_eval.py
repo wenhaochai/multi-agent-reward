@@ -7,7 +7,7 @@ mini-swe-agent, fcs_agent), changed to:
                finished runs' critics are deleted (owner 2026-10-18); it starts from the HF checkpoint (15794440)
   N episodes per problem (main; the smoke keeps 8 problems x 1), own run dir, W&B ids, trace dirs, MA_AG_STEPS=0 (user
   2026-10-18: no step limit; the agent run trains without one from rollout 21), runs/<run>/extra_env from the probe.
-  python3 tools/make_agent_eval.py NAME CKPT|sft N OUT_DIR
+  python3 tools/make_agent_eval.py NAME CKPT|sft N OUT_DIR [--module M] [KEY=VALUE ...]   (env set last)
   e.g. python3 tools/make_agent_eval.py fcs_evalonly_agentev4_sft sft 4 /scratch/.../tmp/agentic/ev4_sft"""
 import os
 import shutil
@@ -27,7 +27,7 @@ def setv(a, flag, *vals):
     return a
 
 
-def emit(part, name, ckpt, n, out):
+def emit(part, name, ckpt, n, out, module="fcs_agent", sets=()):
     src = f"{PROBE}/{part}"
     a = [x for x in open(f"{src}/args").read().split("\n") if x != ""]
     env = [x for x in open(f"{src}/env").read().split("\n") if x != ""]
@@ -51,6 +51,10 @@ def emit(part, name, ckpt, n, out):
         a = setv(a, "--n-samples-per-eval-prompt", str(n))
     env = [e for e in env if not e.startswith(("RUN_NAME=", "MA_AG_STEPS="))]
     env = [f"RUN_NAME={name}"] + env + ["MA_AG_STEPS=0"]
+    if module != "fcs_agent":   # e.g. fcs_agent_team: N agents in one shared repo (log functions are fcs_agent's)
+        a = setv(a, "--custom-generate-function-path", f"miles_team.{module}.generate")
+    keys = [kv.split("=", 1)[0] + "=" for kv in sets]
+    env = [e for e in env if not e.startswith(tuple(keys))] + list(sets)
     assert not any(old in x for x in a + env), "a probe path is left"
     os.makedirs(out, exist_ok=False)
     os.makedirs(rdir, exist_ok=True)
@@ -63,9 +67,12 @@ def emit(part, name, ckpt, n, out):
 
 if __name__ == "__main__":
     name, ckpt, n, out = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+    rest = sys.argv[5:]
+    module = rest[rest.index("--module") + 1] if "--module" in rest else "fcs_agent"
+    sets = [x for x in rest if "=" in x and x.split("=", 1)[0].isupper()]
     if os.path.exists(out):
         sys.exit(f"{out} exists: remove it by hand first")
     smoke = name.replace("fcs_evalonly_", "fcs_evalonly_smoke_", 1)
     assert smoke != name
-    emit("smoke", smoke, ckpt, 1, f"{out}/smoke")
-    emit("main", name, ckpt, n, f"{out}/main")
+    emit("smoke", smoke, ckpt, 1, f"{out}/smoke", module, sets)
+    emit("main", name, ckpt, n, f"{out}/main", module, sets)
