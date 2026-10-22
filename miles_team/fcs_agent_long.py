@@ -125,10 +125,11 @@ def trim_chat(chat: list, keep_chars: int, dropped: int) -> tuple[list, int]:
     """Drop the oldest (assistant, user) pairs after [system, instance] until the history fits keep_chars; the
     instance message then says how many steps were removed. Returns (chat, total dropped)."""
     head, hist = chat[:2], chat[2:]
-    size = sum(len(m["content"]) for m in hist)
+    n = [len(m["content"]) + len(m.get("reasoning_content") or "") for m in hist]   # reasoning kept in history (Flint)
+    size = sum(n)
     k = 0
     while size > keep_chars and len(hist) - 2 * k > 2:
-        size -= len(hist[2 * k]["content"]) + len(hist[2 * k + 1]["content"])
+        size -= n[2 * k] + n[2 * k + 1]
         k += 1
     if not k:
         return chat, dropped
