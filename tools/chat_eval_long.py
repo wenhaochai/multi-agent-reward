@@ -51,30 +51,33 @@ TOOLCALL = not args.textbased
 # ---- mini-swe-agent 2.4.6 mini.yaml (the tool-calling config; Flint's SWE-Bench evals ran mini-swe-agent) ------------
 # Verbatim: the system template, the command execution rules and example response, the ```bash command examples, the
 # JSON observation template, the tool-call error and length templates, and BASH_TOOL. Ours: the task and workflow
-# (fcs_agent.INSTANCE's), and exactly ONE tool call per response (the game runs one action per agent per round).
-# The smoke test 15968124 showed why: in the text-based format Flint wrote its native tool-call syntax instead of the
-# mswea_bash_command block and lost turns to format errors.
-BASH_TOOL = {"type": "function", "function": {"name": "bash", "description": "Execute a bash command", "parameters": {
-    "type": "object", "properties": {"command": {"type": "string", "description": "The bash command to execute"}},
-    "required": ["command"]}}}
+# (fcs_agent.INSTANCE's). The smoke test 15968124 showed why: in the text-based format Flint wrote its native
+# tool-call syntax instead of the mswea_bash_command block and lost turns to format errors. We follow Flint's own
+# format (user 2026-10-22, "Flint自己爱用什么格式我们就适配他的"): the kit's tool parser and grammar turn its native
+# calls into OpenAI tool calls, "strict" makes the grammar hold the arguments to the schema, and a response may make
+# several calls, as mini.yaml and Flint's template allow. The game runs one action per round, so ChatSession hands the
+# extra calls out one per round without a model call, and to_api folds them back into the turn that made them.
+BASH_TOOL = {"type": "function", "function": {"name": "bash", "strict": True, "description": "Execute a bash command",
+    "parameters": {"type": "object", "properties": {"command": {"type": "string",
+    "description": "The bash command to execute"}}, "required": ["command"]}}}
 _TC_RULES = """## Important Rules
 
 You are operating in an environment where
 
-1. You issue one command
-2. The system executes the command in a subshell
-3. You see the result
-4. You write your next command
+1. You issue at least one command
+2. The system executes the command(s) in a subshell
+3. You see the result(s)
+4. You write your next command(s)
 
 Each response should include:
 
 1. **Reasoning text** where you explain your analysis and plan
-2. Exactly one tool call with your command
+2. At least one tool call with your command
 
 **CRITICAL REQUIREMENTS:**
 
 - Your response SHOULD include reasoning text explaining what you're doing
-- Your response MUST include EXACTLY ONE bash tool call
+- Your response MUST include AT LEAST ONE bash tool call
 - Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
 - However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load \
 environment variables from files
@@ -137,7 +140,7 @@ _TC_FORMAT_ERROR = """Tool call error:
 
 Here is general guidance on how to submit correct toolcalls:
 
-Every response needs to use the 'bash' tool exactly once to execute commands.
+Every response needs to use the 'bash' tool at least once to execute commands.
 
 Call the bash tool with your command as the argument:
 - Tool: bash
@@ -177,11 +180,18 @@ def _block(cmd: str) -> str:
 
 def to_api(messages: list) -> list:
     """The game's history (commands as mswea blocks in the assistant text, observations as user messages) as a
-    tool-calling chat: each block becomes a bash tool call and the next user message its tool result."""
-    out, pending = [], []
+    tool-calling chat: each block becomes a bash tool call and the next user message its tool result. A message marked
+    _cont holds a call that an earlier response made (ChatSession ran it a round later); it joins that response's
+    tool_calls when only its tool results lie between them, so the model sees the turn it wrote."""
+    out, pending, last = [], [], None   # last: the assistant message that only tool results have followed
     for m in messages:
         if m["role"] == "assistant":
             cmds = [c.strip() for c in A.ACTION_RE.findall(m["content"])]
+            if m.get("_cont") and last is not None and cmds:
+                pending = [f"call_{len(out)}_{j}" for j in range(len(cmds))]
+                last["tool_calls"] += [{"id": t, "type": "function", "function": {
+                    "name": "bash", "arguments": json.dumps({"command": c})}} for t, c in zip(pending, cmds)]
+                continue
             am = {"role": "assistant", "content": A.ACTION_RE.sub("", m["content"]).strip()}
             if m.get("reasoning_content"):
                 am["reasoning_content"] = m["reasoning_content"]
@@ -190,13 +200,16 @@ def to_api(messages: list) -> list:
                 am["tool_calls"] = [{"id": t, "type": "function", "function": {
                     "name": "bash", "arguments": json.dumps({"command": c})}} for t, c in zip(pending, cmds)]
             out.append(am)
-        elif m["role"] == "user" and pending:
+            last = am if cmds else None
+            continue
+        if m["role"] == "user" and pending:
             out.append({"role": "tool", "tool_call_id": pending[0], "content": m["content"]})
             out += [{"role": "tool", "tool_call_id": t, "content": "Not executed: one bash tool call per response."}
                     for t in pending[1:]]
             pending = []
         else:
             out.append(m)
+            last = None
     return out
 
 
@@ -210,9 +223,18 @@ class ChatSession:
         self.max_len = max_len or A.MAX_LEN
         self.segments, self.last_messages = [], None
         self.last_reasoning, self.fresh, self.used = "", False, 0   # used: prompt + completion tokens of the last call
+        self.queue, self.cont, self.n_cont = [], False, 0   # calls a response made beyond its first; cont: this turn
+        # handed one out; n_cont: how many since the last model call
 
     async def turn(self, messages: list, max_tokens: int) -> tuple[str, bool]:
-        est = self.used + sum(len(m["content"]) for m in messages[-1:]) // 3   # the new observation, ~3 chars/token
+        if self.queue:   # the next call of the last response: no model call, no tokens
+            self.cont, self.fresh, self.n_cont = True, False, self.n_cont + 1
+            block = _block(self.queue.pop(0))
+            return (f"<think></think>{block}" if self.think else block), False
+        # the messages since the last model call (its observation, then each handed-out call and its observation),
+        # ~3 chars/token
+        est = self.used + sum(len(m["content"]) for m in messages[-(1 + 2 * self.n_cont):]) // 3
+        self.cont, self.n_cont = False, 0
         room = self.max_len - est
         if room <= 256:
             return "", True
@@ -240,18 +262,22 @@ class ChatSession:
         ch, usage = out["choices"][0], out.get("usage") or {}
         msg = ch["message"]
         reasoning, content = msg.get("reasoning_content") or "", msg.get("content") or ""
-        for tc in msg.get("tool_calls") or []:   # each call becomes a block; a bad call is still an action
+        cmds = []
+        for tc in msg.get("tool_calls") or []:   # a bad call is still an action
             fn = tc.get("function") or {}
             try:
                 cmd = json.loads(fn.get("arguments") or "{}").get("command") if fn.get("name") == "bash" else None
             except (json.JSONDecodeError, AttributeError):
                 cmd = None
-            content += _block(cmd if isinstance(cmd, str) else "")
+            cmds.append(cmd if isinstance(cmd, str) else "")
+        cut = ch.get("finish_reason") == "length"
+        if cmds:   # the first call is this round's action; the rest wait for the next rounds (none from a cut turn)
+            content += _block(cmds[0])
+            self.queue = [] if cut else cmds[1:]
         n_out = int(usage.get("completion_tokens") or 0)
         self.used = int(usage.get("prompt_tokens") or 0) + n_out
         self.segments.append(SimpleNamespace(loss_mask=[1] * n_out))
         self.last_reasoning, self.fresh = reasoning, True
-        cut = ch.get("finish_reason") == "length"
         if self.think:
             text = f"<think>{reasoning}</think>{content}" if (content or not cut) else f"<think>{reasoning}"
         else:
@@ -277,6 +303,8 @@ class _Agent(L._Agent):
     def observe(self, cmd, out, rnd, order):
         super().observe(cmd, out, rnd, order)
         self._keep_reasoning()
+        if self.sess.cont and len(self.chat) >= 4 and self.chat[-2].get("role") == "assistant":
+            self.chat[-2] = {**self.chat[-2], "_cont": True}
 
 
 L.Session = ChatSession

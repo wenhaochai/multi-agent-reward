@@ -21,7 +21,7 @@ def check(c, what):
 
 
 pr = L.instance("Read n and print it.", "agent1")
-check("mswea_bash_command" not in pr and "EXACTLY ONE bash tool call" in pr and "```bash" in pr, "prompt: tool-call rules")
+check("mswea_bash_command" not in pr and "AT LEAST ONE bash tool call" in pr and "```bash" in pr, "prompt: tool-call rules")
 check("`submit` or `submit <file>`" in pr and pr.index("## Long work") < pr.index("## Important Rules"), "prompt: long-work tools")
 check("7. When you cannot improve" in pr and "Read n and print it." in pr, "prompt: workflow and problem")
 check(A.SYSTEM.startswith("You are a helpful assistant") and "format_example" not in A.SYSTEM, "system: mini.yaml")
@@ -40,5 +40,66 @@ check(api[4] == {"role": "assistant", "content": "no call", "reasoning_content":
       "history: a format error stays a user message")
 m = A.ACTION_RE.findall("x" + g["_block"]("submit"))
 check(m == ["submit"] and L.SUBMIT_RE.fullmatch(m[0].strip()), "response: tool call -> one action the game parses")
+check(g["BASH_TOOL"]["function"]["strict"] is True, "tool: strict, so Flint's grammar holds the arguments")
+
+# a response with two calls: the first runs now, the second a round later without a model call
+import asyncio
+from types import SimpleNamespace
+
+
+class _Resp:
+    def __init__(self, d):
+        self.d, self.status = d, 200
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    def raise_for_status(self):
+        pass
+
+    async def json(self):
+        return self.d
+
+
+calls = []
+
+
+class _Http:
+    def post(self, url, json):
+        calls.append(json)
+        tcs = [{"id": "x", "type": "function", "function": {"name": "bash", "arguments": '{"command": "%s"}' % c}}
+               for c in ("g++ a.cpp", "submit a.cpp")]
+        return _Resp({"choices": [{"message": {"reasoning_content": "R", "content": "plan", "tool_calls": tcs},
+                                   "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 100, "completion_tokens": 50}})
+
+
+g["_http"] = _Http()
+sess = g["ChatSession"](SimpleNamespace(evaluation=True), "a0", True, max_len=262144)
+hist = [{"role": "system", "content": "s"}, {"role": "user", "content": "inst"}]
+t1, c1 = asyncio.run(sess.turn(hist, 1000))
+check(A.ACTION_RE.findall(t1) == ["g++ a.cpp"] and t1.startswith("<think>R</think>plan") and not c1 and sess.queue == ["submit a.cpp"],
+      "turn 1: first call is the action, second queued")
+hist += [{"role": "assistant", "content": "plan" + g["_block"]("g++ a.cpp"), "reasoning_content": "R"},
+         {"role": "user", "content": '{"returncode": 0}'}]
+n_seg = len(sess.segments)
+t2, c2 = asyncio.run(sess.turn(hist, 1000))
+check(A.ACTION_RE.findall(t2) == ["submit a.cpp"] and len(calls) == 1 and len(sess.segments) == n_seg and sess.cont
+      and not sess.fresh, "turn 2: queued call, no model call, no tokens")
+hist += [{"role": "assistant", "content": g["_block"]("submit a.cpp"), "_cont": True},
+         {"role": "user", "content": '{"returncode": 0, "output": "provisional 61"}'}]
+api = g["to_api"](hist)
+check([m["role"] for m in api] == ["system", "user", "assistant", "tool", "tool"]
+      and [tc["function"]["arguments"] for tc in api[2]["tool_calls"]] == [json.dumps({"command": "g++ a.cpp"}),
+                                                                         json.dumps({"command": "submit a.cpp"})]
+      and [m["tool_call_id"] for m in api[3:]] == [tc["id"] for tc in api[2]["tool_calls"]]
+      and all("_cont" not in m for m in api), "history: the queued call folds back into the turn that made it")
+asyncio.run(sess.turn(hist, 1000))
+check(len(calls) == 2 and sess.n_cont == 0 and not sess.cont, "turn 3: back to the model")
+# a _cont message after a trimmed parent stands alone
+api = g["to_api"]([{"role": "user", "content": "[trimmed]"}, hist[-2], hist[-1]])
+check(api[1]["role"] == "assistant" and len(api[1]["tool_calls"]) == 1 and api[2]["role"] == "tool", "history: orphan _cont")
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)
