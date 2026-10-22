@@ -21,7 +21,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--base-url", required=True)
+ap.add_argument("--base-url", required=True, help="one URL, or several comma-separated (one per server replica)")
 ap.add_argument("--model", required=True)
 ap.add_argument("--data", required=True)
 ap.add_argument("--out", required=True)
@@ -46,6 +46,8 @@ from miles_team import fcs_agent_long as L  # noqa: E402
 from miles_team.team_rollout import Aborted  # noqa: E402
 
 _http: aiohttp.ClientSession | None = None
+URLS = [u.strip().rstrip("/") for u in args.base_url.split(",") if u.strip()]
+_active = {u: 0 for u in URLS}   # episodes running per server; a new episode takes the least busy one
 TOOLCALL = not args.textbased
 
 # ---- mini-swe-agent 2.4.6 mini.yaml (the tool-calling config; Flint's SWE-Bench evals ran mini-swe-agent) ------------
@@ -246,7 +248,7 @@ class ChatSession:
         out = None
         for attempt in range(4):
             try:
-                async with _http.post(f"{args.base_url}/v1/chat/completions", json=body) as r:
+                async with _http.post(f"{getattr(self.input, 'base_url', URLS[0])}/v1/chat/completions", json=body) as r:
                     if r.status == 400:
                         err = await r.text()
                         if "context" in err.lower() or "length" in err.lower():
@@ -329,7 +331,9 @@ async def main():
     async def one(i, e, r):
         async with sem:
             t0 = time.time()
-            inp = SimpleNamespace(evaluation=True, sampling_params={},
+            url = min(URLS, key=_active.get)
+            _active[url] += 1
+            inp = SimpleNamespace(evaluation=True, sampling_params={}, base_url=url,
                                   sample=SimpleNamespace(index=i, group_index=e, label=r["label"], metadata=r["metadata"]))
             rec = {"pid": r["metadata"]["pid"], "episode": e, "model": args.model}
             try:
@@ -337,6 +341,8 @@ async def main():
                 rec.update(S=S, info=info)
             except Aborted as ex:
                 rec.update(S=None, aborted=str(ex))
+            finally:
+                _active[url] -= 1
             rec["minutes"] = round((time.time() - t0) / 60, 1)
             with open(res_path, "a") as f:
                 f.write(json.dumps(rec) + "\n")
