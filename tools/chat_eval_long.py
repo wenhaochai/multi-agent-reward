@@ -32,6 +32,7 @@ ap.add_argument("--temperature", type=float, default=1.0)
 ap.add_argument("--top-p", type=float, default=0.95)
 ap.add_argument("--top-k", type=int, default=20)
 ap.add_argument("--request-timeout", type=float, default=3600)
+ap.add_argument("--textbased", action="store_true", help="mini_textbased.yaml format instead of tool calls")
 args = ap.parse_args()
 OUT = Path(args.out)
 OUT.mkdir(parents=True, exist_ok=True)
@@ -45,6 +46,158 @@ from miles_team import fcs_agent_long as L  # noqa: E402
 from miles_team.team_rollout import Aborted  # noqa: E402
 
 _http: aiohttp.ClientSession | None = None
+TOOLCALL = not args.textbased
+
+# ---- mini-swe-agent 2.4.6 mini.yaml (the tool-calling config; Flint's SWE-Bench evals ran mini-swe-agent) ------------
+# Verbatim: the system template, the command execution rules and example response, the ```bash command examples, the
+# JSON observation template, the tool-call error and length templates, and BASH_TOOL. Ours: the task and workflow
+# (fcs_agent.INSTANCE's), and exactly ONE tool call per response (the game runs one action per agent per round).
+# The smoke test 15968124 showed why: in the text-based format Flint wrote its native tool-call syntax instead of the
+# mswea_bash_command block and lost turns to format errors.
+BASH_TOOL = {"type": "function", "function": {"name": "bash", "description": "Execute a bash command", "parameters": {
+    "type": "object", "properties": {"command": {"type": "string", "description": "The bash command to execute"}},
+    "required": ["command"]}}}
+_TC_RULES = """## Important Rules
+
+You are operating in an environment where
+
+1. You issue one command
+2. The system executes the command in a subshell
+3. You see the result
+4. You write your next command
+
+Each response should include:
+
+1. **Reasoning text** where you explain your analysis and plan
+2. Exactly one tool call with your command
+
+**CRITICAL REQUIREMENTS:**
+
+- Your response SHOULD include reasoning text explaining what you're doing
+- Your response MUST include EXACTLY ONE bash tool call
+- Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
+- However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load \
+environment variables from files
+- Each command may run for at most {timeout} seconds.{steps}
+
+Example of a CORRECT response:
+<example_response>
+I need to understand the structure of the repository first. Let me check what files are in the current directory to \
+get a better understanding of the codebase.
+
+[Makes bash tool call with {{"command": "ls -la"}} as arguments]
+</example_response>
+
+## Useful command examples
+
+### Create a new file:
+
+```bash
+cat <<'EOF' > newfile.py
+import numpy as np
+hello = "world"
+print(hello)
+EOF
+```
+
+### Edit files with sed:
+
+```bash
+# Replace all occurrences
+sed -i 's/old_string/new_string/g' filename.py
+
+# Replace only first occurrence
+sed -i 's/old_string/new_string/' filename.py
+
+# Replace first occurrence on line 1
+sed -i '1s/old_string/new_string/' filename.py
+
+# Replace all occurrences in lines 1-10
+sed -i '1,10s/old_string/new_string/g' filename.py
+```
+
+### View file content:
+
+```bash
+# View specific lines with numbers
+nl -ba filename.py | sed -n '10,20p'
+```
+
+### Any other command you want to run
+
+```bash
+anything
+```
+"""
+_TC_FORMAT_ERROR = """Tool call error:
+
+<error>
+{error}
+</error>
+
+Here is general guidance on how to submit correct toolcalls:
+
+Every response needs to use the 'bash' tool exactly once to execute commands.
+
+Call the bash tool with your command as the argument:
+- Tool: bash
+- Arguments: {{"command": "your_command_here"}}
+
+If you want to end the task, please issue the following command: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
+without any other command."""
+_TC_LENGTH_ERROR = ("Your previous response reached the output token limit (finish_reason=length) before you produced "
+                    "a tool call, so it was cut off. Respond more concisely and finish with exactly one bash tool call. "
+                    "If you need to think more, do so briefly.")
+
+
+def _tc_observation(out: dict) -> str:
+    """mini.yaml's observation template: JSON with the return code and the output (head and tail when long)."""
+    o = out["output"]
+    if len(o) < A.OUT_CHARS:
+        d = {"returncode": out["returncode"], "output": o}
+    else:
+        d = {"returncode": out["returncode"], "output_head": o[:5000], "output_tail": o[-5000:],
+             "elided_chars": len(o) - 10000, "warning": "Output too long."}
+    if out.get("exception_info"):
+        d["exception_info"] = out["exception_info"]
+    return json.dumps(d, indent=2, ensure_ascii=False)
+
+
+if TOOLCALL:
+    A.INSTANCE = A.INSTANCE[: A.INSTANCE.index("## Important Rules")] + _TC_RULES
+    A.SYSTEM = "You are a helpful assistant that can interact with a computer.\n"
+    A.FORMAT_ERROR, A.LENGTH_ERROR, A.observation = _TC_FORMAT_ERROR, _TC_LENGTH_ERROR, _tc_observation
+    L._FLAT = A.INSTANCE.replace("\\\n", "")
+    assert L._LONE_ENV in L._FLAT and L._LONE_SUBMIT in L._FLAT
+
+
+def _block(cmd: str) -> str:
+    return f"\n\n```mswea_bash_command\n{cmd}\n```"
+
+
+def to_api(messages: list) -> list:
+    """The game's history (commands as mswea blocks in the assistant text, observations as user messages) as a
+    tool-calling chat: each block becomes a bash tool call and the next user message its tool result."""
+    out, pending = [], []
+    for m in messages:
+        if m["role"] == "assistant":
+            cmds = [c.strip() for c in A.ACTION_RE.findall(m["content"])]
+            am = {"role": "assistant", "content": A.ACTION_RE.sub("", m["content"]).strip()}
+            if m.get("reasoning_content"):
+                am["reasoning_content"] = m["reasoning_content"]
+            if cmds:
+                pending = [f"call_{len(out)}_{j}" for j in range(len(cmds))]
+                am["tool_calls"] = [{"id": t, "type": "function", "function": {
+                    "name": "bash", "arguments": json.dumps({"command": c})}} for t, c in zip(pending, cmds)]
+            out.append(am)
+        elif m["role"] == "user" and pending:
+            out.append({"role": "tool", "tool_call_id": pending[0], "content": m["content"]})
+            out += [{"role": "tool", "tool_call_id": t, "content": "Not executed: one bash tool call per response."}
+                    for t in pending[1:]]
+            pending = []
+        else:
+            out.append(m)
+    return out
 
 
 class ChatSession:
@@ -63,8 +216,11 @@ class ChatSession:
         room = self.max_len - est
         if room <= 256:
             return "", True
-        body = {"model": args.model, "messages": messages, "max_tokens": min(max_tokens, room),
-                "temperature": args.temperature, "top_p": args.top_p, "top_k": args.top_k}
+        body = {"model": args.model, "messages": to_api(messages) if TOOLCALL else messages,
+                "max_tokens": min(max_tokens, room), "temperature": args.temperature, "top_p": args.top_p,
+                "top_k": args.top_k}
+        if TOOLCALL:
+            body["tools"] = [BASH_TOOL]
         out = None
         for attempt in range(4):
             try:
@@ -84,6 +240,13 @@ class ChatSession:
         ch, usage = out["choices"][0], out.get("usage") or {}
         msg = ch["message"]
         reasoning, content = msg.get("reasoning_content") or "", msg.get("content") or ""
+        for tc in msg.get("tool_calls") or []:   # each call becomes a block; a bad call is still an action
+            fn = tc.get("function") or {}
+            try:
+                cmd = json.loads(fn.get("arguments") or "{}").get("command") if fn.get("name") == "bash" else None
+            except (json.JSONDecodeError, AttributeError):
+                cmd = None
+            content += _block(cmd if isinstance(cmd, str) else "")
         n_out = int(usage.get("completion_tokens") or 0)
         self.used = int(usage.get("prompt_tokens") or 0) + n_out
         self.segments.append(SimpleNamespace(loss_mask=[1] * n_out))
