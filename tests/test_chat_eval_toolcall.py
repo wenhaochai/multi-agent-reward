@@ -23,7 +23,7 @@ def check(c, what):
 pr = L.instance("Read n and print it.", "agent1")
 check("mswea_bash_command" not in pr and "AT LEAST ONE bash tool call" in pr and "```bash" in pr, "prompt: tool-call rules")
 check("`submit` or `submit <file>`" in pr and pr.index("## Long work") < pr.index("## Important Rules"), "prompt: long-work tools")
-check("7. When you cannot improve" in pr and "Read n and print it." in pr, "prompt: workflow and problem")
+check("7. `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` also submits solution.cpp" in pr and "Read n and print it." in pr, "prompt: workflow and problem")
 check(A.SYSTEM.startswith("You are a helpful assistant") and "format_example" not in A.SYSTEM, "system: mini.yaml")
 obs = json.loads(A.observation({"output": "hi\n", "returncode": 0, "exception_info": ""}))
 check(obs == {"returncode": 0, "output": "hi\n"}, "observation: JSON")

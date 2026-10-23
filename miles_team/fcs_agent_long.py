@@ -11,7 +11,11 @@ What changes against fcs_agent_team (one submission, no feedback, no messages):
   post <message>  (the whole action) sends a message to every other agent. New messages and new submissions of the
                   others are shown at the top of each agent's next observation, so the agents keep talking without
                   having to poll files; BOARD.md keeps the whole log.
-  the end         an agent stops when it runs `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`, uses up MA_LG_TOKENS
+  finish          `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` (mini-swe-agent's submit, which Flint uses to submit: smoke
+                  w69 had it say "Let me submit" and run it, 0 submits in 4 episodes) submits solution.cpp as `submit`
+                  does and the agent goes on; when solution.cpp has not changed since its last submission it ends the
+                  agent's work.
+  the end         an agent stops when it runs the finish command on an unchanged solution.cpp, uses up MA_LG_TOKENS
                   generated tokens, or makes three format errors in a row. When every agent has stopped, the submission
                   with the highest provisional score (the earliest on a tie) is the team's answer, and its FINAL score
                   (the mean over the odd-numbered cases, never shown to the agents) is the episode's score. A problem
@@ -76,19 +80,22 @@ _TOOLS = """
 ## Long work, submissions and messages
 
 You have a budget of about {budget} generated tokens, and you should use it: keep improving your program for as long \
-as you can make it better. Two commands are provided by the harness; each must be the whole action, alone:
+as you can make it better. Three commands are provided by the harness; each must be the whole action, alone:
 
 - `submit` or `submit <file>`: judges the file (default solution.cpp) right away and shows its PROVISIONAL score \
 (0-100): the mean over half of the hidden tests, with the score of each of those tests and any compiler errors. You \
 may submit as often as you like.{team_submit}
 - `post <message>`: {post_text}
+- `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`: submits solution.cpp, as `submit` does, and your work goes on. Run \
+it on a solution.cpp that has not changed since your last submission to end your work.
 
 When {when_end}, the submission with the highest provisional score is judged on the OTHER half of the hidden tests; \
 that final score is the result. Older steps of this conversation are removed when it gets long, so keep what you need \
 to remember in a notes file and re-read it; SCORES.md lists every submission and its provisional score."""
 _STEP6 = ("6. Submit with `submit` whenever you have something better, read the provisional score, and keep "
-          "improving.\n7. When you cannot improve any more, finish your work with `echo "
-          "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`. This ends only your own work and submits nothing by itself.")
+          "improving.\n7. `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` also submits solution.cpp and shows its "
+          "provisional score; your work then goes on, so keep improving and run it again. Run it on a solution.cpp "
+          "that has not changed since your last submission to end your work.")
 
 
 def instance(problem: str, name: str) -> str:
@@ -152,6 +159,7 @@ class _Agent(T._Agent):
         self.done, self.exit, self.turns, self.segs = False, "", [], []
         self.generated, self.dropped, self.seen, self.last_seg = 0, 0, 0, None
         self.n_submit = self.n_post = 0
+        self.last_sha = None   # sha of solution.cpp at this agent's last submission of it
 
     def gen(self) -> int:
         return self.generated
@@ -196,7 +204,7 @@ class _Agent(T._Agent):
 
     def observe(self, cmd: str, out: dict, rnd: int, order: int) -> None:
         T._Agent.observe(self, cmd, out, rnd, order)
-        if self.exit == "Submitted":   # the finish command: the agent's own work ends; it submitted nothing by it
+        if self.exit == "Submitted":   # the finish command on an unchanged solution.cpp (episode's finish()) ends it
             self.exit = "Finished"
 
 
@@ -240,6 +248,8 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
              "sha": hashlib.sha1(code.encode()).hexdigest()[:12], "code": code}
         subs.append(s)
         a.n_submit += 1
+        if p == os.path.realpath(os.path.join(work, "solution.cpp")):
+            a.last_sha = s["sha"]
         events.append((rounds, a.name, f"submitted {path}: {res['status']}, provisional {100 * prov:.2f}"))
         best = max(subs, key=lambda x: (x["prov"], -subs.index(x)))
         per = ", ".join(f"{100 * cases[i]:.0f}" for i in prov_idx if i < len(cases))
@@ -249,6 +259,23 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
         if res["status"] == "compile error" and res.get("msg"):
             msg += "Compiler output:\n" + res["msg"][:3000] + "\n"
         return {"output": msg, "returncode": 0, "exception_info": ""}
+
+    async def finish(a, out: dict) -> dict:
+        """The finish command: submit solution.cpp and go on, or (unchanged since a.last_sha) pass `out` on to end."""
+        p = os.path.join(work, "solution.cpp")
+        if not os.path.isfile(p):
+            return {**out, "output": "Finish command received, but there is no solution.cpp to submit. Write "
+                                     "solution.cpp and run the command again.\n"}
+        with open(p, "rb") as f:
+            sha = hashlib.sha1(f.read(MAX_FILE + 1).decode("utf-8", errors="replace").encode()).hexdigest()[:12]
+        if sha == a.last_sha:
+            return out
+        res = await do_submit(a, "solution.cpp")
+        left = max(0, TOKENS - a.generated)
+        return {**res, "output": "Finish command received: solution.cpp was submitted.\n" + res["output"]
+                + f"Your work goes on: about {left:,} of your {TOKENS:,} tokens are left. Keep improving solution.cpp "
+                  "and run the command again to submit again; running it while solution.cpp is unchanged since your "
+                  "last submission ends your work.\n"}
 
     def do_post(a, text: str) -> dict:
         text = text.strip().strip("'\"")[:MAX_POST]
@@ -284,6 +311,9 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
                 else:
                     out = await loop.run_in_executor(A._POOL, A.run_command, cmd, work, True)
                     secs = out["seconds"]
+                    lines = out["output"].lstrip().splitlines()
+                    if lines and lines[0].strip() == A.MARK and out["returncode"] == 0:
+                        out = {**await finish(a, out), "seconds": secs}
                 run_s += secs
                 await loop.run_in_executor(A._POOL, write_logs)
                 await loop.run_in_executor(A._POOL, T.commit_as, work, a.name, a.steps)
