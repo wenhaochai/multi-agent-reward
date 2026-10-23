@@ -9,11 +9,16 @@ import os
 import struct
 import subprocess
 import time
+from pathlib import Path
 
 from . import fcs_judge as J
 
 TIMEOUT = int(os.environ.get("MA_AG_TIMEOUT", "60"))
 CMD_MEM = 4 << 30            # address space of a command and its children (g++ -O2 of a large file fits)
+# Stub `submit` and `post` executables for the long-horizon game. The harness handles both only as the whole action
+# (fcs_agent_long.SUBMIT_RE); Flint first looked them up with `which submit`, found nothing, and never submitted
+# (smoke 16024925: 4 episodes, 0 submits). The stubs make the lookup succeed and say how to call them.
+HARNESS_BIN = str(Path(__file__).resolve().parent / "harness_bin")
 
 
 # ---- the sandbox: the judge's Landlock rules for the compiler, plus no TCP --------------------------------------------
@@ -47,8 +52,10 @@ def _restrict_net(rules):
         os.close(rs)
 
 
-def _preexec(work: str, nproc: int):
+def _preexec(work: str, nproc: int, harness: bool = False):
     rules = J._compile_sandbox(J.Path(work))
+    if rules is not None and harness:
+        rules = rules + J._landlock_rules([(HARNESS_BIN, J._FS_RX)])
 
     def f():
         import resource
@@ -63,26 +70,26 @@ def _preexec(work: str, nproc: int):
     return f
 
 
-def run_command(command: str, work: str) -> dict:
+def run_command(command: str, work: str, harness: bool = False) -> dict:
     """One action in the episode's work dir (blocking; run in fcs_agent's _POOL). mini-swe-agent's output dict, plus
-    "seconds", the command's wall time (the run time that the reward charges)."""
-    return J._in_proc(_timed, command, work)
+    "seconds", the command's wall time (the run time that the reward charges). harness: HARNESS_BIN first on PATH."""
+    return J._in_proc(_timed, command, work, harness)
 
 
-def _timed(command: str, work: str) -> dict:
+def _timed(command: str, work: str, harness: bool = False) -> dict:
     t0 = time.monotonic()
-    out = _run_command(command, work)
+    out = _run_command(command, work, harness)
     out["seconds"] = time.monotonic() - t0
     return out
 
 
-def _run_command(command: str, work: str) -> dict:
-    env = {"PATH": "/usr/bin:/bin", "LANG": "C", "HOME": work, "TMPDIR": work, "PAGER": "cat", "MANPAGER": "cat",
+def _run_command(command: str, work: str, harness: bool = False) -> dict:
+    env = {"PATH": (HARNESS_BIN + ":" if harness else "") + "/usr/bin:/bin", "LANG": "C", "HOME": work, "TMPDIR": work, "PAGER": "cat", "MANPAGER": "cat",
            "LESS": "-R", "PIP_PROGRESS_BAR": "off", "TQDM_DISABLE": "1"}
     try:
         p = subprocess.Popen(["bash", "-c", command], cwd=work, env=env, stdin=subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             preexec_fn=_preexec(work, J._nproc_limit()))
+                             preexec_fn=_preexec(work, J._nproc_limit(), harness))
     except Exception as e:
         return {"output": "", "returncode": -1, "exception_info": f"An error occurred while executing the command: {e}"}
     try:

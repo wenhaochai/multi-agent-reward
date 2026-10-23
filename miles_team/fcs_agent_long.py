@@ -282,7 +282,7 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
                 elif m_post:
                     out, secs = do_post(a, m_post.group(1)), 0.0
                 else:
-                    out = await loop.run_in_executor(A._POOL, A.run_command, cmd, work)
+                    out = await loop.run_in_executor(A._POOL, A.run_command, cmd, work, True)
                     secs = out["seconds"]
                 run_s += secs
                 await loop.run_in_executor(A._POOL, write_logs)

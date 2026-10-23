@@ -1,0 +1,4 @@
+#!/bin/sh
+# `post` is run by the harness, not by this shell. Send exactly `post <message>` as your whole command, alone.
+echo "post: the harness runs this only as your whole command. Send exactly \`post <message>\`, alone, with nothing before or after it." >&2
+exit 2
