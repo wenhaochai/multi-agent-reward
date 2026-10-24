@@ -90,5 +90,34 @@ check("explicit submit counts as the last submission", len(judged) == 1 and a.ex
 a = run(["printf 'int main(){}\\n' > solution.cpp", "submit sol2.cpp", FIN])
 check("submit of another file does not", len(judged) == 1 and a.exit != "Finished" and "Your work goes on" in a.outs[2],
       (judged, a.exit, a.outs))
+# N = 2: agent2 posts in the round in which agent1 runs the finish command on an unchanged file; the team update
+# must not hide agent1's MARK, so agent1 ends (fcs_agent_long.episode's `ends`)
+L.N = 2
+
+
+class Pair(Scripted):
+    scripts = {}
+
+    async def think(self):
+        sc = Pair.scripts[self.name]
+        if not sc:
+            self.done, self.exit = True, "TokensExceeded"
+            return None
+        self.steps += 1
+        cmd = sc.pop(0)
+        self._pending = (cmd, {"step": self.steps, "text": cmd, "cut": False})
+        return cmd
+
+
+L._Agent = Pair
+Pair.scripts = {"agent1": ["printf 'int main(){}\\n' > solution.cpp", FIN, FIN, "true", "true"],
+                "agent2": ["post a", "post b", "post c", "post d", "true"]}
+judged.clear()
+inp = SimpleNamespace(sample=SimpleNamespace(index=0), evaluation=True)
+agents, S, info = asyncio.run(L.episode(inp, [{"role": "user", "content": "problem"}], LABEL))
+a1 = agents[0]
+check("N=2: finish on an unchanged file ends the agent despite a team update", a1.done and a1.exit == "Finished"
+      and a1.steps == 3, (a1.exit, a1.steps, a1.outs))
+L.N, L._Agent = 1, Scripted
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)

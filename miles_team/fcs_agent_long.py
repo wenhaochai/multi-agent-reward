@@ -341,6 +341,7 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
             rng.shuffle(todo)
             for k, (a, cmd) in enumerate(todo):
                 m_sub, m_post = SUBMIT_RE.fullmatch(cmd), POST_RE.fullmatch(cmd)
+                ends = False   # the finish command on an unchanged solution.cpp: finish() passes `out` on to end it
                 if m_sub:
                     out, secs = await do_submit(a, m_sub.group(1) or "solution.cpp"), 0.0
                 elif m_post:
@@ -350,12 +351,14 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
                     secs = out["seconds"]
                     lines = out["output"].lstrip().splitlines()
                     if lines and lines[0].strip() == A.MARK and out["returncode"] == 0:
-                        out = {**await finish(a, out), "seconds": secs}
+                        res = await finish(a, out)
+                        ends = res is out
+                        out = {**res, "seconds": secs}
                 run_s += secs
                 await loop.run_in_executor(A._POOL, write_logs)
                 await loop.run_in_executor(A._POOL, T.commit_as, work, a.name, a.steps)
                 upd = updates_for(a)
-                if upd:
+                if upd and not ends:   # an ending observation keeps the MARK as its first line
                     out = {**out, "output": upd + out["output"]}
                 a.observe(cmd, out, rounds, k)
         best = max(subs, key=lambda x: (x["prov"], -subs.index(x))) if subs else None
