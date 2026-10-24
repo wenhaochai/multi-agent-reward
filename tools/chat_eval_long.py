@@ -244,6 +244,25 @@ def _block(cmd: str) -> str:
     return f"\n\n```mswea_bash_command\n{cmd}\n```"
 
 
+def _calls(m: dict) -> tuple[str, list]:
+    """(text, tool-call functions) of an assistant message. A message from a tool call keeps the command (_cmds) and
+    the function Flint sent (_fn): the block re-parsed would end at the first line of the command that starts with ```
+    (a heredoc of Markdown), so the model would see a command it did not write. Arguments that are not a JSON object
+    are re-encoded, so the server's chat template always parses them. Other messages (format errors, text mode): the
+    blocks."""
+    if "_cmds" in m:
+        fn = m.get("_fn") or {}
+        try:
+            good = isinstance(json.loads(fn.get("arguments")), dict)
+        except (TypeError, ValueError):
+            good = False
+        return m["content"].split("```mswea_bash_command")[0].strip(), [
+            {"name": fn.get("name") or "bash", "arguments": fn["arguments"]} if good
+            else {"name": "bash", "arguments": json.dumps({"command": c})} for c in m["_cmds"]]
+    return A.ACTION_RE.sub("", m["content"]).strip(), [
+        {"name": "bash", "arguments": json.dumps({"command": c.strip()})} for c in A.ACTION_RE.findall(m["content"])]
+
+
 def to_api(messages: list) -> list:
     """The game's history (commands as mswea blocks in the assistant text, observations as user messages) as a
     tool-calling chat: each block becomes a bash tool call and the next user message its tool result. A message marked
@@ -252,21 +271,19 @@ def to_api(messages: list) -> list:
     out, pending, last = [], [], None   # last: the assistant message that only tool results have followed
     for m in messages:
         if m["role"] == "assistant":
-            cmds = [c.strip() for c in A.ACTION_RE.findall(m["content"])]
-            if m.get("_cont") and last is not None and cmds:
-                pending = [f"call_{len(out)}_{j}" for j in range(len(cmds))]
-                last["tool_calls"] += [{"id": t, "type": "function", "function": {
-                    "name": "bash", "arguments": json.dumps({"command": c})}} for t, c in zip(pending, cmds)]
+            text, fns = _calls(m)
+            if m.get("_cont") and last is not None and fns:
+                pending = [f"call_{len(out)}_{j}" for j in range(len(fns))]
+                last["tool_calls"] += [{"id": t, "type": "function", "function": f} for t, f in zip(pending, fns)]
                 continue
-            am = {"role": "assistant", "content": A.ACTION_RE.sub("", m["content"]).strip()}
+            am = {"role": "assistant", "content": text}
             if m.get("reasoning_content"):
                 am["reasoning_content"] = m["reasoning_content"]
-            if cmds:
-                pending = [f"call_{len(out)}_{j}" for j in range(len(cmds))]
-                am["tool_calls"] = [{"id": t, "type": "function", "function": {
-                    "name": "bash", "arguments": json.dumps({"command": c})}} for t, c in zip(pending, cmds)]
+            if fns:
+                pending = [f"call_{len(out)}_{j}" for j in range(len(fns))]
+                am["tool_calls"] = [{"id": t, "type": "function", "function": f} for t, f in zip(pending, fns)]
             out.append(am)
-            last = am if cmds else None
+            last = am if fns else None
             continue
         if m["role"] == "user" and pending:
             out.append({"role": "tool", "tool_call_id": pending[0], "content": m["content"]})
@@ -292,12 +309,14 @@ class ChatSession:
         self.queue, self.cont, self.n_cont = [], False, 0   # calls a response made beyond its first; cont: this turn
         # handed one out; n_cont: how many since the last model call
         self.last_call = None   # the last turn's model call: server, latency, tries, tokens, cached tokens (None: no call)
+        self.last_tc = None   # the last turn's tool call (command, function as sent); None for a turn without one
 
     async def turn(self, messages: list, max_tokens: int) -> tuple[str, bool]:
-        self.last_call = None
+        self.last_call = self.last_tc = None
         if self.queue:   # the next call of the last response: no model call, no tokens
             self.cont, self.fresh, self.n_cont = True, False, self.n_cont + 1
-            block = _block(self.queue.pop(0))
+            self.last_tc = self.queue.pop(0)
+            block = _block(self.last_tc[0])
             return (f"<think></think>{block}" if self.think else block), False
         # the messages since the last model call (its observation, then each handed-out call and its observation),
         # ~3 chars/token
@@ -350,18 +369,20 @@ class ChatSession:
         ch, usage = out["choices"][0], out.get("usage") or {}
         msg = ch["message"]
         reasoning, content = msg.get("reasoning_content") or "", msg.get("content") or ""
-        cmds = []
+        calls = []
         for tc in msg.get("tool_calls") or []:   # a bad call is still an action
             fn = tc.get("function") or {}
             try:
                 cmd = json.loads(fn.get("arguments") or "{}").get("command") if fn.get("name") == "bash" else None
-            except (json.JSONDecodeError, AttributeError):
+            except (json.JSONDecodeError, AttributeError, TypeError):
                 cmd = None
-            cmds.append(cmd if isinstance(cmd, str) else "")
+            calls.append((cmd if isinstance(cmd, str) else "",
+                          {"name": fn.get("name") or "bash", "arguments": fn.get("arguments") or "{}"}))
         cut = ch.get("finish_reason") == "length"
-        if cmds:   # the first call is this round's action; the rest wait for the next rounds (none from a cut turn)
-            content += _block(cmds[0])
-            self.queue = [] if cut else cmds[1:]
+        if calls:   # the first call is this round's action; the rest wait for the next rounds (none from a cut turn)
+            content += _block(calls[0][0])
+            self.last_tc = calls[0]
+            self.queue = [] if cut else calls[1:]
         n_out = int(usage.get("completion_tokens") or 0)
         # cached_tokens needs the servers' --enable-cache-report; None without it
         self.last_call = {"base_url": url, "latency_s": round(time.time() - t0, 2), "tries": tries,
@@ -388,8 +409,10 @@ class _Agent(L._Agent):
             self.sess.fresh = False
 
     async def think(self):
-        self.sess.last_call = None   # a turn that ends before the model call (token budget) leaves none
+        self.sess.last_call = self.sess.last_tc = None   # a turn that ends before the model call (token budget)
         cmd = await super().think()
+        if cmd is not None and TOOLCALL and self.sess.last_tc is not None:
+            cmd = self.sess.last_tc[0].strip()   # the whole command: the game's block regex stops at a line of ```
         st = self.sess.last_call   # this turn's model call goes on its record; a queued call (no model call) has none
         if st is not None and cmd is not None:
             self._pending[1]["usage"] = st   # observe() spreads it into self.turns
@@ -400,10 +423,14 @@ class _Agent(L._Agent):
         return cmd
 
     def observe(self, cmd, out, rnd, order):
+        n = len(self.chat)
         super().observe(cmd, out, rnd, order)
         self._keep_reasoning()
         if self.sess.cont and len(self.chat) >= 4 and self.chat[-2].get("role") == "assistant":
             self.chat[-2] = {**self.chat[-2], "_cont": True}
+        if TOOLCALL and self.sess.last_tc is not None and len(self.chat) == n + 2 \
+                and self.chat[-2].get("role") == "assistant":   # to_api sends the call as Flint made it
+            self.chat[-2] = {**self.chat[-2], "_cmds": [cmd], "_fn": self.sess.last_tc[1]}
 
 
 L.Session = ChatSession

@@ -14,9 +14,9 @@ A, L = g["A"], g["L"]
 ok = True
 
 
-def check(c, what):
+def check(c, what, detail=""):
     global ok
-    print(("PASS " if c else "FAIL ") + what)
+    print(("PASS " if c else "FAIL ") + what + ("" if c else f"  {detail}"))
     ok &= bool(c)
 
 
@@ -80,7 +80,7 @@ g["_http"] = _Http()
 sess = g["ChatSession"](SimpleNamespace(evaluation=True), "a0", True, max_len=262144)
 hist = [{"role": "system", "content": "s"}, {"role": "user", "content": "inst"}]
 t1, c1 = asyncio.run(sess.turn(hist, 1000))
-check(A.ACTION_RE.findall(t1) == ["g++ a.cpp"] and t1.startswith("<think>R</think>plan") and not c1 and sess.queue == ["submit a.cpp"],
+check(A.ACTION_RE.findall(t1) == ["g++ a.cpp"] and t1.startswith("<think>R</think>plan") and not c1 and [q[0] for q in sess.queue] == ["submit a.cpp"],
       "turn 1: first call is the action, second queued")
 hist += [{"role": "assistant", "content": "plan" + g["_block"]("g++ a.cpp"), "reasoning_content": "R"},
          {"role": "user", "content": '{"returncode": 0}'}]
@@ -127,5 +127,31 @@ for details, want in [({"cached_tokens": 96}, 96), (None, None)]:
     check(c1 == "ls" and u.get("cached_tokens") == want and u.get("prompt_tokens") == 120 and u.get("completion_tokens") == 30
           and u.get("base_url") == "http://x" and u.get("tries") == 1 and "latency_s" in u, f"usage on the turn record, cached {want}")
     check(c2 == "pwd" and "usage" not in ag.turns[1], "queued call: no usage")
+
+# a command with lines that start with ``` (a Markdown heredoc) comes back whole, and goes back to the model as sent
+CMD = "cat > notes.md <<'EOF'\n# plan\n```\nint x;\n```\nEOF\necho ok"
+RAW = '{"command":  ' + json.dumps(CMD) + '}'   # Flint's own spacing, kept byte for byte
+
+
+class _Http3:
+    def post(self, url, json):
+        tcs = [{"id": "x", "type": "function", "function": {"name": "bash", "arguments": a}} for a in (RAW, RAW, "{bad")]
+        return _Resp({"choices": [{"message": {"content": "plan", "tool_calls": tcs}, "finish_reason": "tool_calls"}],
+                      "usage": {"prompt_tokens": 10, "completion_tokens": 5}})
+
+
+g["_http"] = _Http3()
+ag = g["_Agent"](SimpleNamespace(evaluation=True, base_url="http://x"), 0, "Read n.")
+cmds = []
+for rnd in (1, 2, 3):
+    c = asyncio.run(ag.think())
+    cmds.append(c)
+    ag.observe(c, OUT0, rnd, 0)
+check(cmds[:2] == [CMD, CMD], "heredoc with ``` lines: whole command from think (first and queued call)", cmds)
+api = g["to_api"](ag.chat)
+am = [m for m in api if m["role"] == "assistant"]
+fns = [tc["function"] for tc in am[0]["tool_calls"]]
+check(len(am) == 1 and am[0]["content"] == "plan" and [f["arguments"] for f in fns[:2]] == [RAW, RAW]
+      and json.loads(fns[2]["arguments"]) == {"command": ""}, "to_api: the arguments Flint sent; a bad one re-encoded", fns)
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)
