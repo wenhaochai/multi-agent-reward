@@ -2,6 +2,8 @@
 solution.cpp and the agent goes on; on an unchanged solution.cpp it ends the agent's work; with no solution.cpp it
 says so and goes on. Scripted agent, stubbed judge, real problem 0 for the case count."""
 import asyncio
+import glob
+import json
 import os
 import sys
 import tempfile
@@ -20,9 +22,13 @@ FIN = "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 judged = []
 
 
+SECRET = "wrong answer expected 4242, found 7"   # a checker line that quotes the expected output
+
+
 async def fake_judge(label, code):
     judged.append(code)
-    return {"cases": [0.5] * 10, "status": "ok", "infra_error": "", "msg": ""}
+    await asyncio.sleep(0.05)
+    return {"cases": [0.5] * 10, "status": "ok", "infra_error": "", "msg": "", "case_info": [SECRET] * 10}
 
 
 Base = L._Agent
@@ -71,7 +77,13 @@ def run(script):
     judged.clear()
     inp = SimpleNamespace(sample=SimpleNamespace(index=0), evaluation=True)
     agents, S, info = asyncio.run(L.episode(inp, [{"role": "user", "content": "problem"}], LABEL))
+    run.info = info
     return agents[0]
+
+
+def last_trace() -> dict:
+    lines = [l for f in glob.glob(os.path.join(os.environ["MA_AG_TRACE_DIR"], "*.jsonl")) for l in open(f)]
+    return json.loads(lines[-1])
 
 
 a = run([FIN, "printf 'int main(){}\\n' > solution.cpp", FIN, FIN])
@@ -90,5 +102,13 @@ check("explicit submit counts as the last submission", len(judged) == 1 and a.ex
 a = run(["printf 'int main(){}\\n' > solution.cpp", "submit sol2.cpp", FIN])
 check("submit of another file does not", len(judged) == 1 and a.exit != "Finished" and "Your work goes on" in a.outs[2],
       (judged, a.exit, a.outs))
+# judge time, every case and the judge's per-case lines reach the trace, never the agent (they would leak final tests)
+a = run(["printf 'int main(){}\\n' > solution.cpp", "submit"])
+sub = last_trace()["submissions"][0]
+check("trace has judge_s, cases, case_info", sub.get("judge_s", 0) >= 0.05 and sub.get("cases") == [0.5] * 10
+      and sub.get("case_info") == [SECRET] * 10, sub)
+check("agent never sees case_info", not any("4242" in o for o in a.outs), a.outs)
+check("fo_lg_judge_min in info", abs(run.info["fo_lg_judge_min"] - sub["judge_s"] / 60) < 1e-9, run.info)
+check("judge time is not command time", run.info["fo_ag_run_min"] * 60 < sub["judge_s"] + 5, run.info)
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)

@@ -239,13 +239,17 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
         if len(code) > MAX_FILE:
             return {"output": f"submit: {path} is larger than {MAX_FILE} bytes\n", "returncode": 1, "exception_info": ""}
         code = code.decode("utf-8", errors="replace")
+        t0 = time.monotonic()   # wall time, the wait for an FCS_RM_CONCURRENCY slot included
         res = await judge_code(label, code)
+        judge_s = time.monotonic() - t0
         cases = res["cases"]
         prov, final = subset_mean(cases, prov_idx), subset_mean(cases, final_idx)
         rev = (await loop.run_in_executor(A._POOL, lambda: T._git(work, "rev-parse", "HEAD").stdout.strip()))
         s = {"agent": a.name, "round": rounds, "step": a.steps, "file": path, "status": res["status"], "prov": prov,
              "final": final, "infra": bool(res["infra_error"]), "rev": rev,
-             "sha": hashlib.sha1(code.encode()).hexdigest()[:12], "code": code}
+             "sha": hashlib.sha1(code.encode()).hexdigest()[:12], "code": code, "judge_s": round(judge_s, 2),
+             # trace only: every case (final ones too) and the judge's per-case lines; never in the agent's view
+             "cases": [round(c, 4) for c in cases], "case_info": res.get("case_info", [])}
         subs.append(s)
         a.n_submit += 1
         if p == os.path.realpath(os.path.join(work, "solution.cpp")):
@@ -335,7 +339,8 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
             "fo_lg_posts": len(board), "fo_lg_tokens": sum(a.generated for a in agents) / N,
             "fo_tokens": sum(a.generated for a in agents), "fo_latency": max(a.generated for a in agents),
             "fo_ag_steps": sum(a.steps for a in agents) / N, "fo_ag_format_errors": sum(a.fmt_total for a in agents) / N,
-            "fo_ag_run_min": run_s / 60, "fo_ag_compile_fail": float(bool(best) and best["status"] == "compile error"),
+            "fo_ag_run_min": run_s / 60, "fo_lg_judge_min": sum(s["judge_s"] for s in subs) / 60,
+            "fo_ag_compile_fail": float(bool(best) and best["status"] == "compile error"),
             "fo_ag_no_code": float(best is None), "fo_ag_top_author": max(shares.values()) if shares else 0.0,
             **{f"fo_ag_exit_{e}": sum(a.exit == e for a in agents) / N for e in
                ("Finished", "TokensExceeded", "ContextExceeded", "RepeatedFormatError")},

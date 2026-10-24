@@ -348,6 +348,12 @@ r = judge_full(str(FCS_ROOT / "problems" / "0"), "#include <vector>\nint main(){
 shown = O.fmt_result(r)
 assert r["status"] == "compile error" and shown.count(" error: ") == 2 and "sol.cpp:2:" in shown and "^" in shown, shown
 print("[ok] compile errors in the feedback")
+# judge_full's case_info: the judge's per-case lines when cases ran, [] otherwise
+assert r["case_info"] == [] and judge_full(str(FCS_ROOT / "problems" / "0"), "")["case_info"] == []
+r = judge_full(str(FCS_ROOT / "problems" / "0"), "int main(){}\n")
+assert r["status"] == "done" and len(r["case_info"]) == len(r["cases"]) > 0, r
+assert all(isinstance(i, str) and len(i) <= 160 for i in r["case_info"]), r["case_info"]
+print("[ok] judge_full case_info")
 
 # 6) seq (shared): 5 rounds in one chat, each round sees its result, per-case scores and the best so far
 O.GAME = "seq"
