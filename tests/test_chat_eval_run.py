@@ -130,6 +130,9 @@ class _Http:
         posts.append(url)
         return _Resp(self.status, self.d)
 
+    def get(self, url, timeout=None):   # /health: the server is up, so the abort is this episode's alone
+        return _Resp(200, {})
+
 
 _sleep = asyncio.sleep
 

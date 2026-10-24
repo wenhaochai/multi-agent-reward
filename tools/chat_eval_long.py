@@ -57,6 +57,14 @@ from miles_team.team_rollout import Aborted  # noqa: E402
 _http: aiohttp.ClientSession | None = None
 URLS = [u.strip().rstrip("/") for u in args.base_url.split(",") if u.strip()]
 _active = {u: 0 for u in URLS}   # episodes running per server; a new episode takes the least busy one
+_last = {u: time.time() for u in URLS}   # the last request start or end on each server
+DOWN: set = set()   # servers that failed the retries and a /health probe: no request goes to them again in this run
+# An episode moves to another server (one cold prefill) when its server has 2 or more episodes more than the least
+# busy one, or when a server without episodes has had no request for IDLE_S seconds (the cluster mails at 30 min of
+# 0% GPU and cancels the whole host at 90) and the episode has stayed DWELL_S where it is. A lone episode then visits
+# every server at least every IDLE_S + (servers - 1) * DWELL_S + one turn (36 min with 4 servers).
+IDLE_S = float(os.environ.get("MA_CE_IDLE_S", 1200))
+DWELL_S = 300
 TOOLCALL = not args.textbased
 
 # ---- mini-swe-agent 2.4.6 mini.yaml (the tool-calling config; Flint's SWE-Bench evals ran mini-swe-agent) ------------
@@ -185,6 +193,41 @@ if TOOLCALL:
     assert L._LONE_ENV in L._FLAT and L._LONE_SUBMIT in L._FLAT
 
 
+def _route(inp) -> str:
+    """The server for an episode's next request; moves the episode (all its agents share `inp`) as above. No await
+    between the check and the update, so two episodes never interleave a move."""
+    cur = getattr(inp, "base_url", None)
+    if cur not in _active:   # a session made outside main() (tests)
+        return cur or URLS[0]
+    live = [u for u in URLS if u not in DOWN]
+    now, new = time.time(), None
+    if live:
+        low = min(live, key=_active.get)
+        if cur in DOWN or _active[cur] - _active[low] >= 2:
+            new = low
+        else:
+            idle = [u for u in live if u != cur and _active[u] == 0 and now - _last[u] > IDLE_S]
+            if idle and now - getattr(inp, "moved_at", 0) > DWELL_S:
+                new = min(idle, key=_last.get)
+    if new is not None and new != cur:
+        _active[cur] -= 1
+        _active[new] += 1
+        inp.base_url, inp.moved_at, inp.moves = new, now, getattr(inp, "moves", 0) + 1
+        s = getattr(inp, "sample", None)
+        print(f"[{(getattr(s, 'metadata', None) or {}).get('pid')} ep{getattr(s, 'group_index', '?')}] move {cur} -> "
+              f"{new} (active {_active})", flush=True)
+    _last[inp.base_url] = now
+    return inp.base_url
+
+
+async def _healthy(url: str) -> bool:
+    try:
+        async with _http.get(f"{url}/health", timeout=aiohttp.ClientTimeout(total=10)) as r:
+            return r.status == 200
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return False
+
+
 class _BadReply(Exception):
     """A 200 reply without a usable body: retried as a transport error."""
 
@@ -266,9 +309,9 @@ class ChatSession:
                 "top_k": args.top_k}
         if TOOLCALL:
             body["tools"] = [BASH_TOOL]
-        out = None
-        for attempt in range(4):
-            url = getattr(self.input, "base_url", URLS[0])
+        out, attempt = None, 0
+        while True:
+            url = _route(self.input)
             try:
                 async with _http.post(f"{url}/v1/chat/completions", json=body) as r:
                     if r.status == 400:
@@ -286,9 +329,21 @@ class ChatSession:
                         raise _BadReply(f"no choices: {str(out)[:300]}")
                 break
             except (aiohttp.ClientError, asyncio.TimeoutError, _BadReply) as e:
-                if attempt == 3:
-                    raise _HttpAborted(f"{self.name}: {e!r}", url)
-                await asyncio.sleep(10 * (attempt + 1))
+                attempt += 1
+                if attempt < 4:
+                    await asyncio.sleep(10 * attempt)
+                    continue
+                # ~60 s of failures: a server that also fails /health is down, and the episode goes on elsewhere
+                if url in _active and url not in DOWN and not await _healthy(url):
+                    DOWN.add(url)
+                    print(f"server {url} is down after {e!r}: no new episodes start in this run", flush=True)
+                if url in DOWN and any(u not in DOWN for u in URLS):
+                    attempt = 0
+                    continue
+                raise _HttpAborted(f"{self.name}: {e!r}", url)
+            finally:
+                if url in _last:   # a long decode does not look idle
+                    _last[url] = time.time()
         ch, usage = out["choices"][0], out.get("usage") or {}
         msg = ch["message"]
         reasoning, content = msg.get("reasoning_content") or "", msg.get("content") or ""
@@ -407,15 +462,21 @@ async def main():
 
     async def one(i, e, r):
         async with sem:
+            if DOWN:   # a server died: no new episode starts; the requeue (exit 99) runs it on fresh servers
+                return
             t0 = time.time()
             url = min(URLS, key=_active.get)
             _active[url] += 1
-            inp = SimpleNamespace(evaluation=True, sampling_params={}, base_url=url,
+            inp = SimpleNamespace(evaluation=True, sampling_params={}, base_url=url, moved_at=t0, moves=0,
                                   sample=SimpleNamespace(index=i, group_index=e, label=r["label"], metadata=r["metadata"]))
             rec = {"pid": r["metadata"]["pid"], "episode": e, "model": args.model}
             try:
                 _, S, info = await L.episode(inp, r["metadata"]["messages"], r["label"])
                 rec.update(S=S, info=info)
+            except _HttpAborted as ex:
+                rec.update(S=None, aborted=str(ex))
+                if ex.url in DOWN:   # every server is down: not the episode's failure, no row; the rerun resumes it
+                    rec = None
             except Aborted as ex:
                 rec.update(S=None, aborted=str(ex))
             except Exception as ex:   # one episode's bug or bad reply; CancelledError (a BaseException) still stops all
@@ -423,13 +484,17 @@ async def main():
                 rec.update(S=None, aborted=f"{type(ex).__name__}: {ex}"[:500], crash=True,
                            traceback=traceback.format_exc()[-4000:])
             finally:
-                _active[url] -= 1
+                _active[inp.base_url] -= 1   # the server it ended on
+            if rec is None:
+                print(f"[{r['metadata']['pid']} ep{e}] stopped: no live server", flush=True)
+                return
+            rec["moves"] = inp.moves
             rec["minutes"] = round((time.time() - t0) / 60, 1)
             with open(res_path, "a") as f:
                 f.write(json.dumps(rec) + "\n")
             ran.append(rec)
             print(f"[{rec['pid']} ep{e}] S={rec.get('S')} subs={(rec.get('info') or {}).get('fo_lg_submissions')} "
-                  f"tokens={(rec.get('info') or {}).get('fo_lg_tokens')} {rec['minutes']} min"
+                  f"tokens={(rec.get('info') or {}).get('fo_lg_tokens')} {rec['minutes']} min moves={inp.moves}"
                   + (f" ABORTED {rec['aborted'][:200]}" if rec.get("S") is None else ""), flush=True)
 
     try:
@@ -438,6 +503,8 @@ async def main():
         await _http.close()
     line, code = outcome(want, _read(res_path), ran, args.max_episode_tries, args.episodes)
     print(line, flush=True)
+    if DOWN:
+        print(f"servers down: {sorted(DOWN)}", flush=True)
     if code:
         print(f"exit {code}" + (": rerun the same command to resume" if code == 99 else ""), flush=True)
         sys.exit(code)
