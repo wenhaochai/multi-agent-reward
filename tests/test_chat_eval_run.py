@@ -108,6 +108,7 @@ import time  # noqa: E402
 
 starts = {}   # (pid, episode) -> the round each start resumed from, over all runs
 ROUNDS = {}   # pid -> rounds the episode takes (default 5)
+FAIL_AT = [3]   # the round at which "abort" and "raise" happen
 
 
 async def ck_episode(inp, messages, label, ckpt=None):
@@ -121,9 +122,9 @@ async def ck_episode(inp, messages, label, ckpt=None):
     for rnd in range(r0 + 1, ROUNDS.get(key[0], 5) + 1):
         await asyncio.sleep(0.01)
         m = mode.get(key)
-        if m == "abort" and rnd == 3:
+        if m == "abort" and rnd == FAIL_AT[0]:
             raise g["Aborted"]("server gone")
-        if m == "raise" and rnd == 3:
+        if m == "raise" and rnd == FAIL_AT[0]:
             raise RuntimeError("boom")
         if ckpt is not None:
             ckpt.save({"rounds": rnd}, str(work))
@@ -182,10 +183,12 @@ check(c == 0 and starts[(1, 0)] == [2] and starts[(2, 0)] == [0], "abort resumes
 
 mode = {(0, 0): "raise"}
 ROUNDS = {i: 100000 for i in range(4)}
-# 2-3 s ahead (int() truncates): pid 0 must reach its crash at round 3 before the stop pauses it
+# pid 0 crashes at its first round, before the stop (2-3 s ahead; a save on GPFS can take ~1 s) can pause it
+FAIL_AT[0] = 1
 os.environ["SLURM_JOB_END_TIME"] = str(int(time.time()) + g["STOP_MARGIN_S"] + 3)
 c = run("c5")
 del os.environ["SLURM_JOB_END_TIME"]
+FAIL_AT[0] = 3
 r = rows("c5")
 st = sorted(p.name for p in (TMP / "c5/state").iterdir())
 check(c == 99 and [(x["pid"], x.get("crash")) for x in r] == [(0, True)] and len([x for x in st if x.endswith(".pkl")]) == 3,
