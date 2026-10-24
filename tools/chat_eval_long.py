@@ -10,7 +10,7 @@ shell runs lost points without it), and fcs_agent_long.trim_chat counts it again
   python3 tools/chat_eval_long.py --base-url http://127.0.0.1:8000 --model flint --data data_v11/fcs11_val40_agent.jsonl \
       --out <dir> [--episodes 1] [--concurrency 40]
 Game settings come from the environment as in miles: MA_LG_N, MA_LG_TOKENS, MA_LG_CTX_CHARS, MA_LG_CTX_LOW, MA_LG_HARNESS,
-MA_AG_TURN, MA_AG_MAX_LEN, MA_AG_TRACE_DIR (defaults to <out>/traces). Output: <out>/results.jsonl, one line per finished episode (resumable)."""
+MA_LG_END, MA_AG_TURN, MA_AG_MAX_LEN, MA_AG_TRACE_DIR (defaults to <out>/traces). Output: <out>/results.jsonl, one line per finished episode (resumable)."""
 import argparse
 import asyncio
 import json
