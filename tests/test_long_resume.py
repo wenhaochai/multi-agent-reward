@@ -144,6 +144,45 @@ res = run(L.Checkpoint(path, every=1e9))
 L.TOKENS -= 1
 check("other settings: fresh start", res["rounds"] == ref["rounds"] and len(res["prompts"]) == len(ref["prompts"]))
 
+# a save that fails (a full quota, a file that shrinks while the tar reads it) logs; the episode goes on and the last
+# good save stays
+import errno  # noqa: E402
+import pickle  # noqa: E402
+import tarfile  # noqa: E402
+from types import SimpleNamespace as NS  # noqa: E402
+
+
+def quota(*a, **k):
+    raise OSError(errno.EDQUOT, "Disk quota exceeded")
+
+
+real_tar, real_pickle = L.tarfile, L.pickle
+p3 = os.path.join(tempfile.mkdtemp(), "state", "0_e1")
+L.tarfile = NS(open=quota, data_filter=tarfile.data_filter, FilterError=tarfile.FilterError)
+ck = L.Checkpoint(p3, every=0)
+res = run(ck)
+L.tarfile = real_tar
+eq, diff = same(ref, res)
+check("every tar fails: the episode ends as the uninterrupted run, nothing left on disk", eq and ck.failed > 0
+      and ck.saves == 0 and not glob.glob(p3 + "*"), (diff, ck.failed, ck.saves, glob.glob(p3 + "*")))
+ck = L.Checkpoint(p3, every=1e9)
+hook.update(stop_at=("agent1", 3), ckpt=ck)
+try:
+    run(ck)
+except L.Paused:
+    pass
+hook["stop_at"] = None
+good = L.Checkpoint(p3).load()
+L.pickle = NS(dump=quota, load=pickle.load, HIGHEST_PROTOCOL=pickle.HIGHEST_PROTOCOL)
+ck = L.Checkpoint(p3, every=0)
+res = run(ck)
+L.pickle = real_pickle
+st = L.Checkpoint(p3).load()
+eq, diff = same(ref, res)
+check("every pickle fails after a resume: the episode ends as the uninterrupted run, the good save stays", eq
+      and ck.failed > 0 and st and st["rounds"] == good["rounds"] and glob.glob(p3 + ".r*.tgz") == [
+          os.path.join(os.path.dirname(p3), good["tar"])] and not glob.glob(p3 + "*.tmp"), (diff, ck.failed))
+
 # nor one of a setting that changes the game: a paused state, then one setting changed, starts fresh
 for name, val in [("CTX_LOW", 0.75), ("HARNESS", "v2"), ("END", "budget"), ("VERDICTS", True)]:
     p2 = os.path.join(tempfile.mkdtemp(), "state", "0_e1")

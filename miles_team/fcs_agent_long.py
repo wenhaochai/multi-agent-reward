@@ -371,12 +371,14 @@ class Checkpoint:
     """An episode's saved state: <path>.r<round>.tgz holds the work dir (.git included) and <path>.pkl the rest. The
     tar is written first under a new name, then the pickle (atomically) names it, then older tars go: a kill at any
     point leaves a pickle and the tar of the same round. stop: set by the caller; the episode saves and raises Paused
-    at the end of its round. prior_s: wall seconds of the earlier runs; saves: how many this run made."""
+    at the end of its round. prior_s: wall seconds of the earlier runs; saves: how many this run made; failed: how many
+    saves failed (a full quota, a file the agent made unreadable or that shrank while it was read): the episode goes on
+    and the last good save stays."""
 
     def __init__(self, path, every: float = CKPT_S):
         self.path, self.every, self.stop = str(path), every, False
         self.t0 = self.saved_at = time.time()
-        self.prior_s, self.saves = 0.0, 0
+        self.prior_s, self.saves, self.failed = 0.0, 0, 0
 
     def exists(self) -> bool:
         return os.path.exists(self.path + ".pkl")
@@ -396,22 +398,39 @@ class Checkpoint:
     def due(self, submitted: bool) -> bool:
         return self.stop or submitted or time.time() - self.saved_at >= self.every
 
-    def save(self, state: dict, work: str) -> None:
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+    def save(self, state: dict, work: str) -> bool:
+        """Never raises: a failed save logs, removes its own partial files and keeps the last good save (the next try
+        comes after `every` seconds, or at the next submission or stop)."""
         tgz = f"{self.path}.r{state['rounds']}.tgz"
-        with tarfile.open(tgz + ".tmp", "w:gz", compresslevel=1) as t:
-            t.add(work, arcname=".", filter=_tar_member)
-        os.replace(tgz + ".tmp", tgz)
-        state = {**state, "tar": os.path.basename(tgz), "wall_s": self.prior_s + time.time() - self.t0}
-        with open(self.path + ".pkl.tmp", "wb") as f:
-            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(self.path + ".pkl.tmp", self.path + ".pkl")
-        for old in glob.glob(glob.escape(self.path) + ".r*.tgz"):
-            if os.path.basename(old) != state["tar"]:
-                os.remove(old)
+        named = False   # the pickle names the new tar: from here on the save is good
+        try:
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+            with tarfile.open(tgz + ".tmp", "w:gz", compresslevel=1) as t:
+                t.add(work, arcname=".", filter=_tar_member)
+            os.replace(tgz + ".tmp", tgz)
+            state = {**state, "tar": os.path.basename(tgz), "wall_s": self.prior_s + time.time() - self.t0}
+            with open(self.path + ".pkl.tmp", "wb") as f:
+                pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(self.path + ".pkl.tmp", self.path + ".pkl")
+            named = True
+            for old in glob.glob(glob.escape(self.path) + ".r*.tgz"):
+                if os.path.basename(old) != state["tar"]:
+                    os.remove(old)
+        except Exception as e:
+            print(f"checkpoint {self.path}: save after round {state['rounds']} "
+                  f"{'kept, old tars left' if named else 'failed, the last good save stays'} ({e!r})", flush=True)
+            if not named:
+                for f in (tgz + ".tmp", tgz, self.path + ".pkl.tmp"):
+                    try:
+                        os.remove(f)
+                    except OSError:
+                        pass
+                self.saved_at, self.failed = time.time(), self.failed + 1
+                return False
         self.saved_at, self.saves = time.time(), self.saves + 1
+        return True
 
     def restore(self, st: dict, work: str) -> None:
         with tarfile.open(os.path.join(os.path.dirname(self.path), st["tar"]), "r:gz") as t:
