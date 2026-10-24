@@ -182,7 +182,8 @@ check(c == 0 and starts[(1, 0)] == [2] and starts[(2, 0)] == [0], "abort resumes
 
 mode = {(0, 0): "raise"}
 ROUNDS = {i: 100000 for i in range(4)}
-os.environ["SLURM_JOB_END_TIME"] = str(int(time.time()) + g["STOP_MARGIN_S"] + 1)
+# 2-3 s ahead (int() truncates): pid 0 must reach its crash at round 3 before the stop pauses it
+os.environ["SLURM_JOB_END_TIME"] = str(int(time.time()) + g["STOP_MARGIN_S"] + 3)
 c = run("c5")
 del os.environ["SLURM_JOB_END_TIME"]
 r = rows("c5")
