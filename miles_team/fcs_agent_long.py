@@ -135,6 +135,10 @@ def subset_mean(cases: list[float], idx: list[int]) -> float:
     return sum(vals) / len(vals) if vals else 0.0
 
 
+def sha1(code: str) -> str:
+    return hashlib.sha1(code.encode()).hexdigest()[:12]
+
+
 def trim_chat(chat: list, keep_chars: int, dropped: int, low_chars: int | None = None) -> tuple[list, int]:
     """Once the history after [system, instance] is over keep_chars, drop the oldest (assistant, user) pairs until it
     fits low_chars (default keep_chars); the instance message then says how many steps were removed. Returns (chat,
@@ -232,31 +236,55 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
     rng = random.Random(f"{label}:{input.sample.index}:{getattr(input.sample, 'group_index', 0)}")
     rounds, run_s, subs, board, events = 0, 0.0, [], [], []
 
-    def write_logs():
-        with open(os.path.join(work, "SCORES.md"), "w") as f:
-            f.write("# Submissions (provisional score = mean over half of the hidden tests)\n\n")
-            f.write("| # | round | agent | file | status | provisional |\n|---|---|---|---|---|---|\n")
-            for i, s in enumerate(subs, 1):
-                f.write(f"| {i} | {s['round']} | {s['agent']} | {s['file']} | {s['status']} | {100 * s['prov']:.2f} |\n")
-        with open(os.path.join(work, "BOARD.md"), "w") as f:
-            f.write("# Messages\n\n" + "".join(f"- [round {r}] {a}: {m}\n" for r, a, m in board))
+    def _put(name: str, text: str) -> None:
+        """Write work/name for the agents to read without following what they put there (audit 2026-10-24: an
+        `ln -sf ~/x SCORES.md` made the harness overwrite ~/x): a new file under a unique name, then a rename over
+        whatever is at the path (a symlink is replaced, not followed). Never raises; on an error the log is stale."""
+        path = os.path.join(work, name)
+        tmp = os.path.join(work, f".{name}.{uuid.uuid4().hex}")
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+            with os.fdopen(fd, "w") as f:
+                f.write(text)
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path, ignore_errors=True)   # rmtree does not follow symlinks
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.unlink(tmp)   # leave nothing for commit_as to pick up
+            except OSError:
+                pass
 
-    async def do_submit(a, path: str) -> dict:
+    def write_logs():
+        _put("SCORES.md", "# Submissions (provisional score = mean over half of the hidden tests)\n\n"
+             "| # | round | agent | file | status | provisional |\n|---|---|---|---|---|---|\n"
+             + "".join(f"| {i} | {s['round']} | {s['agent']} | {s['file']} | {s['status']} | {100 * s['prov']:.2f} |\n"
+                       for i, s in enumerate(subs, 1)))
+        _put("BOARD.md", "# Messages\n\n" + "".join(f"- [round {r}] {a}: {m}\n" for r, a, m in board))
+
+    def read_code(path: str):
+        """(real path, text or None when larger than MAX_FILE) of a regular file inside the repository (a symlink out
+        of it is refused), or None when there is no such file."""
         p = os.path.realpath(os.path.join(work, path))
         if not p.startswith(os.path.realpath(work) + os.sep) or not os.path.isfile(p):
-            return {"output": f"submit: no file {path} in the repository\n", "returncode": 1, "exception_info": ""}
+            return None
         with open(p, "rb") as f:
             code = f.read(MAX_FILE + 1)
-        if len(code) > MAX_FILE:
+        return p, (None if len(code) > MAX_FILE else code.decode("utf-8", errors="replace"))
+
+    async def do_submit(a, path: str) -> dict:
+        got = read_code(path)
+        if got is None:
+            return {"output": f"submit: no file {path} in the repository\n", "returncode": 1, "exception_info": ""}
+        p, code = got
+        if code is None:
             return {"output": f"submit: {path} is larger than {MAX_FILE} bytes\n", "returncode": 1, "exception_info": ""}
-        code = code.decode("utf-8", errors="replace")
         res = await judge_code(label, code)
         cases = res["cases"]
         prov, final = subset_mean(cases, prov_idx), subset_mean(cases, final_idx)
         rev = (await loop.run_in_executor(A._POOL, lambda: T._git(work, "rev-parse", "HEAD").stdout.strip()))
         s = {"agent": a.name, "round": rounds, "step": a.steps, "file": path, "status": res["status"], "prov": prov,
-             "final": final, "infra": bool(res["infra_error"]), "rev": rev,
-             "sha": hashlib.sha1(code.encode()).hexdigest()[:12], "code": code}
+             "final": final, "infra": bool(res["infra_error"]), "rev": rev, "sha": sha1(code), "code": code}
         subs.append(s)
         a.n_submit += 1
         if p == os.path.realpath(os.path.join(work, "solution.cpp")):
@@ -273,13 +301,11 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
 
     async def finish(a, out: dict) -> dict:
         """The finish command: submit solution.cpp and go on, or (unchanged since a.last_sha) pass `out` on to end."""
-        p = os.path.join(work, "solution.cpp")
-        if not os.path.isfile(p):
+        got = read_code("solution.cpp")
+        if got is None:
             return {**out, "output": "Finish command received, but there is no solution.cpp to submit. Write "
                                      "solution.cpp and run the command again.\n"}
-        with open(p, "rb") as f:
-            sha = hashlib.sha1(f.read(MAX_FILE + 1).decode("utf-8", errors="replace").encode()).hexdigest()[:12]
-        if sha == a.last_sha:
+        if got[1] is not None and sha1(got[1]) == a.last_sha:
             return out
         res = await do_submit(a, "solution.cpp")
         left = max(0, TOKENS - a.generated)
