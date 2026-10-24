@@ -61,8 +61,11 @@ import yaml
 
 FCS_ROOT = Path(os.environ.get("FCS_ROOT", "/scratch/gpfs/GROUP/USER/project/Frontier-CS/algorithmic"))
 TESTLIB_DIR = FCS_ROOT / "judge" / "include"
-CACHE = Path(os.environ.get("FCS_JUDGE_CACHE", "/tmp/fcs_judge_cache"))
-TMP = Path(os.environ.get("FCS_JUDGE_TMP", "/tmp"))
+# work dirs (each case's stdout, up to 128 MiB) and the helper cache follow TMPDIR (a job's per-job scratch dir, removed by
+# its EXIT trap) when FCS_JUDGE_TMP / FCS_JUDGE_CACHE are unset: on shared node /tmp a full disk cut outputs short and
+# scored them WA, silently (2026-10-08), and a killed job left its fcsj_* dirs behind. Without TMPDIR: /tmp as before
+TMP = Path(os.environ.get("FCS_JUDGE_TMP") or tempfile.gettempdir())
+CACHE = Path(os.environ.get("FCS_JUDGE_CACHE") or TMP / "fcs_judge_cache")
 CASE_WORKERS = int(os.environ.get("FCS_CASE_WORKERS", "8"))
 
 
@@ -448,6 +451,54 @@ def _case_interactive(prob, sol: Path, inter: Path, case, work: Path) -> float:
     finally:
         for suffix in (".tout", ".ierr"):
             (work / f"{case[0]}{suffix}").unlink(missing_ok=True)
+
+
+_V_RUN = re.compile(r"run: code=(\S+) cpu=([\d.]+)/([\d.]+) killed=(\w+)")
+_V_CHK = re.compile(r"chk=(-?\d+) ")
+_V_INT = re.compile(r"sol code=(\S+) cpu=([\d.]+)/([\d.]+) rss=(-?\d+)MiB/(\d+) killed=(\w+); inter code=(\S+) "
+                    r"killed=(\w+)")
+
+
+def verdict(info: str) -> str:
+    """A case's verdict from the case_info line this judge wrote: OK (a valid output, scored by the checker or
+    interactor, 0 points included), WA, TLE, MLE (interactive only: a classic program over its address space crashes,
+    so RE), RE, OLE, INFRA, or JUDGE (the checker / interactor failed, or the line is not one of ours). Only the fixed
+    prefix is read, never the checker's message, which can quote the expected output."""
+    if info.startswith("INFRA"):
+        return "INFRA"
+    code = lambda s: None if s == "None" else int(s)
+    m = _V_RUN.match(info)
+    if m:
+        c, cpu, tl, killed = code(m[1]), float(m[2]), float(m[3]), m[4] == "True"
+        if killed or cpu > tl or c == -signal.SIGXCPU:
+            return "TLE"
+        if c == -signal.SIGXFSZ:   # a write past STDOUT_MAX (RLIMIT_FSIZE)
+            return "OLE"
+        if c not in (0, None):
+            return "RE"
+        return "TLE" if cpu >= tl else "OLE"   # exit 0 under the limit: the output passed STDOUT_MAX
+    m = _V_CHK.match(info)
+    if m:
+        r = int(m[1])
+        return "OK" if r in (OK_EXIT, POINTS_EXIT) else "WA" if r in (1, 2) else "JUDGE"
+    m = _V_INT.match(info)
+    if m:
+        c, cpu, tl, rss, ml, killed = code(m[1]), float(m[2]), float(m[3]), int(m[4]), int(m[5]), m[6] == "True"
+        i, ikilled = code(m[7]), m[8] == "True"
+        if killed or cpu > tl or c == -signal.SIGXCPU:
+            return "TLE"
+        if rss > ml:
+            return "MLE"
+        if c == -signal.SIGPIPE and not ikilled and i in (1, 2):   # the interactor rejected and closed its pipe
+            return "WA"
+        if c != 0:
+            return "RE"
+        if ikilled:
+            return "JUDGE"
+        if i == -signal.SIGPIPE:   # the program ended (closing its pipe) before the interaction did
+            return "WA"
+        return "OK" if i in (OK_EXIT, POINTS_EXIT) else "WA" if i in (1, 2) else "JUDGE"
+    return "JUDGE"
 
 
 # FCS_CASE_POOL=1: one process-wide pool of FCS_CASE_SLOTS threads (default: the job's cores - 8) runs every compile

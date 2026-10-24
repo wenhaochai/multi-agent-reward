@@ -5,9 +5,11 @@ N = 1 the same code is the lone-agent control at the same per-agent budget, and 
 
 What changes against fcs_agent_team (one submission, no feedback, no messages):
   submit [file]   (the whole action) judges the file (default solution.cpp) at once. The agent sees its PROVISIONAL score:
-                  the mean over the even-numbered test cases, with per-case scores and compiler errors, like a contest's
-                  provisional board. Every submission and its provisional score goes to SCORES.md and to every agent.
-                  An agent may submit as often as it likes.
+                  the mean over the cases at 0-based even indices (files 1.in, 3.in, ...), with per-case scores and
+                  compiler errors, like a contest's provisional board. Every submission and its provisional score goes
+                  to SCORES.md and to every agent. An agent may submit as often as it likes. A judge infrastructure
+                  failure is judged again (twice, after 2 s and 4 s); one that stays is told to the agent and never
+                  picked as best unless all are.
   post <message>  (the whole action) sends a message to every other agent. New messages and new submissions of the
                   others are shown at the top of each agent's next observation, so the agents keep talking without
                   having to poll files; BOARD.md keeps the whole log.
@@ -18,8 +20,9 @@ What changes against fcs_agent_team (one submission, no feedback, no messages):
   the end         an agent stops when it runs the finish command on an unchanged solution.cpp, uses up MA_LG_TOKENS
                   generated tokens, or makes three format errors in a row. When every agent has stopped, the submission
                   with the highest provisional score (the earliest on a tie) is the team's answer, and its FINAL score
-                  (the mean over the odd-numbered cases, never shown to the agents) is the episode's score. A problem
-                  with a single test case uses it for both (flagged "shared_case" in the trace).
+                  (the mean over the cases at 0-based odd indices, files 2.in, 4.in, ..., never shown to the agents) is
+                  the episode's score. A problem with a single test case uses it for both, so its final score is not
+                  held out (flagged "shared_case" in the trace).
   context         a long episode overflows the 65k-token context, so before each step the oldest steps of an agent's
                   chat are dropped (MA_LG_CTX_CHARS of history kept) and its instance message says how many; the agents
                   are told to keep what matters in files (notes, SCORES.md, BOARD.md).
@@ -32,7 +35,9 @@ What changes against fcs_agent_team (one submission, no feedback, no messages):
                   nothing changes (generate() and the miles path pass none).
 
 Env: MA_LG_N (4), MA_LG_TOKENS (500000 per agent), MA_LG_CTX_CHARS (110000), MA_LG_MAX_ROUNDS (2000, a safety cap),
-MA_LG_CKPT_S (300), fcs_agent's MA_AG_TURN / MA_AG_TIMEOUT / MA_AG_THINK / MA_AG_MAX_LEN / MA_AG_TRACE_DIR.
+MA_LG_CKPT_S (300), MA_LG_VERDICTS (0; 1 shows each provisional test's verdict, OK / WA / TLE / MLE / RE / OLE / CE,
+beside its score: a different game, recorded as fo_lg_verdicts, so never pool runs across it),
+fcs_agent's MA_AG_TURN / MA_AG_TIMEOUT / MA_AG_THINK / MA_AG_MAX_LEN / MA_AG_TRACE_DIR.
 --custom-generate-function-path miles_team.fcs_agent_long.generate   (evaluation; training is not supported yet)
 """
 from __future__ import annotations
@@ -63,8 +68,10 @@ TOKENS = int(os.environ.get("MA_LG_TOKENS", "500000"))
 CTX_CHARS = int(os.environ.get("MA_LG_CTX_CHARS", "110000"))
 MAX_ROUNDS = int(os.environ.get("MA_LG_MAX_ROUNDS", "2000"))
 CKPT_S = float(os.environ.get("MA_LG_CKPT_S", "300"))
+VERDICTS = os.environ.get("MA_LG_VERDICTS", "0") == "1"
 MAX_FILE = 256 << 10          # bytes of a submitted file
 MAX_POST = 2000               # characters of one message
+INFRA_RETRIES, INFRA_BACKOFF = 2, 2.0   # a judge infra failure is judged again, after 2 s, then 4 s
 SUBMIT_RE = re.compile(r"\s*submit(?:\s+(\S+))?\s*")
 POST_RE = re.compile(r"\s*post\s+(.+?)\s*", re.S)
 
@@ -92,7 +99,7 @@ You have a budget of about {budget} generated tokens, and you should use it: kee
 as you can make it better. Three commands are provided by the harness; each must be the whole action, alone:
 
 - `submit` or `submit <file>`: judges the file (default solution.cpp) right away and shows its PROVISIONAL score \
-(0-100): the mean over half of the hidden tests, with the score of each of those tests and any compiler errors. You \
+(0-100): the mean over half of the hidden tests, with {per_test} and any compiler errors. You \
 may submit as often as you like.{team_submit}
 - `post <message>`: {post_text}
 - `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`: submits solution.cpp, as `submit` does, and your work goes on. Run \
@@ -111,6 +118,9 @@ def instance(problem: str, name: str) -> str:
     team = N > 1
     tools = _TOOLS.format(
         budget=f"{TOKENS:,}",
+        per_test=("the score and verdict of each of those tests (OK: a valid output, scored by the checker, which may "
+                  "give it 0; WA: wrong answer; TLE, MLE, OLE: over the time, memory or output limit; RE: runtime "
+                  "error; CE: compile error)" if VERDICTS else "the score of each of those tests"),
         team_submit=(" Every submission of every agent and its provisional score is shown to all agents." if team
                      else ""),
         post_text=("sends the message to every other agent; their messages appear at the top of your next "
@@ -126,10 +136,17 @@ def instance(problem: str, name: str) -> str:
 
 
 def split_cases(n: int) -> tuple[list[int], list[int], bool]:
-    """(provisional, final, shared): even-numbered cases are provisional, odd-numbered final; one case serves both."""
+    """(provisional, final, shared): cases at 0-based even indices (files 1.in, 3.in, ...) are provisional, odd
+    indices (2.in, 4.in, ...) final; a single case serves both (no held-out final)."""
     if n <= 1:
         return [0], [0], True
     return list(range(0, n, 2)), list(range(1, n, 2)), False
+
+
+def best_of(subs: list[dict]) -> dict:
+    """The submission with the highest provisional score, the earliest on a tie; one the judge could not finish
+    (infra) only when every submission is one, so an infra zero never lowers the episode's score by being picked."""
+    return max(enumerate(subs), key=lambda t: (not t[1]["infra"], t[1]["prov"], -t[0]))[1]
 
 
 def subset_mean(cases: list[float], idx: list[int]) -> float:
@@ -342,23 +359,37 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
         if len(code) > MAX_FILE:
             return {"output": f"submit: {path} is larger than {MAX_FILE} bytes\n", "returncode": 1, "exception_info": ""}
         code = code.decode("utf-8", errors="replace")
+        t0 = time.monotonic()   # wall time, the wait for an FCS_RM_CONCURRENCY slot included
         res = await judge_code(label, code)
+        tries = 0   # a transient fork / disk / memory failure must not cost the agent a submission
+        while res["infra_error"] and tries < INFRA_RETRIES:
+            tries += 1
+            await asyncio.sleep(INFRA_BACKOFF * tries)
+            res = await judge_code(label, code)
+        judge_s = time.monotonic() - t0
         cases = res["cases"]
         prov, final = subset_mean(cases, prov_idx), subset_mean(cases, final_idx)
         rev = (await loop.run_in_executor(A._POOL, lambda: T._git(work, "rev-parse", "HEAD").stdout.strip()))
         s = {"agent": a.name, "round": rounds, "step": a.steps, "file": path, "status": res["status"], "prov": prov,
-             "final": final, "infra": bool(res["infra_error"]), "rev": rev,
-             "sha": hashlib.sha1(code.encode()).hexdigest()[:12], "code": code}
+             "final": final, "infra": bool(res["infra_error"]), "infra_retries": tries, "rev": rev,
+             "sha": hashlib.sha1(code.encode()).hexdigest()[:12], "code": code, "judge_s": round(judge_s, 2),
+             # trace only: every case (final ones too) and the judge's per-case lines; never in the agent's view
+             "cases": [round(c, 4) for c in cases], "case_info": res.get("case_info", [])}
         subs.append(s)
         a.n_submit += 1
         if p == os.path.realpath(os.path.join(work, "solution.cpp")):
             a.last_sha = s["sha"]
         events.append((rounds, a.name, f"submitted {path}: {res['status']}, provisional {100 * prov:.2f}"))
-        best = max(subs, key=lambda x: (x["prov"], -subs.index(x)))
-        per = ", ".join(f"{100 * cases[i]:.0f}" for i in prov_idx if i < len(cases))
+        best = best_of(subs)
+        v = (res.get("verdicts") or []) if VERDICTS else []
+        per = ", ".join(f"{100 * cases[i]:.0f}" + (f" ({v[i]})" if i < len(v) else "") for i in prov_idx if i < len(cases))
         msg = (f"Submission #{len(subs)} by {a.name}: {res['status']}. Provisional score {100 * prov:.2f} on "
                f"{len(prov_idx)} tests (per test: {per}). Best provisional so far: {100 * best['prov']:.2f} "
                f"(#{subs.index(best) + 1}, {best['agent']}).\n")
+        if res["infra_error"]:
+            msg += (f"The judge could not finish this submission after {tries + 1} tries (status: {res['status']}). "
+                    "It is not counted as your best. If the status is a compile resource or time failure, your code "
+                    "may be too heavy to compile; otherwise submit again.\n")
         if res["status"] == "compile error" and res.get("msg"):
             msg += "Compiler output:\n" + res["msg"][:3000] + "\n"
         return {"output": msg, "returncode": 0, "exception_info": ""}
@@ -456,7 +487,7 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
                     raise
                 if ckpt.stop:
                     raise Paused(f"paused after round {rounds}")
-        best = max(subs, key=lambda x: (x["prov"], -subs.index(x))) if subs else None
+        best = best_of(subs) if subs else None
         shares = (await loop.run_in_executor(A._POOL, T.blame_shares, work, best["file"], best["rev"])) if best else {}
         log = (await loop.run_in_executor(A._POOL, lambda: T._git(work, "log", "--format=%an %s").stdout))[-20000:]
     finally:
@@ -470,13 +501,16 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
             "fo_lg_posts": len(board), "fo_lg_tokens": sum(a.generated for a in agents) / N,
             "fo_tokens": sum(a.generated for a in agents), "fo_latency": max(a.generated for a in agents),
             "fo_ag_steps": sum(a.steps for a in agents) / N, "fo_ag_format_errors": sum(a.fmt_total for a in agents) / N,
-            "fo_ag_run_min": run_s / 60, "fo_ag_compile_fail": float(bool(best) and best["status"] == "compile error"),
+            "fo_ag_run_min": run_s / 60, "fo_lg_judge_min": sum(s["judge_s"] for s in subs) / 60,
+            "fo_ag_compile_fail": float(bool(best) and best["status"] == "compile error"),
             "fo_ag_no_code": float(best is None), "fo_ag_top_author": max(shares.values()) if shares else 0.0,
             **{f"fo_ag_exit_{e}": sum(a.exit == e for a in agents) / N for e in
                ("Finished", "TokensExceeded", "ContextExceeded", "RepeatedFormatError")},
-            "fo_judge_infra_error": float(any(s["infra"] for s in subs))}
+            "fo_judge_infra_error": float(any(s["infra"] or s["infra_retries"] for s in subs)),   # any infra judge call
+            "fo_judge_infra_unresolved": float(any(s["infra"] for s in subs)),   # still infra after the retries
+            "fo_judge_infra_retries": sum(s["infra_retries"] for s in subs), "fo_lg_verdicts": float(VERDICTS)}
     A._trace({"time": round(time.time(), 1), "eval": input.evaluation, "game": "agent_long", "label": label, "S": S,
-              "n": N, "budget": TOKENS, "rounds": rounds, "shared_case": shared, "n_cases": n_cases,
+              "n": N, "budget": TOKENS, "verdicts": VERDICTS, "rounds": rounds, "shared_case": shared, "n_cases": n_cases,
               "submissions": [{k: v for k, v in s.items() if k != "code"} for s in subs],
               "best": {k: v for k, v in best.items()} if best else None, "board": board, "blame": shares,
               "git_log": log,
