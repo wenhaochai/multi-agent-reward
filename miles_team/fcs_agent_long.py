@@ -19,7 +19,9 @@ What changes against fcs_agent_team (one submission, no feedback, no messages):
                   generated tokens, or makes three format errors in a row. When every agent has stopped, the submission
                   with the highest provisional score (the earliest on a tie) is the team's answer, and its FINAL score
                   (the mean over the odd-numbered cases, never shown to the agents) is the episode's score. A problem
-                  with a single test case uses it for both (flagged "shared_case" in the trace).
+                  with a single test case uses it for both (flagged "shared_case" in the trace, fo_lg_shared_case in
+                  info). An unsubmitted solution.cpp left by an agent that did not finish is judged apart: fo_lg_S_auto
+                  is the score had it been submitted (S itself counts only submissions).
   context         a long episode overflows the 65k-token context, so before each step the oldest steps of an agent's
                   chat are dropped (once over MA_LG_CTX_CHARS, down to MA_LG_CTX_LOW of it) and its instance message
                   says how many; the agents
@@ -382,7 +384,20 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
                 if upd and not ends:   # an ending observation keeps the MARK as its first line
                     out = {**out, "output": upd + out["output"]}
                 a.observe(cmd, {**out, "_timing": timing}, rounds, k)
+        # what the budget cut costs (audit 2026-10-24): an agent that stopped without the finish command (tokens,
+        # context, format errors, the round cap) may leave a better solution.cpp unsubmitted. It is judged once, apart
+        # from subs: S keeps the documented rule (only submissions count) and S_auto - S measures the cut.
+        auto_sub = []
+        if any(a.exit != "Finished" for a in agents):
+            got = read_code("solution.cpp")
+            if got is not None and got[1] and got[1].strip() and sha1(got[1]) not in {x["sha"] for x in subs}:
+                res = await judge_code(label, got[1])
+                auto_sub.append({"agent": "auto", "round": rounds, "file": "solution.cpp", "status": res["status"],
+                                 "prov": subset_mean(res["cases"], prov_idx), "final": subset_mean(res["cases"], final_idx),
+                                 "infra": bool(res["infra_error"]), "sha": sha1(got[1]), "auto": True, "code": got[1]})
         best = max(subs, key=lambda x: (x["prov"], -subs.index(x))) if subs else None
+        cand = subs + auto_sub
+        best_auto = max(cand, key=lambda x: (x["prov"], -cand.index(x))) if cand else None
         shares = (await loop.run_in_executor(A._POOL, T.blame_shares, work, best["file"], best["rev"])) if best else {}
         log = (await loop.run_in_executor(A._POOL, lambda: T._git(work, "log", "--format=%an %s").stdout))[-20000:]
     finally:
@@ -393,7 +408,9 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
     def total_min(key: str) -> float:   # summed over every agent's turns
         return sum(t.get(key) or 0.0 for a in agents for t in a.turns) / 60
     first = subs[0]["round"] if subs else -1
-    info = {"fo_S": S, "fo_R": S, "fo_lg_n": N, "fo_lg_rounds": rounds, "fo_lg_submissions": len(subs),
+    info = {"fo_S": S, "fo_R": S, "fo_lg_n": N, "fo_lg_shared_case": float(shared), "fo_lg_rounds": rounds,
+            "fo_lg_submissions": len(subs),
+            "fo_lg_S_auto": best_auto["final"] if best_auto else 0.0, "fo_lg_auto_judged": float(bool(auto_sub)),
             "fo_lg_best_prov": best["prov"] if best else 0.0, "fo_lg_oracle_final": oracle,
             "fo_lg_selection_loss": oracle - S, "fo_lg_first_submit_round": first,
             "fo_lg_posts": len(board), "fo_lg_tokens": sum(a.generated for a in agents) / N,
@@ -412,7 +429,7 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
     A._trace({"time": round(time.time(), 1), "eval": input.evaluation, "game": "agent_long", "label": label, "S": S,
               "n": N, "budget": TOKENS, "rounds": rounds, "shared_case": shared, "n_cases": n_cases,
               "submissions": subs, "best": {k: v for k, v in best.items() if k != "code"} if best else None,
-              "board": board, "blame": shares, "git_log": log,
+              "auto_submission": auto_sub[0] if auto_sub else None, "board": board, "blame": shares, "git_log": log,
               # full turns (text = <think>reasoning</think>answer) and submissions with their code (audit 2026-10-24:
               # the last 4000 characters of a turn hid the reasoning; ~4 MB per 1M-token episode)
               "agents": [{"name": a.name, "exit": a.exit, "steps": a.steps, "generated": a.generated,

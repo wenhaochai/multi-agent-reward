@@ -22,7 +22,7 @@ judged = []
 
 async def fake_judge(label, code):
     judged.append(code)
-    return {"cases": [0.5] * 10, "status": "ok", "infra_error": "", "msg": ""}
+    return {"cases": [0.9 if "return 1" in code else 0.5] * 10, "status": "ok", "infra_error": "", "msg": ""}
 
 
 Base = L._Agent
@@ -66,12 +66,12 @@ def check(name, cond, detail=""):
     print(("OK  " if cond else "FAIL"), name, "" if cond else detail)
 
 
-def run(script):
+def run(script, full=False):
     Scripted.script = list(script)
     judged.clear()
     inp = SimpleNamespace(sample=SimpleNamespace(index=0), evaluation=True)
     agents, S, info = asyncio.run(L.episode(inp, [{"role": "user", "content": "problem"}], LABEL))
-    return agents[0]
+    return (agents[0], S, info) if full else agents[0]
 
 
 a = run([FIN, "printf 'int main(){}\\n' > solution.cpp", FIN, FIN])
@@ -90,6 +90,23 @@ check("explicit submit counts as the last submission", len(judged) == 1 and a.ex
 a = run(["printf 'int main(){}\\n' > solution.cpp", "submit sol2.cpp", FIN])
 check("submit of another file does not", len(judged) == 1 and a.exit != "Finished" and "Your work goes on" in a.outs[2],
       (judged, a.exit, a.outs))
+# the budget runs out (the scripted agent's TokensExceeded) with a better solution.cpp unsubmitted: S keeps the rule,
+# fo_lg_S_auto judges it once apart
+a, S, info = run(["printf 'int main(){}\\n' > solution.cpp", "submit", "printf 'int main(){return 1;}\\n' > solution.cpp"],
+                 True)
+check("budget end: S counts only the submission", abs(S - 0.5) < 1e-9 and len(judged) == 2, (S, judged))
+check("budget end: the unsubmitted file is judged apart", abs(info["fo_lg_S_auto"] - 0.9) < 1e-9
+      and info["fo_lg_auto_judged"] == 1.0 and info["fo_lg_submissions"] == 1, info)
+a, S, info = run(["printf 'int main(){return 1;}\\n' > solution.cpp"], True)
+check("budget end, no submission: S 0, S_auto > 0", S == 0.0 and info["fo_lg_S_auto"] > 0, (S, info))
+a, S, info = run(["printf 'int main(){}\\n' > solution.cpp", "submit"], True)
+check("budget end, file already submitted: no extra judge", len(judged) == 1 and info["fo_lg_auto_judged"] == 0.0
+      and info["fo_lg_S_auto"] == S, (judged, info))
+a, S, info = run(["printf 'int main(){return 1;}\\n' > solution.cpp", FIN, "printf 'int main(){}\\n' > solution.cpp",
+                  "submit", FIN], True)
+check("finished: no extra judge, S_auto = S", a.exit == "Finished" and info["fo_lg_auto_judged"] == 0.0
+      and info["fo_lg_S_auto"] == S and info["fo_lg_shared_case"] == 0.0, info)
+
 # N = 2: agent2 posts in the round in which agent1 runs the finish command on an unchanged file; the team update
 # must not hide agent1's MARK, so agent1 ends (fcs_agent_long.episode's `ends`)
 L.N = 2

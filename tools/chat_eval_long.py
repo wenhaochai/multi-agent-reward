@@ -368,6 +368,12 @@ async def main():
     ok = [r for r in recs if r.get("S") is not None]
     if ok:
         print(f"DONE {len(ok)} episodes, mean final score {100 * sum(r['S'] for r in ok) / len(ok):.2f}", flush=True)
+        # a problem with one test case scores the case the agent saw (fcs_agent_long.split_cases): the held-out mean
+        # leaves those out (runs before fo_lg_shared_case: train67 pids 43, 83, 137)
+        ho = [r for r in ok if not (r.get("info") or {}).get("fo_lg_shared_case")]
+        if ho:
+            print(f"HELD-OUT {len(ho)} episodes ({len(ok) - len(ho)} with a single shared case left out), mean final "
+                  f"score {100 * sum(r['S'] for r in ho) / len(ho):.2f}", flush=True)
 
 
 asyncio.run(main())
