@@ -25,10 +25,19 @@ judged = []
 SECRET = "wrong answer expected 4242, found 7"   # a checker line that quotes the expected output
 
 
+RESULT = None   # RESULT(code, call number) -> a judge result, to stub infra failures
+
+
 async def fake_judge(label, code):
     judged.append(code)
     await asyncio.sleep(0.05)
+    if RESULT is not None:
+        return RESULT(code, len(judged))
     return {"cases": [0.5] * 10, "status": "ok", "infra_error": "", "msg": "", "case_info": [SECRET] * 10}
+
+
+def infra(cases):
+    return {"cases": cases, "status": "done", "infra_error": True, "msg": "", "case_info": ["INFRA exception: x"] * 10}
 
 
 Base = L._Agent
@@ -62,6 +71,7 @@ class Scripted(Base):
 
 
 L.judge_code = fake_judge
+L.INFRA_BACKOFF = 0.01
 L._Agent = Scripted
 ok = True
 
@@ -110,5 +120,29 @@ check("trace has judge_s, cases, case_info", sub.get("judge_s", 0) >= 0.05 and s
 check("agent never sees case_info", not any("4242" in o for o in a.outs), a.outs)
 check("fo_lg_judge_min in info", abs(run.info["fo_lg_judge_min"] - sub["judge_s"] / 60) < 1e-9, run.info)
 check("judge time is not command time", run.info["fo_ag_run_min"] * 60 < sub["judge_s"] + 5, run.info)
+# an infra failure is judged again: once infra, then a real result
+RESULT = lambda code, k: infra([0.0] * 10) if k == 1 else fake_ok(code)
+fake_ok = lambda code: {"cases": [0.5] * 10, "status": "done", "infra_error": False, "msg": "", "case_info": []}
+a = run(["printf 'int main(){}\\n' > solution.cpp", "submit"])
+sub = last_trace()["submissions"][0]
+check("infra once: one retry, then a real result", len(judged) == 2 and sub["infra_retries"] == 1 and not sub["infra"]
+      and sub["prov"] == 0.5 and "could not finish" not in a.outs[1], (judged, sub, a.outs))
+check("infra info keys", run.info["fo_judge_infra_retries"] == 1 and run.info["fo_judge_infra_unresolved"] == 0.0
+      and run.info["fo_judge_infra_error"] == 1.0, run.info)
+
+# an infra failure that stays: told, and never picked over a real result even with a higher provisional score
+RESULT = lambda code, k: infra([1.0] * 10) if "A" in code else fake_ok(code)
+a = run(["printf 'int main(){A;}\\n' > solution.cpp", "submit", "printf 'int main(){}\\n' > solution.cpp", "submit"])
+tr = last_trace()
+subs = tr["submissions"]
+check("persistent infra: 3 tries, then told", len(judged) == 4 and subs[0]["infra"] and subs[0]["infra_retries"] == 2
+      and "could not finish this submission after 3 tries (status: done)" in a.outs[1], (judged, subs, a.outs))
+check("infra entry with a higher prov is not the best", tr["best"]["sha"] == subs[1]["sha"] and tr["S"] == 0.5
+      and run.info["fo_lg_best_prov"] == 0.5 and "Best provisional so far: 50.00 (#2" in a.outs[3], (tr["best"], a.outs))
+check("unresolved infra flagged", run.info["fo_judge_infra_unresolved"] == 1.0 and run.info["fo_judge_infra_retries"] == 2,
+      run.info)
+a = run(["printf 'int main(){A;}\\n' > solution.cpp", "submit"])
+check("all infra: the infra one is still the answer", last_trace()["best"]["infra"] and run.info["fo_lg_submissions"] == 1)
+RESULT = None
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)
