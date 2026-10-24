@@ -144,5 +144,22 @@ check("unresolved infra flagged", run.info["fo_judge_infra_unresolved"] == 1.0 a
 a = run(["printf 'int main(){A;}\\n' > solution.cpp", "submit"])
 check("all infra: the infra one is still the answer", last_trace()["best"]["infra"] and run.info["fo_lg_submissions"] == 1)
 RESULT = None
+
+# MA_LG_VERDICTS: off (the default) shows scores only, exactly as before; on, each provisional test's verdict too
+a = run(["printf 'int main(){}\\n' > solution.cpp", "submit"])
+check("verdicts off: scores only", "(per test: 50, 50, 50, 50, 50). Best" in a.outs[1] and run.info["fo_lg_verdicts"] == 0.0
+      and "verdict" not in L.instance("P", "agent1"), a.outs[1])
+L.VERDICTS = True
+RESULT = lambda code, k: {"cases": [0.5, 0.0] * 5, "status": "done", "infra_error": False, "msg": "", "case_info": [],
+                          "verdicts": ["OK", "WA"] * 5}
+a = run(["printf 'int main(){}\\n' > solution.cpp", "submit"])
+check("verdicts on: score (verdict) per test", "(per test: 50 (OK), 50 (OK), 50 (OK), 50 (OK), 50 (OK))" in a.outs[1]
+      and run.info["fo_lg_verdicts"] == 1.0 and last_trace()["verdicts"] is True, a.outs[1])
+check("verdicts on: the prompt explains them", "the score and verdict of each of those tests (OK: " in
+      L.instance("P", "agent1"))
+RESULT = lambda code, k: {"cases": [0.5] * 10, "status": "done", "infra_error": False, "msg": "", "case_info": []}
+a = run(["printf 'int main(){}\\n' > solution.cpp", "submit"])
+check("verdicts on, judge without them: scores only", "(per test: 50, 50, 50, 50, 50)" in a.outs[1], a.outs[1])
+L.VERDICTS, RESULT = False, None
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)

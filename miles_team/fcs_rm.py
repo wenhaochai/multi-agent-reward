@@ -251,20 +251,21 @@ async def _one(sample, args=None) -> float:
 def judge_full(problem_dir: str, code: str) -> dict:
     """Judge already-extracted code: {"score": [0, 1], "cases": per-case ratios (zeros when nothing ran),
     "status": ..., "infra_error": bool, "case_info": the judge's per-case lines, cut to 160 chars ([] when nothing
-    ran)}. Infrastructure failures are logged and flagged, never a silent 0. case_info can quote the checker, which
-    may print expected output: keep it out of what a policy sees."""
-    from miles_team.fcs_judge import load_problem
+    ran), "verdicts": one per case (fcs_judge.verdict: OK, WA, TLE, ...; CE for a compile error, - when nothing ran)}.
+    Infrastructure failures are logged and flagged, never a silent 0. case_info can quote the checker, which may print
+    expected output: keep it out of what a policy sees (verdicts are safe to show)."""
+    from miles_team.fcs_judge import load_problem, verdict
     from pathlib import Path
     n = len(load_problem(Path(problem_dir))["cases"])
     if not code:
         return {"score": 0.0, "cases": [0.0] * n, "status": "no code", "infra_error": False, "msg": "",
-                "case_info": []}
+                "case_info": [], "verdicts": ["-"] * n}
     try:
         r = judge(problem_dir, code)
     except Exception as e:
         print(f"[fcs_rm] JUDGE-ERROR {problem_dir}: {e}"[:500], file=sys.stderr, flush=True)
         return {"score": 0.0, "cases": [0.0] * n, "status": "judge error", "infra_error": True, "msg": "",
-                "case_info": []}
+                "case_info": [], "verdicts": ["-"] * n}
     cases = r.get("cases") or [0.0] * n
     infra = bool(r.get("infra")) or r.get("status") == "infra error"
     if infra:
@@ -272,7 +273,9 @@ def judge_full(problem_dir: str, code: str) -> dict:
               file=sys.stderr, flush=True)
     return {"score": r["score"] / 100.0, "cases": [float(c) for c in cases], "status": r["status"],
             "infra_error": infra, "msg": r.get("msg", "") if r["status"] == "compile error" else "",
-            "case_info": [str(i)[:160] for i in (r.get("case_info") or [])]}
+            "case_info": [str(i)[:160] for i in (r.get("case_info") or [])],
+            "verdicts": ([verdict(str(i)) for i in r.get("case_info") or []] if r["status"] == "done" else
+                         ["CE"] * n if r["status"] == "compile error" else ["-"] * n)}
 
 
 async def judge_code(problem_dir: str, code: str) -> dict:

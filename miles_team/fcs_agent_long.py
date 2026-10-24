@@ -28,6 +28,8 @@ What changes against fcs_agent_team (one submission, no feedback, no messages):
                   every segment would hold hundreds of full contexts per agent); generated tokens are counted apart.
 
 Env: MA_LG_N (4), MA_LG_TOKENS (500000 per agent), MA_LG_CTX_CHARS (110000), MA_LG_MAX_ROUNDS (2000, a safety cap),
+MA_LG_VERDICTS (0; 1 shows each provisional test's verdict, OK / WA / TLE / MLE / RE / OLE / CE, beside its score: a
+different game, recorded as fo_lg_verdicts, so never pool runs across it),
 fcs_agent's MA_AG_TURN / MA_AG_TIMEOUT / MA_AG_THINK / MA_AG_MAX_LEN / MA_AG_TRACE_DIR.
 --custom-generate-function-path miles_team.fcs_agent_long.generate   (evaluation; training is not supported yet)
 """
@@ -55,6 +57,7 @@ N = int(os.environ.get("MA_LG_N", "4"))
 TOKENS = int(os.environ.get("MA_LG_TOKENS", "500000"))
 CTX_CHARS = int(os.environ.get("MA_LG_CTX_CHARS", "110000"))
 MAX_ROUNDS = int(os.environ.get("MA_LG_MAX_ROUNDS", "2000"))
+VERDICTS = os.environ.get("MA_LG_VERDICTS", "0") == "1"
 MAX_FILE = 256 << 10          # bytes of a submitted file
 MAX_POST = 2000               # characters of one message
 INFRA_RETRIES, INFRA_BACKOFF = 2, 2.0   # a judge infra failure is judged again, after 2 s, then 4 s
@@ -85,7 +88,7 @@ You have a budget of about {budget} generated tokens, and you should use it: kee
 as you can make it better. Three commands are provided by the harness; each must be the whole action, alone:
 
 - `submit` or `submit <file>`: judges the file (default solution.cpp) right away and shows its PROVISIONAL score \
-(0-100): the mean over half of the hidden tests, with the score of each of those tests and any compiler errors. You \
+(0-100): the mean over half of the hidden tests, with {per_test} and any compiler errors. You \
 may submit as often as you like.{team_submit}
 - `post <message>`: {post_text}
 - `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`: submits solution.cpp, as `submit` does, and your work goes on. Run \
@@ -104,6 +107,9 @@ def instance(problem: str, name: str) -> str:
     team = N > 1
     tools = _TOOLS.format(
         budget=f"{TOKENS:,}",
+        per_test=("the score and verdict of each of those tests (OK: a valid output, scored by the checker, which may "
+                  "give it 0; WA: wrong answer; TLE, MLE, OLE: over the time, memory or output limit; RE: runtime "
+                  "error; CE: compile error)" if VERDICTS else "the score of each of those tests"),
         team_submit=(" Every submission of every agent and its provisional score is shown to all agents." if team
                      else ""),
         post_text=("sends the message to every other agent; their messages appear at the top of your next "
@@ -269,7 +275,8 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
             a.last_sha = s["sha"]
         events.append((rounds, a.name, f"submitted {path}: {res['status']}, provisional {100 * prov:.2f}"))
         best = best_of(subs)
-        per = ", ".join(f"{100 * cases[i]:.0f}" for i in prov_idx if i < len(cases))
+        v = (res.get("verdicts") or []) if VERDICTS else []
+        per = ", ".join(f"{100 * cases[i]:.0f}" + (f" ({v[i]})" if i < len(v) else "") for i in prov_idx if i < len(cases))
         msg = (f"Submission #{len(subs)} by {a.name}: {res['status']}. Provisional score {100 * prov:.2f} on "
                f"{len(prov_idx)} tests (per test: {per}). Best provisional so far: {100 * best['prov']:.2f} "
                f"(#{subs.index(best) + 1}, {best['agent']}).\n")
@@ -363,9 +370,9 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
                ("Finished", "TokensExceeded", "ContextExceeded", "RepeatedFormatError")},
             "fo_judge_infra_error": float(any(s["infra"] or s["infra_retries"] for s in subs)),   # any infra judge call
             "fo_judge_infra_unresolved": float(any(s["infra"] for s in subs)),   # still infra after the retries
-            "fo_judge_infra_retries": sum(s["infra_retries"] for s in subs)}
+            "fo_judge_infra_retries": sum(s["infra_retries"] for s in subs), "fo_lg_verdicts": float(VERDICTS)}
     A._trace({"time": round(time.time(), 1), "eval": input.evaluation, "game": "agent_long", "label": label, "S": S,
-              "n": N, "budget": TOKENS, "rounds": rounds, "shared_case": shared, "n_cases": n_cases,
+              "n": N, "budget": TOKENS, "verdicts": VERDICTS, "rounds": rounds, "shared_case": shared, "n_cases": n_cases,
               "submissions": [{k: v for k, v in s.items() if k != "code"} for s in subs],
               "best": {k: v for k, v in best.items()} if best else None, "board": board, "blame": shares,
               "git_log": log,
