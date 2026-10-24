@@ -37,6 +37,7 @@ UNIT = [("chk=7 cpu=0.00/1.0 points 0.0 Ratio: 0.000000000000", "OK"), ("chk=0 c
         ("sol code=0 cpu=0.10/2.0 rss=3MiB/512 killed=False; inter code=2 killed=False", "WA"),
         ("sol code=0 cpu=0.10/2.0 rss=3MiB/512 killed=False; inter code=None killed=True", "JUDGE"),
         ("sol code=0 cpu=0.10/2.0 rss=3MiB/512 killed=False; inter code=3 killed=False fail", "JUDGE"),
+        ("sol code=0 cpu=0.00/2.0 rss=13MiB/512 killed=False; inter code=-13 killed=False ", "WA"),
         ("something else", "JUDGE")]
 bad = [(i, verdict(i), v) for i, v in UNIT if verdict(i) != v]
 check("verdict() on every line format", not bad, bad)

@@ -495,6 +495,8 @@ def verdict(info: str) -> str:
             return "RE"
         if ikilled:
             return "JUDGE"
+        if i == -signal.SIGPIPE:   # the program ended (closing its pipe) before the interaction did
+            return "WA"
         return "OK" if i in (OK_EXIT, POINTS_EXIT) else "WA" if i in (1, 2) else "JUDGE"
     return "JUDGE"
 
