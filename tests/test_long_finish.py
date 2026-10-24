@@ -141,10 +141,13 @@ check("persistent infra: 3 tries, then told", len(judged) == 4 and subs[0]["infr
       and "could not finish this submission after 3 tries (status: done)" in a.outs[1], (judged, subs, a.outs))
 check("infra entry with a higher prov is not the best", tr["best"]["sha"] == subs[1]["sha"] and tr["S"] == 0.5
       and run.info["fo_lg_best_prov"] == 0.5 and "Best provisional so far: 50.00 (#2" in a.outs[3], (tr["best"], a.outs))
+check("the infra submission is not shown as the best: none yet, then the real one", "Best provisional so far: none yet."
+      in a.outs[1] and "Best provisional so far: 50.00 (#2, agent1)." in a.outs[3], a.outs)
 check("unresolved infra flagged", run.info["fo_judge_infra_unresolved"] == 1.0 and run.info["fo_judge_infra_error"] == 1.0
       and run.info["fo_judge_infra_any"] == 1.0 and run.info["fo_judge_infra_retries"] == 2, run.info)
 a = run(["printf 'int main(){A;}\\n' > solution.cpp", "submit"])
-check("all infra: the infra one is still the answer", last_trace()["best"]["infra"] and run.info["fo_lg_submissions"] == 1)
+check("all infra: the infra one is still the answer", last_trace()["best"]["infra"] and run.info["fo_lg_submissions"] == 1
+      and "Best provisional so far: none yet." in a.outs[1], a.outs)
 RESULT = None
 
 # MA_LG_VERDICTS: off (the default) shows scores only, exactly as before; on, each provisional test's verdict too

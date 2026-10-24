@@ -544,12 +544,12 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
         if p == os.path.realpath(os.path.join(work, "solution.cpp")):
             a.last_sha = s["sha"]
         events.append((rounds, a.name, f"submitted {path}: {res['status']}, provisional {100 * prov:.2f}"))
-        best = best_of(subs)
+        best = best_of(subs)   # an infra one only when every submission is: then there is no best yet
+        best_txt = "none yet" if best["infra"] else f"{100 * best['prov']:.2f} (#{subs.index(best) + 1}, {best['agent']})"
         v = (res.get("verdicts") or []) if VERDICTS else []
         per = ", ".join(f"{100 * cases[i]:.0f}" + (f" ({v[i]})" if i < len(v) else "") for i in prov_idx if i < len(cases))
         msg = (f"Submission #{len(subs)} by {a.name}: {res['status']}. Provisional score {100 * prov:.2f} on "
-               f"{len(prov_idx)} tests (per test: {per}). Best provisional so far: {100 * best['prov']:.2f} "
-               f"(#{subs.index(best) + 1}, {best['agent']}).\n")
+               f"{len(prov_idx)} tests (per test: {per}). Best provisional so far: {best_txt}.\n")
         if res["infra_error"]:
             msg += (f"The judge could not finish this submission after {tries + 1} tries (status: {res['status']}). "
                     "It is not counted as your best. If the status is a compile resource or time failure, your code "
