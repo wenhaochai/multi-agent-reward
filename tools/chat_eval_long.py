@@ -50,6 +50,7 @@ ap.add_argument("--request-timeout", type=float, default=3600)
 ap.add_argument("--textbased", action="store_true", help="mini_textbased.yaml format instead of tool calls")
 ap.add_argument("--max-episode-tries", type=int, default=3,
                 help="an episode whose rows are all aborted or judge-infra after this many runs is given up")
+ap.add_argument("--no-route", action="store_true", help="episodes stay on their first server unless it is down")
 ap.add_argument("--no-ckpt", action="store_true", help="no episode checkpoints: a stopped run restarts its episodes")
 ap.add_argument("--tail-exit-min", type=float, default=0,
                 help="stop (exit 3) once every episode has started and a server has had none for this many minutes")
@@ -216,9 +217,9 @@ def _route(inp) -> str:
     now, new = time.time(), None
     if live:
         low = min(live, key=_active.get)
-        if cur in DOWN or _active[cur] - _active[low] >= 2:
+        if cur in DOWN or (not args.no_route and _active[cur] - _active[low] >= 2):
             new = low
-        else:
+        elif not args.no_route:
             idle = [u for u in live if u != cur and _active[u] == 0 and now - _last[u] > IDLE_S]
             if idle and now - getattr(inp, "moved_at", 0) > DWELL_S:
                 new = min(idle, key=_last.get)

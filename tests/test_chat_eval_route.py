@@ -121,6 +121,15 @@ cnt = {u: sum(x.base_url == u for x in inps) for u in U}
 check(max(_active.values()) - min(_active.values()) <= 1 and cnt == _active and sum(_active.values()) == 30
       and sum(x.moves for x in inps) == 7, "(a) balanced after one pass, counts match", (_active, cnt))
 
+g["args"].no_route = True   # --no-route: an imbalance moves nothing
+reset()
+x = episode_inp(U[0])
+for k in range(3):
+    episode_inp(U[0], k + 1)
+asyncio.run(CS(x, "agent1", True, max_len=262144).turn(HIST, 100))
+check(x.moves == 0 and x.base_url == U[0] and _active[U[0]] == 4, "--no-route: no move", _active)
+g["args"].no_route = False
+
 # (b) one episode, 4 servers, 3 h of fake time
 reset()
 x = episode_inp(U[0])
