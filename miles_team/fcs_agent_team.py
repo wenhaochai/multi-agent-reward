@@ -85,8 +85,8 @@ def _git(work: str, *args, env: dict | None = None) -> subprocess.CompletedProce
          **(env or {})}
     try:
         return C.run_git(work, [*_GIT_SAFE, *args], e)
-    except (subprocess.TimeoutExpired, OSError, C.J._WorkerDied) as ex:   # an aborted episode is resubmitted; a
-        # crash would end the run
+    except (subprocess.SubprocessError, OSError, C.J._WorkerDied) as ex:   # a timeout or a failing preexec_fn: an
+        # aborted episode is resubmitted; a crash would end the run
         raise Aborted(f"harness git {args[:1]}: {type(ex).__name__}") from ex
 
 

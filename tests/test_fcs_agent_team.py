@@ -65,4 +65,20 @@ with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as w, \
     A.run_command("printf x > \"$(printf 'bad\\377name.txt')\" && echo '// 2' >> solution.cpp", w)
     T.commit_as(w, "agent2", 2)
     check("agent2 agent2 step 2" in T._git(w, "log", "--format=%an %s").stdout, "a file name that is not UTF-8 is committed")
+import subprocess  # noqa: E402
+from miles_team.team_rollout import Aborted  # noqa: E402
+real_run_git = T.C.run_git
+for err in (subprocess.SubprocessError("Exception occurred in preexec_fn."), subprocess.TimeoutExpired(["git"], 60)):
+    def bad(*a, err=err, **k):
+        raise err
+    T.C.run_git = bad
+    try:
+        T._git("/nonexistent", "status")
+        got = None
+    except Aborted as ex:
+        got = str(ex)
+    except Exception as ex:
+        got = f"not Aborted: {ex!r}"
+    check(got is not None and got.startswith("harness git"), f"harness git {type(err).__name__}: Aborted ({got})")
+T.C.run_git = real_run_git
 print("ALL OK" if ok else "SOME FAILED"); sys.exit(0 if ok else 1)
