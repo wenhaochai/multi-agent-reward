@@ -101,5 +101,31 @@ check(len(calls) == 2 and sess.n_cont == 0 and not sess.cont, "turn 3: back to t
 # a _cont message after a trimmed parent stands alone
 api = g["to_api"]([{"role": "user", "content": "[trimmed]"}, hist[-2], hist[-1]])
 check(api[1]["role"] == "assistant" and len(api[1]["tool_calls"]) == 1 and api[2]["role"] == "tool", "history: orphan _cont")
+
+# per-turn usage on the agent's turn records: server, latency, tokens, cached tokens (None without the cache report)
+class _Http2:
+    def __init__(self, details):
+        self.details = details
+
+    def post(self, url, json):
+        tcs = [{"id": "x", "type": "function", "function": {"name": "bash", "arguments": '{"command": "%s"}' % c}}
+               for c in ("ls", "pwd")]
+        return _Resp({"choices": [{"message": {"reasoning_content": "R", "content": "plan", "tool_calls": tcs},
+                                   "finish_reason": "tool_calls"}],
+                      "usage": {"prompt_tokens": 120, "completion_tokens": 30, "prompt_tokens_details": self.details}})
+
+
+OUT0 = {"output": "x\n", "returncode": 0, "exception_info": ""}
+for details, want in [({"cached_tokens": 96}, 96), (None, None)]:
+    g["_http"] = _Http2(details)
+    ag = g["_Agent"](SimpleNamespace(evaluation=True, base_url="http://x"), 0, "Read n.")
+    c1 = asyncio.run(ag.think())
+    ag.observe(c1, OUT0, 1, 0)
+    c2 = asyncio.run(ag.think())
+    ag.observe(c2, OUT0, 2, 0)
+    u = ag.turns[0].get("usage") or {}
+    check(c1 == "ls" and u.get("cached_tokens") == want and u.get("prompt_tokens") == 120 and u.get("completion_tokens") == 30
+          and u.get("base_url") == "http://x" and u.get("tries") == 1 and "latency_s" in u, f"usage on the turn record, cached {want}")
+    check(c2 == "pwd" and "usage" not in ag.turns[1], "queued call: no usage")
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)

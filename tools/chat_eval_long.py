@@ -291,8 +291,10 @@ class ChatSession:
         self.last_reasoning, self.fresh, self.used = "", False, 0   # used: prompt + completion tokens of the last call
         self.queue, self.cont, self.n_cont = [], False, 0   # calls a response made beyond its first; cont: this turn
         # handed one out; n_cont: how many since the last model call
+        self.last_call = None   # the last turn's model call: server, latency, tries, tokens, cached tokens (None: no call)
 
     async def turn(self, messages: list, max_tokens: int) -> tuple[str, bool]:
+        self.last_call = None
         if self.queue:   # the next call of the last response: no model call, no tokens
             self.cont, self.fresh, self.n_cont = True, False, self.n_cont + 1
             block = _block(self.queue.pop(0))
@@ -309,9 +311,10 @@ class ChatSession:
                 "top_k": args.top_k}
         if TOOLCALL:
             body["tools"] = [BASH_TOOL]
-        out, attempt = None, 0
+        out, attempt, tries, t0 = None, 0, 0, time.time()
         while True:
             url = _route(self.input)
+            tries += 1
             try:
                 async with _http.post(f"{url}/v1/chat/completions", json=body) as r:
                     if r.status == 400:
@@ -360,6 +363,11 @@ class ChatSession:
             content += _block(cmds[0])
             self.queue = [] if cut else cmds[1:]
         n_out = int(usage.get("completion_tokens") or 0)
+        # cached_tokens needs the servers' --enable-cache-report; None without it
+        self.last_call = {"base_url": url, "latency_s": round(time.time() - t0, 2), "tries": tries,
+                          "prompt_tokens": int(usage.get("prompt_tokens") or 0), "completion_tokens": n_out,
+                          "cached_tokens": (usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
+                          "finish_reason": ch.get("finish_reason")}
         self.used = int(usage.get("prompt_tokens") or 0) + n_out
         self.segments.append(SimpleNamespace(loss_mask=[1] * n_out))
         self.last_reasoning, self.fresh = reasoning, True
@@ -380,7 +388,13 @@ class _Agent(L._Agent):
             self.sess.fresh = False
 
     async def think(self):
+        self.sess.last_call = None   # a turn that ends before the model call (token budget) leaves none
         cmd = await super().think()
+        st = self.sess.last_call   # this turn's model call goes on its record; a queued call (no model call) has none
+        if st is not None and cmd is not None:
+            self._pending[1]["usage"] = st   # observe() spreads it into self.turns
+        elif st is not None and self.turns:   # a format error or a cut turn appended its record already
+            self.turns[-1]["usage"] = st
         if cmd is None:   # a format or length error added (assistant, error) now
             self._keep_reasoning()
         return cmd
