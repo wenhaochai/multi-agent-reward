@@ -359,12 +359,16 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
 
     def read_code(path: str):
         """(real path, text or None when larger than MAX_FILE) of a regular file inside the repository (a symlink out
-        of it is refused), or None when there is no such file."""
-        p = os.path.realpath(os.path.join(work, path))
-        if not p.startswith(os.path.realpath(work) + os.sep) or not os.path.isfile(p):
+        of it is refused), or None when there is no such file. A file the agent made unreadable (chmod 000; the harness
+        runs as the same uid) is None too, so submit, the finish command and the auto-judge never raise on it."""
+        try:
+            p = os.path.realpath(os.path.join(work, path))
+            if not p.startswith(os.path.realpath(work) + os.sep) or not os.path.isfile(p):
+                return None
+            with open(p, "rb") as f:
+                code = f.read(MAX_FILE + 1)
+        except OSError:
             return None
-        with open(p, "rb") as f:
-            code = f.read(MAX_FILE + 1)
         return p, (None if len(code) > MAX_FILE else code.decode("utf-8", errors="replace"))
 
     async def do_submit(a, path: str) -> dict:

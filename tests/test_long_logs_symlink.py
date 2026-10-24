@@ -1,6 +1,7 @@
 """fcs_agent_long's SCORES.md and BOARD.md writer does not follow what the agent puts at those paths (audit
 2026-10-24): symlinks out of the repository are replaced, not written through; a directory is replaced; no temp file is
-left; nothing raises. Also a symlinked solution.cpp is not read for the finish command. Scripted agent, stubbed judge."""
+left; nothing raises. Also a symlinked or unreadable (chmod 000) solution.cpp is not read for submit, the finish
+command or the auto-judge. Scripted agent, stubbed judge."""
 import asyncio
 import os
 import sys
@@ -88,5 +89,21 @@ check("a directory at SCORES.md is replaced by the file", a.outs[5].lstrip().sta
 check("a symlink out of the repository is not read as solution.cpp", len(judged) == 1 and "no solution.cpp" in a.outs[7],
       (judged, a.outs[7]))
 check("episode ran to the end without an exception", a.steps == 8 and S == 0.5, (a.steps, S))
+
+# an unreadable solution.cpp (chmod 000; the harness has the same uid) is "no file" for submit, the finish command and
+# the auto-judge at a budget end, and does not raise PermissionError out of episode() (review 2026-10-24)
+judged.clear()
+Scripted.script = ["printf 'int main(){return 0;}\\n' > solution.cpp && chmod 000 solution.cpp", "submit", FIN]
+try:
+    agents, S, info = asyncio.run(L.episode(inp, [{"role": "user", "content": "problem"}], LABEL))
+    a, err = agents[0], None
+except Exception as e:  # noqa: BLE001
+    err = e
+check("chmod 000 solution.cpp: episode ends without an exception", err is None, repr(err))
+if err is None:
+    check("chmod 000: submit says no file", "no file solution.cpp" in a.outs[1], a.outs[1])
+    check("chmod 000: the finish command says no solution.cpp", "no solution.cpp" in a.outs[2], a.outs[2])
+    check("chmod 000: nothing judged, S 0, S_auto 0", not judged and S == 0.0 and info["fo_lg_S_auto"] == 0.0
+          and info["fo_lg_auto_judged"] == 0.0, (judged, S, info))
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)
