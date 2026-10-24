@@ -468,10 +468,12 @@ def _read(path: Path) -> list:
     return rows
 
 
-def outcome(want: list, recs: list, ran: list, max_tries: int, episodes: int) -> tuple[str, int]:
+def outcome(want: list, recs: list, ran: list, max_tries: int, episodes: int, kept: bool = False) -> tuple[str, int]:
     """The summary line and the exit status. A key (pid, episode) of `want` is complete with a clean row, or given up
     after max_tries rows that are not clean (aborted, crashed or judge-infra); the others are retried by the next run
-    (exit 99). The mean covers the clean rows only, and the line says how many keys it leaves out."""
+    (exit 99). The mean covers the clean rows only, and the line says how many keys it leaves out. Exit 1 when every
+    row of this run is a crash and no other episode of it kept work for the rerun (kept: paused, cancelled, or a
+    checkpoint still on disk)."""
     by: dict = {}
     for r in recs:
         by.setdefault((r["pid"], r["episode"]), []).append(r)
@@ -490,7 +492,7 @@ def outcome(want: list, recs: list, ran: list, max_tries: int, episodes: int) ->
     line = (f"{'INCOMPLETE' if retry else 'DONE'} {len(ok)}/{len(want)} clean episodes (to rerun {len(retry)}, given "
             f"up after {max_tries} tries {len(given_up)}, judge-infra among them {infra}); mean final score "
             f"{mean(list(ok.values())):.2f} over clean episodes; {by_ep}")
-    if ran and not any(_clean(r) for r in ran) and all(r.get("crash") for r in ran):
+    if ran and not kept and not any(_clean(r) for r in ran) and all(r.get("crash") for r in ran):
         return line + f"\nFAILED: all {len(ran)} episodes of this run crashed", 1
     return line, 99 if retry else 0
 
@@ -610,11 +612,13 @@ async def main():
     for t in tasks:
         if not t.cancelled() and t.exception() is not None:   # the driver's own bug (one() catches the episode's)
             raise t.exception()
-    line, code = outcome(want, _read(res_path), ran, args.max_episode_tries, args.episodes)
+    n_cut = sum(t.cancelled() for t in tasks)
+    # a crash clears its own state, so only a state still on disk is work the rerun resumes
+    kept = bool(paused[0] or n_cut or any(ck.saves and ck.exists() for ck in cks))
+    line, code = outcome(want, _read(res_path), ran, args.max_episode_tries, args.episodes, kept)
     print(line, flush=True)
     if DOWN:
         print(f"servers down: {sorted(DOWN)}", flush=True)
-    n_cut = sum(t.cancelled() for t in tasks)
     if _stop[0] or paused[0] or n_cut:
         print(f"stopped ({_stop[0]}): {paused[0]} episodes paused at a checkpoint, {n_cut} cancelled", flush=True)
     if code and _stop[0] == "tail":

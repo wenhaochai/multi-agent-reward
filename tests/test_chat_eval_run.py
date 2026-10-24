@@ -172,6 +172,23 @@ starts.clear()
 c = run("c4")
 check(c == 0 and starts[(1, 0)] == [2] and starts[(2, 0)] == [0], "abort resumes at round 2, crash starts fresh", starts)
 
+mode = {(0, 0): "raise"}
+ROUNDS = {i: 100000 for i in range(4)}
+os.environ["SLURM_JOB_END_TIME"] = str(int(time.time()) + g["STOP_MARGIN_S"] + 1)
+c = run("c5")
+del os.environ["SLURM_JOB_END_TIME"]
+r = rows("c5")
+st = sorted(p.name for p in (TMP / "c5/state").iterdir())
+check(c == 99 and [(x["pid"], x.get("crash")) for x in r] == [(0, True)] and len([x for x in st if x.endswith(".pkl")]) == 3,
+      "time stop: one crash and three paused episodes, exit 99", (c, r, st))
+
+mode = {(i, 0): "raise" for i in range(4)}
+ROUNDS = {}
+c = run("c6")
+check(c == 1 and len(rows("c6")) == 4 and not list((TMP / "c6/state").iterdir()),
+      "every episode crashes after its saves: exit 1", (c, rows("c6")))
+mode = {}
+
 # ChatSession: a 400 that is not about the context, and a reply without choices
 from types import SimpleNamespace  # noqa: E402
 
