@@ -66,6 +66,10 @@ def check(name, cond, detail=""):
     print(("OK  " if cond else "FAIL"), name, "" if cond else detail)
 
 
+# wall-clock numbers differ between any two runs; everything else must match
+CLOCK = {"t", "think_s", "seconds", "cmd_wall_s", "cmd_queue_s", "harness_s", "judge_s", "llm_s", "t_req_start"}
+
+
 def run(ckpt=None):
     prompts.clear()
     inp = SimpleNamespace(sample=SimpleNamespace(index=3, group_index=1), evaluation=True)
@@ -73,11 +77,11 @@ def run(ckpt=None):
     files = sorted(glob.glob(os.path.join(TRACE, "*.jsonl")))
     tr = json.loads(open(files[-1]).read().splitlines()[-1])
     return {"chats": [json.dumps(a.chat) for a in agents], "S": S,
-            "info": {k: v for k, v in info.items() if k != "fo_ag_run_min"},
-            "subs": [{k: v for k, v in s.items() if k != "rev"} for s in tr["submissions"]],
+            "info": {k: v for k, v in info.items() if not k.endswith("_min")},
+            "subs": [{k: v for k, v in s.items() if k not in ("rev", "judge_s")} for s in tr["submissions"]],
             "board": tr["board"], "rounds": tr["rounds"], "git_log": tr["git_log"], "blame": tr["blame"],
             "agents": [{k: v for k, v in x.items() if k != "turns"} for x in tr["agents"]],
-            "turns": [[{k: v for k, v in t.items()} for t in x["turns"]] for x in tr["agents"]],
+            "turns": [[{k: v for k, v in t.items() if k not in CLOCK} for t in x["turns"]] for x in tr["agents"]],
             "used": [a.sess.used for a in agents], "prompts": dict(prompts)}
 
 
@@ -101,6 +105,9 @@ except L.Paused:
     paused = True
 hook["stop_at"] = None
 tars = glob.glob(path + ".r*.tgz")
+st = L.Checkpoint(path).load() or {"agents": [{}]}
+check("the state has the game's counters and the episode's wall time", "idle_fin" in st["agents"][0].get("agent", {})
+      and st.get("wall_ep", 0) > 0 and st["config"]["END"] == L.END and st["config"]["HARNESS"] == L.HARNESS, st.keys())
 check("pause saves one state and one tar", paused and ck.saves >= 1 and os.path.exists(path + ".pkl") and len(tars) == 1,
       (paused, ck.saves, tars))
 ck2 = L.Checkpoint(path, every=1e9)
@@ -136,5 +143,21 @@ L.TOKENS += 1
 res = run(L.Checkpoint(path, every=1e9))
 L.TOKENS -= 1
 check("other settings: fresh start", res["rounds"] == ref["rounds"] and len(res["prompts"]) == len(ref["prompts"]))
+
+# nor one of a setting that changes the game: a paused state, then one setting changed, starts fresh
+for name, val in [("CTX_LOW", 0.75), ("HARNESS", "v2"), ("END", "budget"), ("VERDICTS", True)]:
+    p2 = os.path.join(tempfile.mkdtemp(), "state", "0_e1")
+    ck = L.Checkpoint(p2, every=1e9)
+    hook.update(stop_at=("agent1", 3), ckpt=ck)
+    try:
+        run(ck)
+    except L.Paused:
+        pass
+    hook["stop_at"] = None
+    old = getattr(L, name)
+    setattr(L, name, val)
+    res = run(L.Checkpoint(p2, every=1e9))
+    setattr(L, name, old)
+    check(f"other {name}: fresh start", ck.saves and ("agent1", 0) in res["prompts"], sorted(res["prompts"]))
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)

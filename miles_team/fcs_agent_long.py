@@ -18,13 +18,17 @@ What changes against fcs_agent_team (one submission, no feedback, no messages):
                   does and the agent goes on; when solution.cpp has not changed since its last submission it ends the
                   agent's work.
   the end         an agent stops when it runs the finish command on an unchanged solution.cpp, uses up MA_LG_TOKENS
-                  generated tokens, or makes three format errors in a row. When every agent has stopped, the submission
+                  generated tokens, or makes three format errors in a row (MA_LG_END=budget: not on an unchanged
+                  finish command, unless it is the third in a row). When every agent has stopped, the submission
                   with the highest provisional score (the earliest on a tie) is the team's answer, and its FINAL score
                   (the mean over the cases at 0-based odd indices, files 2.in, 4.in, ..., never shown to the agents) is
                   the episode's score. A problem with a single test case uses it for both, so its final score is not
-                  held out (flagged "shared_case" in the trace).
+                  held out (flagged "shared_case" in the trace, fo_lg_shared_case in info). An unsubmitted
+                  solution.cpp left by an agent that did not finish is judged apart: fo_lg_S_auto is the score had it
+                  been submitted (S itself counts only submissions).
   context         a long episode overflows the 65k-token context, so before each step the oldest steps of an agent's
-                  chat are dropped (MA_LG_CTX_CHARS of history kept) and its instance message says how many; the agents
+                  chat are dropped (once over MA_LG_CTX_CHARS, down to MA_LG_CTX_LOW of it) and its instance message
+                  says how many; the agents
                   are told to keep what matters in files (notes, SCORES.md, BOARD.md).
   memory          in evaluation only the last turn's segment is kept (every turn re-renders the whole chat, so keeping
                   every segment would hold hundreds of full contexts per agent); generated tokens are counted apart.
@@ -34,10 +38,13 @@ What changes against fcs_agent_team (one submission, no feedback, no messages):
                   with the same path resumes from it: a 1M-token episode outlasts one 3-6 h wq piece. Without ckpt
                   nothing changes (generate() and the miles path pass none).
 
-Env: MA_LG_N (4), MA_LG_TOKENS (500000 per agent), MA_LG_CTX_CHARS (110000), MA_LG_MAX_ROUNDS (2000, a safety cap),
-MA_LG_CKPT_S (300), MA_LG_VERDICTS (0; 1 shows each provisional test's verdict, OK / WA / TLE / MLE / RE / OLE / CE,
-beside its score: a different game, recorded as fo_lg_verdicts, so never pool runs across it),
-fcs_agent's MA_AG_TURN / MA_AG_TIMEOUT / MA_AG_THINK / MA_AG_MAX_LEN / MA_AG_TRACE_DIR.
+Env: MA_LG_N (4), MA_LG_TOKENS (500000 per agent), MA_LG_CTX_CHARS (110000), MA_LG_CTX_LOW (1.0: a trim cuts the
+history to this share of MA_LG_CTX_CHARS; 0.75 keeps the prefix cache for many steps), MA_LG_MAX_ROUNDS (2000, a safety
+cap), MA_LG_END (voluntary | budget: see END), MA_LG_HARNESS (v1: the first prompt and observations; v2: budget line,
+shell facts, single-case and combined-finish notes; see HARNESS), MA_LG_CKPT_S (300), MA_LG_VERDICTS (0; 1 shows each
+provisional test's verdict, OK / WA / TLE / MLE / RE / OLE / CE, beside its score: a different game, recorded as
+fo_lg_verdicts, so never pool runs across it), fcs_agent's MA_AG_TURN / MA_AG_TIMEOUT / MA_AG_THINK / MA_AG_MAX_LEN /
+MA_AG_TRACE_DIR.
 --custom-generate-function-path miles_team.fcs_agent_long.generate   (evaluation; training is not supported yet)
 """
 from __future__ import annotations
@@ -60,15 +67,36 @@ from miles.utils.types import Sample
 
 from . import fcs_agent as A
 from . import fcs_agent_team as T
+from . import fcs_cmd as C
 from .fcs_rm import answer, judge_code
 from .team_rollout import Aborted, Session
 
 N = int(os.environ.get("MA_LG_N", "4"))
 TOKENS = int(os.environ.get("MA_LG_TOKENS", "500000"))
 CTX_CHARS = int(os.environ.get("MA_LG_CTX_CHARS", "110000"))
+# a trim cuts the history to CTX_LOW x CTX_CHARS (hysteresis): the prompt prefix, and with it the server's prefix cache,
+# then holds for many steps between trims. 1.0 = the first version: once full, every step trims and re-prefills it all
+# (audit 2026-10-24: ~125k tokens re-prefilled per step past ~120k tokens of history)
+CTX_LOW = float(os.environ.get("MA_LG_CTX_LOW", "1.0"))
+assert 0 < CTX_LOW <= 1, CTX_LOW
 MAX_ROUNDS = int(os.environ.get("MA_LG_MAX_ROUNDS", "2000"))
 CKPT_S = float(os.environ.get("MA_LG_CKPT_S", "300"))
 VERDICTS = os.environ.get("MA_LG_VERDICTS", "0") == "1"
+# the harness version (audit 2026-10-24). v1: the prompt and observations of the smokes and of w100-w105. v2: every
+# observation and error message ends with the tokens used and left; the prompt states the shell's limits (/tmp, the
+# 4 GB address space and ASan, the auto-commits) and, for a problem with one test case, that its provisional score is
+# its final one; a finish command combined with others says that nothing was submitted. Do not pool v1 and v2 rows.
+HARNESS = os.environ.get("MA_LG_HARNESS", "v1")
+assert HARNESS in ("v1", "v2"), HARNESS
+V2 = HARNESS == "v2"
+# how an agent's work ends (audit 2026-10-24: Flint ended voluntarily at 16-46% of a 300k budget, so the 500k and 1M
+# rows would repeat the 150k one). voluntary: the finish command on an unchanged solution.cpp ends it (the first
+# protocol). budget: nothing ends it but the budget (or the context, or format errors); the finish command on an
+# unchanged file says so and goes on, and three of those in a row end the agent as IdleFinish. Never pool the two.
+END = os.environ.get("MA_LG_END", "voluntary")
+assert END in ("voluntary", "budget"), END
+BUDGET_END = END == "budget"
+IDLE_FINISHES = 3
 MAX_FILE = 256 << 10          # bytes of a submitted file
 MAX_POST = 2000               # characters of one message
 INFRA_RETRIES, INFRA_BACKOFF = 2, 2.0   # a judge infra failure is judged again, after 2 s, then 4 s
@@ -91,48 +119,92 @@ _TEAM_ENV = ("You are {name}, one of {n} agents working at the same time in this
              "commits.")
 _SOLO_ENV = ("You work alone in a git repository with a Linux shell (g++, python3, git and the usual command-line "
              "tools; no internet).")
+# v2's facts about the shell (no braces: _TEAM_ENV goes through .format). 50 of 866 smoke turns failed on /tmp; one
+# episode spent ~110 steps on a heap crash after ASan could not start; Flint restored code by full rewrites.
+_ENV_FS = (" Your current directory is the repository and the only place where you can create or change files: /tmp "
+           "and every other path outside it cannot be written (/tmp cannot even be listed), so keep all files there, "
+           "scratch files included, and use relative paths.")
+_ENV_ASAN = (" Each command runs with a 4 GB address-space limit, so -fsanitize=address cannot start; to find memory "
+             "errors use -fsanitize=undefined, -D_GLIBCXX_ASSERTIONS or gdb.")
+assert C.CMD_MEM == 4 << 30, "_ENV_ASAN names the limit"
+_ENV_COMMITS = (" After every command the repository's source files (.cpp, .py, .md, .txt and similar; not binaries or "
+                "files over 1 MB) are committed, so `git log` lists every version and `git show <commit>:solution.cpp "
+                "> solution.cpp` brings one back.")
 _TOOLS = """
 
 ## Long work, submissions and messages
 
 You have a budget of about {budget} generated tokens, and you should use it: keep improving your program for as long \
-as you can make it better. Three commands are provided by the harness; each must be the whole action, alone:
+as you can make it better.{budget_shown} Three commands are provided by the harness; each must be the whole action, alone:
 
 - `submit` or `submit <file>`: judges the file (default solution.cpp) right away and shows its PROVISIONAL score \
-(0-100): the mean over half of the hidden tests, with {per_test} and any compiler errors. You \
-may submit as often as you like.{team_submit}
+(0-100): {prov_rule}. You may submit as often as you like.{team_submit}
 - `post <message>`: {post_text}
-- `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`: submits solution.cpp, as `submit` does, and your work goes on. Run \
-it on a solution.cpp that has not changed since your last submission to end your work.
+- `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`: submits solution.cpp, as `submit` does, and your work goes on.{fin_end}
 
-When {when_end}, the submission with the highest provisional score is judged on the OTHER half of the hidden tests; \
-that final score is the result. Older steps of this conversation are removed when it gets long, so keep what you need \
+When {when_end}, {final_rule} Older steps of this conversation are removed when it gets long, so keep what you need \
 to remember in a notes file and re-read it; SCORES.md lists every submission and its provisional score."""
+_FIN_END = " Run it on a solution.cpp that has not changed since your last submission to end your work."
 _STEP6 = ("6. Submit with `submit` whenever you have something better, read the provisional score, and keep "
           "improving.\n7. `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` also submits solution.cpp and shows its "
-          "provisional score; your work then goes on, so keep improving and run it again. Run it on a solution.cpp "
-          "that has not changed since your last submission to end your work.")
+          "provisional score; your work then goes on, so keep improving and run it again." + _FIN_END)
 
 
-def instance(problem: str, name: str) -> str:
+_FINAL_RULE = ("the submission with the highest provisional score is judged on the OTHER half of the hidden tests; that "
+               "final score is the result.")
+_PROV_RULE = "the mean over half of the hidden tests, with {per_test} and any compiler errors"
+_VERDICT_KEY = ("(OK: a valid output, scored by the checker, which may give it 0; WA: wrong answer; TLE, MLE, OLE: over "
+                "the time, memory or output limit; RE: runtime error; CE: compile error)")
+_SHARED_FINAL = ("the submission with the highest provisional score is the result. This problem has a single hidden "
+                 "test: the provisional score of your best submission is also its final score.")
+
+
+def instance(problem: str, name: str, shared: bool = False) -> str:
+    """The instance message; shared (v2 only): the problem has one test case, which is provisional and final."""
     team = N > 1
+    shared = shared and V2
     tools = _TOOLS.format(
         budget=f"{TOKENS:,}",
-        per_test=("the score and verdict of each of those tests (OK: a valid output, scored by the checker, which may "
-                  "give it 0; WA: wrong answer; TLE, MLE, OLE: over the time, memory or output limit; RE: runtime "
-                  "error; CE: compile error)" if VERDICTS else "the score of each of those tests"),
+        budget_shown=(" The end of each observation shows how many tokens you have used; when they run out, your work "
+                      "ends and only what you have submitted counts." if V2 else ""),
+        prov_rule=((f"its score and verdict on the single hidden test {_VERDICT_KEY}" if VERDICTS else
+                    "its score on the single hidden test") + ", with any compiler errors" if shared else
+                   _PROV_RULE.format(per_test=f"the score and verdict of each of those tests {_VERDICT_KEY}" if VERDICTS
+                                     else "the score of each of those tests")),
+        final_rule=_SHARED_FINAL if shared else _FINAL_RULE,
         team_submit=(" Every submission of every agent and its provisional score is shown to all agents." if team
                      else ""),
         post_text=("sends the message to every other agent; their messages appear at the top of your next "
                    "observations, and BOARD.md keeps them all. Use it to split the work, report what you found and "
                    "agree on the next step." if team else "there are no other agents, so this only writes BOARD.md."),
-        when_end="every agent has finished" if team else "you finish")
+        fin_end="" if BUDGET_END else _FIN_END,
+        when_end=(("every agent has used up its token budget" if team else "your token budget is used up") if BUDGET_END
+                  else "every agent has finished" if team else "you finish"))
     steps = f" You have at most {A.STEPS} steps." if A.STEPS > 0 else ""
-    text = (_FLAT.replace(_LONE_ENV, _TEAM_ENV if team else _SOLO_ENV).replace(_LONE_SUBMIT, _STEP6))
+    env = _TEAM_ENV if team else _SOLO_ENV
+    if V2:
+        env += ("" if team else _ENV_COMMITS) + (_ENV_FS if C.J.LANDLOCK_ABI else "") + _ENV_ASAN
+    text = (_FLAT.replace(_LONE_ENV, env).replace(_LONE_SUBMIT, _STEP6.replace(_FIN_END, "") if BUDGET_END else _STEP6))
     text = text.format(problem=problem, timeout=A.TIMEOUT, steps=steps, name=name, n=N)
     marker = "## Important Rules"
     assert marker in text
     return text.replace(marker, tools.strip() + "\n\n" + marker, 1)
+
+
+# the last lines of the format errors (fcs_agent's text format; chat_eval_long's tool-call format), which say the
+# finish command ends the task; v2 says what it does here
+_FORMAT_ERROR_ENDS = ("If you have completed your assignment, please consult the first message about how to\nsubmit your "
+                      "solution (you will not be able to continue working on this task after that).",
+                      "If you want to end the task, please issue the following command: "
+                      "`echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`\nwithout any other command.")
+assert _FORMAT_ERROR_ENDS[0] in A.FORMAT_ERROR, "fcs_agent.FORMAT_ERROR changed"
+_FORMAT_ERROR_END_V2 = ("To submit solution.cpp, issue `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` (or `submit`) without "
+                        "any other command; your work then goes on. Issued on an unchanged solution.cpp, it ends your "
+                        "work.")
+_FORMAT_ERROR_END_BUDGET = "To submit, run `submit` alone."
+_MARK_CMD_RE = re.compile(r"\becho\s+['\"]?" + A.MARK)
+_COMBINED_NOTE = ("\nNothing was submitted: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` works only as the whole command, "
+                  "alone.\n")
 
 
 def split_cases(n: int) -> tuple[list[int], list[int], bool]:
@@ -154,14 +226,28 @@ def subset_mean(cases: list[float], idx: list[int]) -> float:
     return sum(vals) / len(vals) if vals else 0.0
 
 
-def trim_chat(chat: list, keep_chars: int, dropped: int) -> tuple[list, int]:
-    """Drop the oldest (assistant, user) pairs after [system, instance] until the history fits keep_chars; the
-    instance message then says how many steps were removed. Returns (chat, total dropped)."""
+def harness_tag() -> str:
+    """The settings that change what the agents see or how the episode ends, for results.jsonl and the trace: rows
+    with different tags are different protocols."""
+    return f"long-{HARNESS}{'-budget' if BUDGET_END else ''}-ctxlow{CTX_LOW:g}"
+
+
+def sha1(code: str) -> str:
+    return hashlib.sha1(code.encode()).hexdigest()[:12]
+
+
+def trim_chat(chat: list, keep_chars: int, dropped: int, low_chars: int | None = None) -> tuple[list, int]:
+    """Once the history after [system, instance] is over keep_chars, drop the oldest (assistant, user) pairs until it
+    fits low_chars (default keep_chars); the instance message then says how many steps were removed. Returns (chat,
+    total dropped)."""
     head, hist = chat[:2], chat[2:]
     n = [len(m["content"]) + len(m.get("reasoning_content") or "") for m in hist]   # reasoning kept in history (Flint)
     size = sum(n)
+    if size <= keep_chars:
+        return chat, dropped
+    target = keep_chars if low_chars is None else min(low_chars, keep_chars)
     k = 0
-    while size > keep_chars and len(hist) - 2 * k > 2:
+    while size > target and len(hist) - 2 * k > 2:
         size -= n[2 * k] + n[2 * k + 1]
         k += 1
     if not k:
@@ -177,29 +263,44 @@ class _Agent(T._Agent):
     """fcs_agent_team's agent with a token budget of its own (segments are trimmed in evaluation) and a chat that is
     trimmed to the context."""
 
-    def __init__(self, input, j: int, problem: str):
+    def __init__(self, input, j: int, problem: str, shared: bool = False):
         self.name = f"agent{j + 1}"
         self.sess = Session(input, self.name, A.THINK, max_len=A.MAX_LEN)
-        self.chat = [{"role": "system", "content": A.SYSTEM}, {"role": "user", "content": instance(problem, self.name)}]
+        self.chat = [{"role": "system", "content": A.SYSTEM},
+                     {"role": "user", "content": instance(problem, self.name, shared)}]
         self.steps = self.fmt_run = self.fmt_total = self.timeouts = self.cut_n = 0
         self.done, self.exit, self.turns, self.segs = False, "", [], []
         self.generated, self.dropped, self.seen, self.last_seg = 0, 0, 0, None
         self.n_submit = self.n_post = 0
         self.last_sha = None   # sha of solution.cpp at this agent's last submission of it
+        self.idle_fin = 0      # unchanged finish commands in a row (MA_LG_END=budget)
 
     def gen(self) -> int:
         return self.generated
+
+    def _usage(self) -> str:
+        """v2: the line that ends every observation and error message (none in v1). It goes after the rendering, so
+        the elision, the MARK check and the trace's output are unchanged."""
+        if not V2:
+            return ""
+        return (f"\n<budget>{self.generated:,} of {TOKENS:,} generated tokens used; about "
+                f"{max(0, TOKENS - self.generated):,} left.</budget>")
 
     async def think(self):
         """One model turn, as fcs_agent_team's, with this module's token budget and context trimming."""
         if self.generated >= TOKENS:
             self.done, self.exit = True, "TokensExceeded"
             return None
-        self.chat, self.dropped = trim_chat(self.chat, CTX_CHARS, self.dropped)
+        self.chat, self.dropped = trim_chat(self.chat, CTX_CHARS, self.dropped, int(CTX_LOW * CTX_CHARS))
         self.steps += 1
         self.sess.last_messages = None
-        n_seg = len(self.sess.segments)
+        n_seg, g0, t0 = len(self.sess.segments), self.generated, time.monotonic()
         text, cut = await self.sess.turn(self.chat, min(A.TURN, TOKENS - self.generated))
+        # the turn's accounting for the trace: completion tokens, prompt + completion of the call (None without a new
+        # segment, so a stale count is not reused), the history dropped so far, the wall time of the model call and,
+        # from a session that records it (chat_eval_long.ChatSession.last_call), the server's own numbers
+        acct = {"tokens": 0, "used": None, "dropped": self.dropped, "think_s": round(time.monotonic() - t0, 3),
+                "t": round(time.time(), 1), **(getattr(self.sess, "last_call", None) or {})}
         for tok in A._SPECIAL:
             text = text.replace(tok, "")
         if len(self.sess.segments) > n_seg:
@@ -208,19 +309,24 @@ class _Agent(T._Agent):
             self.last_seg = seg
             if self.sess.input.evaluation:   # keep one segment: the episode returns only the last one
                 self.sess.segments = [seg]
+            acct.update(tokens=self.generated - g0, used=getattr(self.sess, "used", None))
         if not text and cut:
             self.done, self.exit = True, "ContextExceeded"
-            self.turns.append({"step": self.steps, "text": "", "cut": True})
+            self.turns.append({"step": self.steps, "text": "", "cut": True, **acct})
             return None
         vis = "" if cut else answer(text, A.THINK).strip()
         actions = [] if cut else [a.strip() for a in A.ACTION_RE.findall(vis)]
-        rec = {"step": self.steps, "text": text, "cut": bool(cut)}
+        rec = {"step": self.steps, "text": text, "cut": bool(cut), **acct}
         if len(actions) != 1:
             self.fmt_run, self.fmt_total, self.cut_n = self.fmt_run + 1, self.fmt_total + 1, self.cut_n + bool(cut)
             msg = A.LENGTH_ERROR if cut else A.FORMAT_ERROR.format(
                 error=f"Expected exactly one action, found {len(actions)}.", n=len(actions))
+            if V2 or BUDGET_END:   # the error's last line says the finish command ends the task; here it submits
+                for end in _FORMAT_ERROR_ENDS:
+                    msg = msg.replace(end, _FORMAT_ERROR_END_BUDGET if BUDGET_END else _FORMAT_ERROR_END_V2)
             self.turns.append({**rec, "format_error": True})
-            self.chat = self.chat + [{"role": "assistant", "content": vis or "(cut off)"}, {"role": "user", "content": msg}]
+            self.chat = self.chat + [{"role": "assistant", "content": vis or "(cut off)"},
+                                     {"role": "user", "content": msg + self._usage()}]
             if self.fmt_run >= A.MAX_FORMAT_ERRORS:
                 self.done, self.exit = True, "RepeatedFormatError"
             return None
@@ -229,9 +335,15 @@ class _Agent(T._Agent):
         return actions[0]
 
     def observe(self, cmd: str, out: dict, rnd: int, order: int) -> None:
+        timing = out.get("_timing") or {}   # the episode's waits for this action (judge, command queue, harness)
+        out = {k: v for k, v in out.items() if k != "_timing"}
         T._Agent.observe(self, cmd, out, rnd, order)
+        if self.turns:
+            self.turns[-1].update(seconds=round(out.get("seconds", 0.0), 3), **timing)
         if self.exit == "Submitted":   # the finish command on an unchanged solution.cpp (episode's finish()) ends it
             self.exit = "Finished"
+        if not self.done and V2 and self.chat[-1]["role"] == "user":
+            self.chat[-1] = {**self.chat[-1], "content": self.chat[-1]["content"] + self._usage()}
 
 
 class Paused(Exception):
@@ -239,7 +351,7 @@ class Paused(Exception):
 
 
 _AGENT_STATE = ("chat", "steps", "fmt_run", "fmt_total", "timeouts", "cut_n", "done", "exit", "turns", "generated",
-                "dropped", "seen", "n_submit", "n_post", "last_sha")
+                "dropped", "seen", "n_submit", "n_post", "last_sha", "idle_fin")
 _SESS_STATE = ("used", "queue", "cont", "n_cont", "last_reasoning", "fresh")   # the chat driver's Session fields
 _TAR_MAX = 32 << 20   # a larger file (a generated test input) stays out of the checkpoint; the agent can rebuild it
 
@@ -317,9 +429,9 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
     from miles_team.fcs_judge import load_problem
     from pathlib import Path
     problem = A.problem_text(messages)
-    agents = [_Agent(input, j, problem) for j in range(N)]
     n_cases = len(load_problem(Path(label))["cases"])
     prov_idx, final_idx, shared = split_cases(n_cases)
+    agents = [_Agent(input, j, problem, shared) for j in range(N)]   # a resume builds them so too, then restores
     if ckpt is None:
         work = os.path.join(os.environ.get("TMPDIR", "/tmp"), "agent_long", uuid.uuid4().hex)
     else:   # one name per checkpoint, so paths the agent wrote still hold after a resume in the same job
@@ -328,51 +440,85 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
     os.makedirs(work)
     loop = asyncio.get_running_loop()
     rng = random.Random(f"{label}:{input.sample.index}:{getattr(input.sample, 'group_index', 0)}")
-    rounds, run_s, subs, board, events = 0, 0.0, [], [], []
-    # what a checkpoint must match: the episode and every setting that shapes its prompts and budget
-    config = {"v": 1, "label": label, "index": input.sample.index, "group": getattr(input.sample, "group_index", 0),
-              "N": N, "TOKENS": TOKENS, "CTX_CHARS": CTX_CHARS, "TURN": A.TURN, "MAX_LEN": A.MAX_LEN,
-              "prompt": hashlib.sha1((A.SYSTEM + instance(problem, "agent1")).encode()).hexdigest()[:12]}
+    rounds, run_s, subs, board, events, t_ep = 0, 0.0, [], [], [], time.monotonic()
+    # what a checkpoint must match: the episode and every setting that shapes its prompts, budget or ending
+    config = {"v": 2, "label": label, "index": input.sample.index, "group": getattr(input.sample, "group_index", 0),
+              "N": N, "TOKENS": TOKENS, "CTX_CHARS": CTX_CHARS, "CTX_LOW": CTX_LOW, "HARNESS": HARNESS, "END": END,
+              "VERDICTS": VERDICTS, "TURN": A.TURN, "MAX_LEN": A.MAX_LEN,
+              "prompt": sha1(A.SYSTEM + instance(problem, "agent1", shared))}
 
-    def state() -> dict:
+    def state() -> dict:   # whole turns: the trace keeps them whole too
         return {"config": config, "rounds": rounds, "run_s": run_s, "subs": subs, "board": board, "events": events,
-                "rng": rng.getstate(),
-                "agents": [{"agent": {k: getattr(a, k) for k in _AGENT_STATE} | {   # the trace keeps 4000 chars
-                    "turns": [{**t, "text": t.get("text", "")[-4000:]} for t in a.turns]},
-                    "sess": {k: getattr(a.sess, k) for k in _SESS_STATE if hasattr(a.sess, k)}} for a in agents]}
+                "rng": rng.getstate(), "wall_ep": time.monotonic() - t_ep,
+                "agents": [{"agent": {k: getattr(a, k) for k in _AGENT_STATE},
+                            "sess": {k: getattr(a.sess, k) for k in _SESS_STATE if hasattr(a.sess, k)}} for a in agents]}
+
+    def _put(name: str, text: str) -> None:
+        """Write work/name for the agents to read without following what they put there (audit 2026-10-24: an
+        `ln -sf ~/x SCORES.md` made the harness overwrite ~/x): a new file under a unique name, then a rename over
+        whatever is at the path (a symlink is replaced, not followed). Never raises; on an error the log is stale."""
+        path = os.path.join(work, name)
+        tmp = os.path.join(work, f".{name}.{uuid.uuid4().hex}")
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+            with os.fdopen(fd, "w") as f:
+                f.write(text)
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path, ignore_errors=True)   # rmtree does not follow symlinks
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.unlink(tmp)   # leave nothing for commit_as to pick up
+            except OSError:
+                pass
 
     def write_logs():
-        with open(os.path.join(work, "SCORES.md"), "w") as f:
-            f.write("# Submissions (provisional score = mean over half of the hidden tests)\n\n")
-            f.write("| # | round | agent | file | status | provisional |\n|---|---|---|---|---|---|\n")
-            for i, s in enumerate(subs, 1):
-                f.write(f"| {i} | {s['round']} | {s['agent']} | {s['file']} | {s['status']} | {100 * s['prov']:.2f} |\n")
-        with open(os.path.join(work, "BOARD.md"), "w") as f:
-            f.write("# Messages\n\n" + "".join(f"- [round {r}] {a}: {m}\n" for r, a, m in board))
+        _put("SCORES.md", "# Submissions (provisional score = mean over half of the hidden tests)\n\n"
+             "| # | round | agent | file | status | provisional |\n|---|---|---|---|---|---|\n"
+             + "".join(f"| {i} | {s['round']} | {s['agent']} | {s['file']} | {s['status']} | {100 * s['prov']:.2f} |\n"
+                       for i, s in enumerate(subs, 1)))
+        _put("BOARD.md", "# Messages\n\n" + "".join(f"- [round {r}] {a}: {m}\n" for r, a, m in board))
 
-    async def do_submit(a, path: str) -> dict:
-        p = os.path.realpath(os.path.join(work, path))
-        if not p.startswith(os.path.realpath(work) + os.sep) or not os.path.isfile(p):
-            return {"output": f"submit: no file {path} in the repository\n", "returncode": 1, "exception_info": ""}
-        with open(p, "rb") as f:
-            code = f.read(MAX_FILE + 1)
-        if len(code) > MAX_FILE:
-            return {"output": f"submit: {path} is larger than {MAX_FILE} bytes\n", "returncode": 1, "exception_info": ""}
-        code = code.decode("utf-8", errors="replace")
-        t0 = time.monotonic()   # wall time, the wait for an FCS_RM_CONCURRENCY slot included
+    def read_code(path: str):
+        """(real path, text or None when larger than MAX_FILE) of a regular file inside the repository (a symlink out
+        of it is refused), or None when there is no such file. A file the agent made unreadable (chmod 000; the harness
+        runs as the same uid) is None too, so submit, the finish command and the auto-judge never raise on it."""
+        try:
+            p = os.path.realpath(os.path.join(work, path))
+            if not p.startswith(os.path.realpath(work) + os.sep) or not os.path.isfile(p):
+                return None
+            with open(p, "rb") as f:
+                code = f.read(MAX_FILE + 1)
+        except OSError:
+            return None
+        return p, (None if len(code) > MAX_FILE else code.decode("utf-8", errors="replace"))
+
+    async def judge(code: str) -> tuple[dict, int, float]:
+        """(result, infra retries, wall seconds) of judging code: the wait for an FCS_RM_CONCURRENCY slot and the
+        retries included. The one judge time of the trace (a submission's judge_s, its turn's, fo_lg_judge_min)."""
+        t0 = time.monotonic()
         res = await judge_code(label, code)
         tries = 0   # a transient fork / disk / memory failure must not cost the agent a submission
         while res["infra_error"] and tries < INFRA_RETRIES:
             tries += 1
             await asyncio.sleep(INFRA_BACKOFF * tries)
             res = await judge_code(label, code)
-        judge_s = time.monotonic() - t0
+        return res, tries, round(time.monotonic() - t0, 3)
+
+    async def do_submit(a, path: str) -> dict:
+        got = read_code(path)
+        if got is None:
+            return {"output": f"submit: no file {path} in the repository\n", "returncode": 1, "exception_info": ""}
+        p, code = got
+        if code is None:
+            return {"output": f"submit: {path} is larger than {MAX_FILE} bytes\n", "returncode": 1, "exception_info": ""}
+        res, tries, judge_s = await judge(code)
         cases = res["cases"]
         prov, final = subset_mean(cases, prov_idx), subset_mean(cases, final_idx)
         rev = (await loop.run_in_executor(A._POOL, lambda: T._git(work, "rev-parse", "HEAD").stdout.strip()))
         s = {"agent": a.name, "round": rounds, "step": a.steps, "file": path, "status": res["status"], "prov": prov,
-             "final": final, "infra": bool(res["infra_error"]), "infra_retries": tries, "rev": rev,
-             "sha": hashlib.sha1(code.encode()).hexdigest()[:12], "code": code, "judge_s": round(judge_s, 2),
+             "final": final, "infra": bool(res["infra_error"]), "infra_retries": tries, "rev": rev, "sha": sha1(code),
+             "code": code, "judge_s": judge_s,
              # trace only: every case (final ones too) and the judge's per-case lines; never in the agent's view
              "cases": [round(c, 4) for c in cases], "case_info": res.get("case_info", [])}
         subs.append(s)
@@ -392,24 +538,34 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
                     "may be too heavy to compile; otherwise submit again.\n")
         if res["status"] == "compile error" and res.get("msg"):
             msg += "Compiler output:\n" + res["msg"][:3000] + "\n"
+        if BUDGET_END and not V2:   # (v2's budget line says it on every observation)
+            msg += f"About {max(0, TOKENS - a.generated):,} of your {TOKENS:,} tokens are left.\n"
         return {"output": msg, "returncode": 0, "exception_info": ""}
 
     async def finish(a, out: dict) -> dict:
         """The finish command: submit solution.cpp and go on, or (unchanged since a.last_sha) pass `out` on to end."""
-        p = os.path.join(work, "solution.cpp")
-        if not os.path.isfile(p):
+        got = read_code("solution.cpp")
+        if got is None:
             return {**out, "output": "Finish command received, but there is no solution.cpp to submit. Write "
                                      "solution.cpp and run the command again.\n"}
-        with open(p, "rb") as f:
-            sha = hashlib.sha1(f.read(MAX_FILE + 1).decode("utf-8", errors="replace").encode()).hexdigest()[:12]
-        if sha == a.last_sha:
-            return out
+        if got[1] is not None and sha1(got[1]) == a.last_sha:
+            if not BUDGET_END:
+                return out
+            a.idle_fin = getattr(a, "idle_fin", 0) + 1   # budget mode: the work goes on (episode() ends it after 3)
+            k, x = next(((i, x) for i, x in reversed(list(enumerate(subs, 1))) if x["agent"] == a.name
+                         and x["sha"] == a.last_sha), (len(subs), {"prov": 0.0}))
+            return {"output": f"solution.cpp is unchanged since your submission #{k} (provisional {100 * x['prov']:.2f});"
+                              f" nothing was submitted. About {max(0, TOKENS - a.generated):,} of your {TOKENS:,} "
+                              "tokens are left. Keep improving solution.cpp.\n", "returncode": 0, "exception_info": ""}
+        a.idle_fin = 0
         res = await do_submit(a, "solution.cpp")
         left = max(0, TOKENS - a.generated)
+        tokens = "." if V2 else f": about {left:,} of your {TOKENS:,} tokens are left."   # v2: the budget line says it
+        again = ("and run the command again to submit again.\n" if BUDGET_END else
+                 "and run the command again to submit again; running it while solution.cpp is unchanged since your "
+                 "last submission ends your work.\n")
         return {**res, "output": "Finish command received: solution.cpp was submitted.\n" + res["output"]
-                + f"Your work goes on: about {left:,} of your {TOKENS:,} tokens are left. Keep improving solution.cpp "
-                  "and run the command again to submit again; running it while solution.cpp is unchanged since your "
-                  "last submission ends your work.\n"}
+                + f"Your work goes on{tokens} Keep improving solution.cpp " + again}
 
     def do_post(a, text: str) -> dict:
         text = text.strip().strip("'\"")[:MAX_POST]
@@ -442,6 +598,7 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
                 st = None
         if st is not None:   # the end of the saved round; the work dir replaces whatever a later command half did
             rounds, run_s, subs, board, events = st["rounds"], st["run_s"], st["subs"], st["board"], st["events"]
+            t_ep = time.monotonic() - st["wall_ep"]   # fo_lg_wall_min counts the earlier runs up to the saved round
             rng.setstate(st["rng"])
             for a, d in zip(agents, st["agents"]):
                 for k, v in d["agent"].items():
@@ -460,6 +617,10 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
             n_subs = len(subs)
             for k, (a, cmd) in enumerate(todo):
                 m_sub, m_post = SUBMIT_RE.fullmatch(cmd), POST_RE.fullmatch(cmd)
+                ends = False   # the finish command on an unchanged solution.cpp: finish() passes `out` on to end it
+                fin = False    # the finish command ran (budget mode counts the unchanged ones in a row)
+                timing, t0 = {}, time.monotonic()   # wall times from here, so waits for a worker are seen
+                n_sub = len(subs)
                 if m_sub:
                     out, secs = await do_submit(a, m_sub.group(1) or "solution.cpp"), 0.0
                 elif m_post:
@@ -467,16 +628,31 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
                 else:
                     out = await loop.run_in_executor(A._POOL, A.run_command, cmd, work, True)
                     secs = out["seconds"]
+                    wall = time.monotonic() - t0
+                    timing.update(cmd_wall_s=round(wall, 3), cmd_queue_s=round(wall - secs, 3))
                     lines = out["output"].lstrip().splitlines()
                     if lines and lines[0].strip() == A.MARK and out["returncode"] == 0:
-                        out = {**await finish(a, out), "seconds": secs}
+                        fin = True
+                        res = await finish(a, out)
+                        ends = res is out
+                        out = {**res, "seconds": secs}
+                    elif V2 and _MARK_CMD_RE.search(cmd):   # combined with other commands: say it did not submit
+                        out = {**out, "output": out["output"] + _COMBINED_NOTE}
                 run_s += secs
+                if len(subs) > n_sub:   # submit, or a finish command that submitted: the judge time of do_submit
+                    timing["judge_s"] = subs[-1]["judge_s"]
+                t1 = time.monotonic()
                 await loop.run_in_executor(A._POOL, write_logs)
                 await loop.run_in_executor(A._POOL, T.commit_as, work, a.name, a.steps)
+                timing["harness_s"] = round(time.monotonic() - t1, 3)
                 upd = updates_for(a)
-                if upd:
+                if upd and not ends:   # an ending observation keeps the MARK as its first line
                     out = {**out, "output": upd + out["output"]}
-                a.observe(cmd, out, rounds, k)
+                a.observe(cmd, {**out, "_timing": timing}, rounds, k)
+                if not fin:
+                    a.idle_fin = 0
+                elif BUDGET_END and getattr(a, "idle_fin", 0) >= IDLE_FINISHES and not a.done:
+                    a.done, a.exit = True, "IdleFinish"
             if ckpt is not None and any(not a.done for a in agents) and rounds < MAX_ROUNDS \
                     and ckpt.due(len(subs) > n_subs):
                 fut = loop.run_in_executor(A._POOL, ckpt.save, state(), work)
@@ -487,36 +663,62 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
                     raise
                 if ckpt.stop:
                     raise Paused(f"paused after round {rounds}")
+        # what the budget cut costs (audit 2026-10-24): an agent that stopped without the finish command (tokens,
+        # context, format errors, the round cap) may leave a better solution.cpp unsubmitted. It is judged once, apart
+        # from subs: S keeps the documented rule (only submissions count) and S_auto - S measures the cut.
+        auto_sub = []
+        if any(a.exit != "Finished" for a in agents):
+            got = read_code("solution.cpp")
+            if got is not None and got[1] and got[1].strip() and sha1(got[1]) not in {x["sha"] for x in subs}:
+                res, tries, judge_s = await judge(got[1])
+                auto_sub.append({"agent": "auto", "round": rounds, "file": "solution.cpp", "status": res["status"],
+                                 "prov": subset_mean(res["cases"], prov_idx), "final": subset_mean(res["cases"], final_idx),
+                                 "infra": bool(res["infra_error"]), "infra_retries": tries, "sha": sha1(got[1]),
+                                 "judge_s": judge_s, "auto": True, "code": got[1]})
         best = best_of(subs) if subs else None
+        best_auto = best_of(subs + auto_sub) if subs or auto_sub else None   # an infra auto-judge never beats a real one
         shares = (await loop.run_in_executor(A._POOL, T.blame_shares, work, best["file"], best["rev"])) if best else {}
         log = (await loop.run_in_executor(A._POOL, lambda: T._git(work, "log", "--format=%an %s").stdout))[-20000:]
     finally:
         shutil.rmtree(work, ignore_errors=True)
     S = best["final"] if best else 0.0
     oracle = max((s["final"] for s in subs), default=0.0)
+
+    def total_min(key: str) -> float:   # summed over every agent's turns
+        return sum(t.get(key) or 0.0 for a in agents for t in a.turns) / 60
     first = subs[0]["round"] if subs else -1
-    info = {"fo_S": S, "fo_R": S, "fo_lg_n": N, "fo_lg_rounds": rounds, "fo_lg_submissions": len(subs),
+    info = {"lg_harness": harness_tag(), "fo_S": S, "fo_R": S, "fo_lg_n": N, "fo_lg_shared_case": float(shared),
+            "fo_lg_rounds": rounds, "fo_lg_submissions": len(subs),
+            "fo_lg_S_auto": best_auto["final"] if best_auto else 0.0, "fo_lg_auto_judged": float(bool(auto_sub)),
             "fo_lg_best_prov": best["prov"] if best else 0.0, "fo_lg_oracle_final": oracle,
             "fo_lg_selection_loss": oracle - S, "fo_lg_first_submit_round": first,
             "fo_lg_posts": len(board), "fo_lg_tokens": sum(a.generated for a in agents) / N,
             "fo_tokens": sum(a.generated for a in agents), "fo_latency": max(a.generated for a in agents),
             "fo_ag_steps": sum(a.steps for a in agents) / N, "fo_ag_format_errors": sum(a.fmt_total for a in agents) / N,
-            "fo_ag_run_min": run_s / 60, "fo_lg_judge_min": sum(s["judge_s"] for s in subs) / 60,
-            "fo_ag_compile_fail": float(bool(best) and best["status"] == "compile error"),
+            "fo_ag_run_min": run_s / 60, "fo_ag_compile_fail": float(bool(best) and best["status"] == "compile error"),
             "fo_ag_no_code": float(best is None), "fo_ag_top_author": max(shares.values()) if shares else 0.0,
             **{f"fo_ag_exit_{e}": sum(a.exit == e for a in agents) / N for e in
-               ("Finished", "TokensExceeded", "ContextExceeded", "RepeatedFormatError")},
+               ("Finished", "IdleFinish", "TokensExceeded", "ContextExceeded", "RepeatedFormatError")},
             "fo_judge_infra_error": float(any(s["infra"] or s["infra_retries"] for s in subs)),   # any infra judge call
             "fo_judge_infra_unresolved": float(any(s["infra"] for s in subs)),   # still infra after the retries
-            "fo_judge_infra_retries": sum(s["infra_retries"] for s in subs), "fo_lg_verdicts": float(VERDICTS)}
-    A._trace({"time": round(time.time(), 1), "eval": input.evaluation, "game": "agent_long", "label": label, "S": S,
-              "n": N, "budget": TOKENS, "verdicts": VERDICTS, "rounds": rounds, "shared_case": shared, "n_cases": n_cases,
-              "submissions": [{k: v for k, v in s.items() if k != "code"} for s in subs],
-              "best": {k: v for k, v in best.items()} if best else None, "board": board, "blame": shares,
-              "git_log": log,
+            "fo_judge_infra_retries": sum(s["infra_retries"] for s in subs), "fo_lg_verdicts": float(VERDICTS),
+            # where the episode's wall time went (audit 2026-10-24): model calls as the server saw them (llm) and as the
+            # agent waited for them (think), commands' waits for a worker, the judge (every submission and the
+            # auto-judge, retries included), the harness's logs and commits
+            "fo_lg_wall_min": (time.monotonic() - t_ep) / 60, "fo_lg_llm_min": total_min("llm_s"),
+            "fo_lg_think_min": total_min("think_s"), "fo_lg_cmd_queue_min": total_min("cmd_queue_s"),
+            "fo_lg_judge_min": sum(s["judge_s"] for s in subs + auto_sub) / 60,
+            "fo_lg_harness_min": total_min("harness_s")}
+    A._trace({"time": round(time.time(), 1), "eval": input.evaluation, "game": "agent_long", "harness": harness_tag(),
+              "label": label, "S": S, "n": N, "budget": TOKENS, "verdicts": VERDICTS, "rounds": rounds,
+              "shared_case": shared, "n_cases": n_cases,
+              "submissions": subs, "best": {k: v for k, v in best.items() if k != "code"} if best else None,
+              "auto_submission": auto_sub[0] if auto_sub else None, "board": board, "blame": shares, "git_log": log,
+              # full turns (text = <think>reasoning</think>answer) and submissions with their code (audit 2026-10-24:
+              # the last 4000 characters of a turn hid the reasoning; ~4 MB per 1M-token episode)
               "agents": [{"name": a.name, "exit": a.exit, "steps": a.steps, "generated": a.generated,
-                          "dropped": a.dropped, "submits": a.n_submit, "posts": a.n_post,
-                          "turns": [{**t, "text": t.get("text", "")[-4000:]} for t in a.turns]} for a in agents]})
+                          "dropped": a.dropped, "submits": a.n_submit, "posts": a.n_post, "turns": a.turns}
+                         for a in agents]})
     return agents, S, info
 
 

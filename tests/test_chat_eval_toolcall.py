@@ -82,12 +82,15 @@ hist = [{"role": "system", "content": "s"}, {"role": "user", "content": "inst"}]
 t1, c1 = asyncio.run(sess.turn(hist, 1000))
 check(A.ACTION_RE.findall(t1) == ["g++ a.cpp"] and t1.startswith("<think>R</think>plan") and not c1 and [q[0] for q in sess.queue] == ["submit a.cpp"],
       "turn 1: first call is the action, second queued")
+lc = sess.last_call
+check(lc["prompt_tokens"] == 100 and lc["completion_tokens"] == 50 and lc["tries"] == 1 and lc["llm_s"] >= 0
+      and lc["cached_tokens"] is None and lc["finish_reason"] == "tool_calls", f"turn 1: last_call {lc}")
 hist += [{"role": "assistant", "content": "plan" + g["_block"]("g++ a.cpp"), "reasoning_content": "R"},
          {"role": "user", "content": '{"returncode": 0}'}]
 n_seg = len(sess.segments)
 t2, c2 = asyncio.run(sess.turn(hist, 1000))
 check(A.ACTION_RE.findall(t2) == ["submit a.cpp"] and len(calls) == 1 and len(sess.segments) == n_seg and sess.cont
-      and not sess.fresh, "turn 2: queued call, no model call, no tokens")
+      and not sess.fresh and sess.last_call == {"llm_s": 0.0, "queued_call": True}, "turn 2: queued call, no model call, no tokens")
 hist += [{"role": "assistant", "content": g["_block"]("submit a.cpp"), "_cont": True},
          {"role": "user", "content": '{"returncode": 0, "output": "provisional 61"}'}]
 api = g["to_api"](hist)
@@ -102,7 +105,8 @@ check(len(calls) == 2 and sess.n_cont == 0 and not sess.cont, "turn 3: back to t
 api = g["to_api"]([{"role": "user", "content": "[trimmed]"}, hist[-2], hist[-1]])
 check(api[1]["role"] == "assistant" and len(api[1]["tool_calls"]) == 1 and api[2]["role"] == "tool", "history: orphan _cont")
 
-# per-turn usage on the agent's turn records: server, latency, tokens, cached tokens (None without the cache report)
+# the model call's numbers merged flat into the agent's turn records: server, tries, wall time, tokens, cached tokens
+# (None without the cache report)
 class _Http2:
     def __init__(self, details):
         self.details = details
@@ -123,10 +127,12 @@ for details, want in [({"cached_tokens": 96}, 96), (None, None)]:
     ag.observe(c1, OUT0, 1, 0)
     c2 = asyncio.run(ag.think())
     ag.observe(c2, OUT0, 2, 0)
-    u = ag.turns[0].get("usage") or {}
+    u = ag.turns[0]
     check(c1 == "ls" and u.get("cached_tokens") == want and u.get("prompt_tokens") == 120 and u.get("completion_tokens") == 30
-          and u.get("base_url") == "http://x" and u.get("tries") == 1 and "latency_s" in u, f"usage on the turn record, cached {want}")
-    check(c2 == "pwd" and "usage" not in ag.turns[1], "queued call: no usage")
+          and u.get("base_url") == "http://x" and u.get("tries") == 1 and "llm_s" in u and "usage" not in u,
+          f"last_call on the turn record, cached {want}", u)
+    check(c2 == "pwd" and ag.turns[1].get("queued_call") and ag.turns[1]["llm_s"] == 0.0 and "base_url" not in ag.turns[1],
+          "queued call: flagged, no model call numbers", ag.turns[1])
 
 # a command with lines that start with ``` (a Markdown heredoc) comes back whole, and goes back to the model as sent
 CMD = "cat > notes.md <<'EOF'\n# plan\n```\nint x;\n```\nEOF\necho ok"

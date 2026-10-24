@@ -42,4 +42,27 @@ with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as w:
     os.remove(os.path.join(w, "big.txt"))
     files = T._git(w, "ls-files").stdout.split()
     check(files == ["solution.cpp"], f"only sources committed (binary left out): {files}")
+# repo config an agent writes runs in its sandbox, not with the harness's rights (audit 2026-10-24); run this file with
+# FCS_CASE_PROC=1 and =0
+with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as w, \
+        tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as outside:
+    T.repo_init(w)
+    out_f, out_g = os.path.join(outside, "FILTER_RAN"), os.path.join(outside, "GPG_RAN")
+    r = A.run_command(f"git config filter.x.clean 'touch FILTER_IN; touch {out_f}; cat' && echo '*.cpp filter=x' > "
+                      f".gitattributes && printf '#!/bin/sh\\ntouch {out_g}\\n' > g.sh && chmod +x g.sh && "
+                      f"git config gpg.program $PWD/g.sh && git config commit.gpgsign true && git config core.pager "
+                      f"'touch {out_f}' && printf 'int main(){{}}\\n' > solution.cpp", w)
+    check(r["returncode"] == 0, "planted filter, gpg and pager config: " + r["output"][-200:])
+    T.commit_as(w, "agent1", 1)
+    check(os.path.exists(os.path.join(w, "FILTER_IN")), "the planted filter ran, inside the sandbox")
+    check(not os.path.exists(out_f) and not os.path.exists(out_g), "the planted filter and gpg.program wrote nothing outside")
+    log = T._git(w, "log", "--format=%an %s").stdout
+    check("agent1 agent1 step 1" in log, "the harness commit still lands: " + log)
+    text, rev = T.snapshot(w)
+    check(len(rev) == 40 and T.blame_shares(w, "solution.cpp", rev) == {"agent1": 1.0}, "rev-parse and blame still work")
+    r = A.run_command("git -c user.name=me -c user.email=me@x -c commit.gpgsign=false commit -q --allow-empty -m mine && git log -1 --format=%s", w)
+    check(r["output"].strip().endswith("mine"), "the agent's own git commit works in the sandbox: " + r["output"][-200:])
+    A.run_command("printf x > \"$(printf 'bad\\377name.txt')\" && echo '// 2' >> solution.cpp", w)
+    T.commit_as(w, "agent2", 2)
+    check("agent2 agent2 step 2" in T._git(w, "log", "--format=%an %s").stdout, "a file name that is not UTF-8 is committed")
 print("ALL OK" if ok else "SOME FAILED"); sys.exit(0 if ok else 1)

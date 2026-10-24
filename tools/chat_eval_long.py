@@ -9,8 +9,9 @@ shell runs lost points without it), and fcs_agent_long.trim_chat counts it again
 
   python3 tools/chat_eval_long.py --base-url http://127.0.0.1:8000 --model flint --data data_v11/fcs11_val40_agent.jsonl \
       --out <dir> [--episodes 1] [--concurrency 40]
-Game settings come from the environment as in miles: MA_LG_N, MA_LG_TOKENS, MA_LG_CTX_CHARS, MA_AG_TURN, MA_AG_MAX_LEN,
-MA_AG_TRACE_DIR (defaults to <out>/traces). Output: <out>/results.jsonl, one line per finished episode (resumable).
+Game settings come from the environment as in miles: MA_LG_N, MA_LG_TOKENS, MA_LG_CTX_CHARS, MA_LG_CTX_LOW, MA_LG_HARNESS,
+MA_LG_END, MA_LG_VERDICTS, MA_AG_TURN, MA_AG_MAX_LEN, MA_AG_TRACE_DIR (defaults to <out>/traces). Output:
+<out>/results.jsonl, one line per finished episode (resumable).
 
 Checkpoints (default on, --no-ckpt off): each episode saves its state to <out>/state/<pid>_e<episode>.{pkl,r<round>.tgz}
 at the end of a round every MA_LG_CKPT_S seconds (300) and after every round with a submission
@@ -205,6 +206,7 @@ if TOOLCALL:
     A.FORMAT_ERROR, A.LENGTH_ERROR, A.observation = _TC_FORMAT_ERROR, _TC_LENGTH_ERROR, _tc_observation
     L._FLAT = A.INSTANCE.replace("\\\n", "")
     assert L._LONE_ENV in L._FLAT and L._LONE_SUBMIT in L._FLAT
+    assert L._FORMAT_ERROR_ENDS[1] in _TC_FORMAT_ERROR   # v2 rewrites this last line (fcs_agent_long.think)
 
 
 def _route(inp) -> str:
@@ -322,12 +324,16 @@ class ChatSession:
         self.last_reasoning, self.fresh, self.used = "", False, 0   # used: prompt + completion tokens of the last call
         self.queue, self.cont, self.n_cont = [], False, 0   # calls a response made beyond its first; cont: this turn
         # handed one out; n_cont: how many since the last model call
-        self.last_call = None   # the last turn's model call: server, latency, tries, tokens, cached tokens (None: no call)
+        self.last_call = {}   # the last turn's numbers for the trace (see turn)
         self.last_tc = None   # the last turn's tool call (command, function as sent); None for a turn without one
 
     async def turn(self, messages: list, max_tokens: int) -> tuple[str, bool]:
-        self.last_call = self.last_tc = None
+        """last_call: this turn's numbers for the trace (fcs_agent_long merges them flat into the turn record): the
+        model call's start, wall seconds (llm_s), server, requests sent (tries, retries and moves included) and token
+        counts; or a flag for a turn without a reply (queued_call, no_room, context_400)."""
+        self.last_call, self.last_tc = {"llm_s": 0.0}, None
         if self.queue:   # the next call of the last response: no model call, no tokens
+            self.last_call["queued_call"] = True
             self.cont, self.fresh, self.n_cont = True, False, self.n_cont + 1
             self.last_tc = self.queue.pop(0)
             block = _block(self.last_tc[0])
@@ -338,13 +344,14 @@ class ChatSession:
         self.cont, self.n_cont = False, 0
         room = self.max_len - est
         if room <= 256:
+            self.last_call["no_room"] = True
             return "", True
         body = {"model": args.model, "messages": to_api(messages) if TOOLCALL else messages,
                 "max_tokens": min(max_tokens, room), "temperature": args.temperature, "top_p": args.top_p,
                 "top_k": args.top_k}
         if TOOLCALL:
             body["tools"] = [BASH_TOOL]
-        out, attempt, tries, t0 = None, 0, 0, time.time()
+        out, attempt, tries, t_req, t0 = None, 0, 0, round(time.time(), 1), time.monotonic()
         while True:
             url = _route(self.input)
             tries += 1
@@ -353,6 +360,8 @@ class ChatSession:
                     if r.status == 400:
                         err = await r.text()
                         if "context" in err.lower() or "length" in err.lower():
+                            self.last_call.update(llm_s=round(time.monotonic() - t0, 3), base_url=url, tries=tries,
+                                                  context_400=True)
                             return "", True
                         # e.g. a strict-grammar compile failure (the kit fails the request): this episode only
                         raise Aborted(f"{self.name}: 400: {err[:500]}")
@@ -398,9 +407,10 @@ class ChatSession:
             self.last_tc = calls[0]
             self.queue = [] if cut else calls[1:]
         n_out = int(usage.get("completion_tokens") or 0)
-        # cached_tokens needs the servers' --enable-cache-report; None without it
-        self.last_call = {"base_url": url, "latency_s": round(time.time() - t0, 2), "tries": tries,
-                          "prompt_tokens": int(usage.get("prompt_tokens") or 0), "completion_tokens": n_out,
+        # cached_tokens needs SGLang's --enable-cache-report; None means not reported, not zero
+        self.last_call = {"t_req_start": t_req, "llm_s": round(time.monotonic() - t0, 3), "base_url": url,
+                          "tries": tries, "prompt_tokens": usage.get("prompt_tokens"),
+                          "completion_tokens": usage.get("completion_tokens"),
                           "cached_tokens": (usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
                           "finish_reason": ch.get("finish_reason")}
         self.used = int(usage.get("prompt_tokens") or 0) + n_out
@@ -423,15 +433,10 @@ class _Agent(L._Agent):
             self.sess.fresh = False
 
     async def think(self):
-        self.sess.last_call = self.sess.last_tc = None   # a turn that ends before the model call (token budget)
-        cmd = await super().think()
+        self.sess.last_tc = None   # a turn that ends before the model call (token budget)
+        cmd = await super().think()   # its record has the session's last_call (fcs_agent_long._Agent.think)
         if cmd is not None and TOOLCALL and self.sess.last_tc is not None:
             cmd = self.sess.last_tc[0].strip()   # the whole command: the game's block regex stops at a line of ```
-        st = self.sess.last_call   # this turn's model call goes on its record; a queued call (no model call) has none
-        if st is not None and cmd is not None:
-            self._pending[1]["usage"] = st   # observe() spreads it into self.turns
-        elif st is not None and self.turns:   # a format error or a cut turn appended its record already
-            self.turns[-1]["usage"] = st
         if cmd is None:   # a format or length error added (assistant, error) now
             self._keep_reasoning()
         return cmd
@@ -492,6 +497,12 @@ def outcome(want: list, recs: list, ran: list, max_tries: int, episodes: int, ke
     line = (f"{'INCOMPLETE' if retry else 'DONE'} {len(ok)}/{len(want)} clean episodes (to rerun {len(retry)}, given "
             f"up after {max_tries} tries {len(given_up)}, judge-infra among them {infra}); mean final score "
             f"{mean(list(ok.values())):.2f} over clean episodes; {by_ep}")
+    # a problem with one test case scores the case the agent saw (fcs_agent_long.split_cases): the held-out mean
+    # leaves those out (runs before fo_lg_shared_case: train67 pids 43, 83, 137)
+    ho = [r for r in ok.values() if not (r.get("info") or {}).get("fo_lg_shared_case")]
+    if ho:
+        line += (f"\nHELD-OUT {len(ho)} clean episodes ({len(ok) - len(ho)} with a single shared case left out), mean "
+                 f"final score {mean(ho):.2f}")
     if ran and not kept and not any(_clean(r) for r in ran) and all(r.get("crash") for r in ran):
         return line + f"\nFAILED: all {len(ran)} episodes of this run crashed", 1
     return line, 99 if retry else 0
@@ -512,7 +523,8 @@ async def main():
     n_cap = sum(k not in done and tries[k] >= args.max_episode_tries for k in want)
     print(f"{len(rows)} problems x {args.episodes} episodes; {len(done)} done, {len(todo)} to run, {n_cap} given up "
           f"after {args.max_episode_tries} tries; model {args.model}; "
-          f"N={L.N} tokens={L.TOKENS} ctx_chars={L.CTX_CHARS} turn={A.TURN} max_len={A.MAX_LEN}", flush=True)
+          f"N={L.N} tokens={L.TOKENS} ctx_chars={L.CTX_CHARS} ctx_low={L.CTX_LOW} turn={A.TURN} max_len={A.MAX_LEN} "
+          f"harness={L.harness_tag()}", flush=True)
     def ckpt_for(pid, e):
         return L.Checkpoint(OUT / "state" / f"{str(pid).replace('/', '_')}_e{e}")
     if not args.no_ckpt:

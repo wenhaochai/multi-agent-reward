@@ -35,7 +35,7 @@ def check(c, what, detail=""):
 
 
 clock = [1e6]
-g["time"] = SimpleNamespace(time=lambda: clock[0])
+g["time"] = SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0])   # llm_s reads monotonic
 TURN_S = 60.0
 posts, dead = [], set()   # posts: (url, start, end)
 
