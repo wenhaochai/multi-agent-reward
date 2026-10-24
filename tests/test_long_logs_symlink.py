@@ -32,7 +32,7 @@ Base = L._Agent
 class Scripted(Base):
     script = []
 
-    def __init__(self, input, j, problem):
+    def __init__(self, input, j, problem, shared=False):
         self.name = f"agent{j + 1}"
         self.steps = self.fmt_run = self.fmt_total = self.timeouts = self.cut_n = 0
         self.done, self.exit, self.turns, self.segs = False, "", [], []

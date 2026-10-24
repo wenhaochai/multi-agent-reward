@@ -22,6 +22,12 @@ check("`submit` or `submit <file>`" in pr and "`post <message>`" in pr and "PROV
 check("COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat solution.cpp" not in pr and "7. `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` also submits" in pr,
       "instance: the one-shot submit step is replaced by the long workflow")
 check(pr.index("## Long work") < pr.index("## Important Rules"), "instance: tools before the rules")
+# harness v1 is frozen: the prompt of the smokes and of w100-w105 (at their defaults), byte for byte
+if L.HARNESS == "v1" and not any(k in os.environ for k in ("MA_AG_STEPS", "MA_AG_TIMEOUT", "MA_LG_TOKENS")) \
+        and L.N in (1, 4):
+    import hashlib
+    check(hashlib.sha1(pr.encode()).hexdigest()[:10] == {1: "20d1d16910", 4: "97b687a74e"}[L.N]
+          and L.instance("Read n {and} print it.", "agent2", shared=True) == pr, "instance: v1 prompt unchanged")
 check(L.split_cases(1) == ([0], [0], True) and L.split_cases(4) == ([0, 2], [1, 3], False)
       and L.split_cases(5) == ([0, 2, 4], [1, 3], False), "split: even provisional, odd final, one case shared")
 check(abs(L.subset_mean([1, 0, 0.5, 0], [0, 2]) - 0.75) < 1e-9 and L.subset_mean([], [0]) == 0.0, "subset mean")

@@ -48,6 +48,9 @@ with tempfile.TemporaryDirectory(dir=base) as work:
     check("return code kept", r["returncode"] == 3 and r["exception_info"] == "", r)
     r = C.run_command("cat /dev/urandom | head -c 4 | wc -c", work)
     check("/dev/urandom readable", r["output"].strip() == "4", r)
+    if C.J.LANDLOCK_ABI:   # what fcs_agent_long's v2 prompt says about /tmp
+        r = C.run_command("ls /tmp; touch /tmp/fcs_probe_$$ && echo WROTE", work)
+        check("/tmp can be neither listed nor written", "Permission denied" in r["output"] and "WROTE" not in r["output"], r)
     t = time.monotonic()
     r = C.run_command("sleep 100", work)
     dt = time.monotonic() - t
