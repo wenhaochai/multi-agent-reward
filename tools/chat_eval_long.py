@@ -9,7 +9,7 @@ shell runs lost points without it), and fcs_agent_long.trim_chat counts it again
 
   python3 tools/chat_eval_long.py --base-url http://127.0.0.1:8000 --model flint --data data_v11/fcs11_val40_agent.jsonl \
       --out <dir> [--episodes 1] [--concurrency 40]
-Game settings come from the environment as in miles: MA_LG_N, MA_LG_TOKENS, MA_LG_CTX_CHARS, MA_AG_TURN, MA_AG_MAX_LEN,
+Game settings come from the environment as in miles: MA_LG_N, MA_LG_TOKENS, MA_LG_CTX_CHARS, MA_LG_CTX_LOW, MA_AG_TURN, MA_AG_MAX_LEN,
 MA_AG_TRACE_DIR (defaults to <out>/traces). Output: <out>/results.jsonl, one line per finished episode (resumable)."""
 import argparse
 import asyncio
@@ -324,7 +324,7 @@ async def main():
         done = {(r["pid"], r["episode"]) for r in map(json.loads, res_path.read_text().splitlines()) if r.get("S") is not None}
     todo = [(i, e, r) for e in range(args.episodes) for i, r in enumerate(rows) if (r["metadata"]["pid"], e) not in done]
     print(f"{len(rows)} problems x {args.episodes} episodes; {len(done)} done, {len(todo)} to run; model {args.model}; "
-          f"N={L.N} tokens={L.TOKENS} ctx_chars={L.CTX_CHARS} turn={A.TURN} max_len={A.MAX_LEN}", flush=True)
+          f"N={L.N} tokens={L.TOKENS} ctx_chars={L.CTX_CHARS} ctx_low={L.CTX_LOW} turn={A.TURN} max_len={A.MAX_LEN}", flush=True)
     sem = asyncio.Semaphore(args.concurrency)
     _http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=args.request_timeout))
 

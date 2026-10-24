@@ -35,6 +35,19 @@ check(sum(len(m["content"]) for m in hist) <= 1000 and d == 5 and len(hist) == 1
 c3, d3 = L.trim_chat(c2 + [{"role": "assistant", "content": "a" * 400}, {"role": "user", "content": "o" * 400}], 1000, d)
 check(d3 > 5 and c3[1]["content"].count("[Note:") == 1 and "inst" in c3[1]["content"], "trim: one note, count grows")
 check(L.trim_chat(chat[:4], 10, 0)[1] == 0, "trim: the last step is never dropped")
+check(L.trim_chat(chat, 1000, 0, 1000) == (c2, 5), "trim: low_chars = keep_chars is the old trim")
+c4, d4 = L.trim_chat(chat, 1000, 0, 600)
+check(sum(len(m["content"]) for m in c4[2:]) <= 600 and d4 == 7 and c4[2]["role"] == "assistant"
+      and "7 earliest steps were removed" in c4[1]["content"], "trim with hysteresis: cut to low_chars")
+c5 = c4 + [{"role": "assistant", "content": "a" * 100}, {"role": "user", "content": "o" * 100}]
+c6, d6 = L.trim_chat(c5, 1000, d4, 600)
+check(c6 is c5 and d6 == d4, "trim with hysteresis: under keep_chars again, chat and prefix unchanged")
+c7, d7 = L.trim_chat(c4 + [{"role": "assistant", "content": "a" * 300}, {"role": "user", "content": "o" * 300}] * 2,
+                     1000, d4, 600)
+check(sum(len(m["content"]) for m in c7[2:]) <= 600 and d7 > d4 and c7[1]["content"].count("[Note:") == 1,
+      "trim with hysteresis: over keep_chars again, one more cut and one note")
+check(L.trim_chat(chat[:4], 10, 0, 5)[1] == 0, "trim with hysteresis: the last step is never dropped")
+check(L.CTX_LOW == float(os.environ.get("MA_LG_CTX_LOW", "1.0")), "CTX_LOW from the environment")
 m = L.SUBMIT_RE.fullmatch("submit")
 check(m and m.group(1) is None and L.SUBMIT_RE.fullmatch(" submit sol2.cpp ").group(1) == "sol2.cpp"
       and not L.SUBMIT_RE.fullmatch("g++ a.cpp && submit"), "submit: alone, optional file")

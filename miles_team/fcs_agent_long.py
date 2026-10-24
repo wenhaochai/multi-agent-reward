@@ -21,12 +21,14 @@ What changes against fcs_agent_team (one submission, no feedback, no messages):
                   (the mean over the odd-numbered cases, never shown to the agents) is the episode's score. A problem
                   with a single test case uses it for both (flagged "shared_case" in the trace).
   context         a long episode overflows the 65k-token context, so before each step the oldest steps of an agent's
-                  chat are dropped (MA_LG_CTX_CHARS of history kept) and its instance message says how many; the agents
+                  chat are dropped (once over MA_LG_CTX_CHARS, down to MA_LG_CTX_LOW of it) and its instance message
+                  says how many; the agents
                   are told to keep what matters in files (notes, SCORES.md, BOARD.md).
   memory          in evaluation only the last turn's segment is kept (every turn re-renders the whole chat, so keeping
                   every segment would hold hundreds of full contexts per agent); generated tokens are counted apart.
 
-Env: MA_LG_N (4), MA_LG_TOKENS (500000 per agent), MA_LG_CTX_CHARS (110000), MA_LG_MAX_ROUNDS (2000, a safety cap),
+Env: MA_LG_N (4), MA_LG_TOKENS (500000 per agent), MA_LG_CTX_CHARS (110000), MA_LG_CTX_LOW (1.0: a trim cuts the
+history to this share of MA_LG_CTX_CHARS; 0.75 keeps the prefix cache for many steps), MA_LG_MAX_ROUNDS (2000, a safety cap),
 fcs_agent's MA_AG_TURN / MA_AG_TIMEOUT / MA_AG_THINK / MA_AG_MAX_LEN / MA_AG_TRACE_DIR.
 --custom-generate-function-path miles_team.fcs_agent_long.generate   (evaluation; training is not supported yet)
 """
@@ -53,6 +55,11 @@ from .team_rollout import Aborted, Session
 N = int(os.environ.get("MA_LG_N", "4"))
 TOKENS = int(os.environ.get("MA_LG_TOKENS", "500000"))
 CTX_CHARS = int(os.environ.get("MA_LG_CTX_CHARS", "110000"))
+# a trim cuts the history to CTX_LOW x CTX_CHARS (hysteresis): the prompt prefix, and with it the server's prefix cache,
+# then holds for many steps between trims. 1.0 = the first version: once full, every step trims and re-prefills it all
+# (audit 2026-10-24: ~125k tokens re-prefilled per step past ~120k tokens of history)
+CTX_LOW = float(os.environ.get("MA_LG_CTX_LOW", "1.0"))
+assert 0 < CTX_LOW <= 1, CTX_LOW
 MAX_ROUNDS = int(os.environ.get("MA_LG_MAX_ROUNDS", "2000"))
 MAX_FILE = 256 << 10          # bytes of a submitted file
 MAX_POST = 2000               # characters of one message
@@ -128,14 +135,18 @@ def subset_mean(cases: list[float], idx: list[int]) -> float:
     return sum(vals) / len(vals) if vals else 0.0
 
 
-def trim_chat(chat: list, keep_chars: int, dropped: int) -> tuple[list, int]:
-    """Drop the oldest (assistant, user) pairs after [system, instance] until the history fits keep_chars; the
-    instance message then says how many steps were removed. Returns (chat, total dropped)."""
+def trim_chat(chat: list, keep_chars: int, dropped: int, low_chars: int | None = None) -> tuple[list, int]:
+    """Once the history after [system, instance] is over keep_chars, drop the oldest (assistant, user) pairs until it
+    fits low_chars (default keep_chars); the instance message then says how many steps were removed. Returns (chat,
+    total dropped)."""
     head, hist = chat[:2], chat[2:]
     n = [len(m["content"]) + len(m.get("reasoning_content") or "") for m in hist]   # reasoning kept in history (Flint)
     size = sum(n)
+    if size <= keep_chars:
+        return chat, dropped
+    target = keep_chars if low_chars is None else min(low_chars, keep_chars)
     k = 0
-    while size > keep_chars and len(hist) - 2 * k > 2:
+    while size > target and len(hist) - 2 * k > 2:
         size -= n[2 * k] + n[2 * k + 1]
         k += 1
     if not k:
@@ -169,7 +180,7 @@ class _Agent(T._Agent):
         if self.generated >= TOKENS:
             self.done, self.exit = True, "TokensExceeded"
             return None
-        self.chat, self.dropped = trim_chat(self.chat, CTX_CHARS, self.dropped)
+        self.chat, self.dropped = trim_chat(self.chat, CTX_CHARS, self.dropped, int(CTX_LOW * CTX_CHARS))
         self.steps += 1
         self.sess.last_messages = None
         n_seg = len(self.sess.segments)
