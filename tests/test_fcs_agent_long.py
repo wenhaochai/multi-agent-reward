@@ -19,7 +19,7 @@ team = L.N > 1
 check("Read n {and} print it." in pr and "{" + "name}" not in pr and "{budget}" not in pr, "instance: fields filled, braces kept")
 check(("You are agent2, one of 4 agents" in pr) == team and ("You work alone" in pr) == (not team), "instance: team or alone")
 check("`submit` or `submit <file>`" in pr and "`post <message>`" in pr and "PROVISIONAL" in pr, "instance: tools described")
-check("COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat solution.cpp" not in pr and "7. When you cannot improve" in pr,
+check("COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat solution.cpp" not in pr and "7. `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` also submits" in pr,
       "instance: the one-shot submit step is replaced by the long workflow")
 check(pr.index("## Long work") < pr.index("## Important Rules"), "instance: tools before the rules")
 check(L.split_cases(1) == ([0], [0], True) and L.split_cases(4) == ([0, 2], [1, 3], False)
