@@ -475,6 +475,17 @@ def _read(path: Path) -> list:
     return rows
 
 
+def _append(path: Path, rec: dict) -> None:
+    """One row at the end of results.jsonl. A line a kill cut short is ended first, so it does not swallow this row
+    (_read then skips the cut line alone)."""
+    with open(path, "a+b") as f:
+        lead = b""
+        if f.seek(0, os.SEEK_END):
+            f.seek(-1, os.SEEK_END)
+            lead = b"" if f.read(1) == b"\n" else b"\n"
+        f.write(lead + (json.dumps(rec) + "\n").encode())
+
+
 def outcome(want: list, recs: list, ran: list, max_tries: int, episodes: int, kept: bool = False) -> tuple[str, int]:
     """The summary line and the exit status. A key (pid, episode) of `want` is complete with a clean row, or given up
     after max_tries rows that are not clean (aborted, crashed or judge-infra); the others are retried by the next run
@@ -579,8 +590,7 @@ async def main():
                 return
             rec["moves"] = inp.moves
             rec["minutes"] = round(((ck.prior_s if ck is not None else 0.0) + time.time() - t0) / 60, 1)   # all runs
-            with open(res_path, "a") as f:
-                f.write(json.dumps(rec) + "\n")
+            _append(res_path, rec)
             ran.append(rec)
             if ck is not None and (rec["S"] is not None or rec.get("crash")):   # a transport abort resumes
                 ck.clear()

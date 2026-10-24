@@ -93,6 +93,14 @@ check(code == 99 and line.startswith("INCOMPLETE 4/5") and "to rerun 1" in line,
 with open(TMP / "o4/results.jsonl", "a") as f:
     f.write('{"pid": 0, "epis')   # a line cut short by a kill
 check(len(rows("o4")) == 5 and run("o4") == 0, "a cut line is skipped")
+mode = {(0, 1): "infra"}   # a second episode per problem: new rows go after the cut line
+g["args"].episodes = 2
+c = run("o4")
+g["args"].episodes = 1
+r = rows("o4")
+check(c == 99 and len(r) == 9 and sorted(x["pid"] for x in r[5:]) == [0, 1, 2, 3] and r[5]["episode"] == 1,
+      "the row after a cut line is kept whole (the cut line is ended first)", (c, len(r), r[5:]))
+mode = {}
 
 # checkpoints through main(): episodes that save every round and pause when asked
 import os  # noqa: E402
