@@ -30,6 +30,7 @@ from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
 from miles.utils.types import Sample
 
 from . import fcs_agent as A
+from . import fcs_cmd as C
 from .fcs_rm import answer, judge_code
 from .team_rollout import Aborted, Session
 
@@ -71,9 +72,11 @@ def team_prompt(problem: str, name: str) -> str:
     return TEAM_INSTANCE.format(problem=problem, timeout=A.TIMEOUT, steps=steps, name=name, n=N)
 
 
-# the harness's git runs outside the sandbox (review 2026-10-20): no global config, and no hooks or fsmonitor command that
-# an agent could have written into the repo's .git
-_GIT_SAFE = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
+# the harness's git (review 2026-10-20): no global config, and no hooks, fsmonitor command, signing or background gc
+# from the repo's .git; any other config an agent planted there (filter.*.clean, ...) runs in the agents' sandbox, as
+# the whole git call does (fcs_cmd.run_git; audit 2026-10-24: it ran with the trainer's rights before)
+_GIT_SAFE = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgSign=false",
+             "-c", "tag.gpgSign=false", "-c", "gc.auto=0"]
 MAX_COMMIT_BYTES = 1 << 20   # files the harness commits; a large .in/.txt stays uncommitted (git timeout, review 2026-10-20)
 
 
@@ -81,8 +84,8 @@ def _git(work: str, *args, env: dict | None = None) -> subprocess.CompletedProce
     e = {"PATH": "/usr/bin:/bin", "LANG": "C", "HOME": work, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
          **(env or {})}
     try:
-        return subprocess.run(["git", *_GIT_SAFE, *args], cwd=work, env=e, capture_output=True, text=True, timeout=60)
-    except (subprocess.TimeoutExpired, OSError) as ex:   # an aborted episode is resubmitted; a crash would end the run
+        return C.run_git(work, [*_GIT_SAFE, *args], e)
+    except (subprocess.TimeoutExpired, OSError, C.J._WorkerDied) as ex:   # an aborted episode is resubmitted; a crash would end the run
         raise Aborted(f"harness git {args[:1]}: {type(ex).__name__}") from ex
 
 
