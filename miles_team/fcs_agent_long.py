@@ -31,9 +31,10 @@ What changes against fcs_agent_team (one submission, no feedback, no messages):
                   every segment would hold hundreds of full contexts per agent); generated tokens are counted apart.
 
 Env: MA_LG_N (4), MA_LG_TOKENS (500000 per agent), MA_LG_CTX_CHARS (110000), MA_LG_CTX_LOW (1.0: a trim cuts the
-history to this share of MA_LG_CTX_CHARS; 0.75 keeps the prefix cache for many steps), MA_LG_MAX_ROUNDS (2000, a safety cap), MA_LG_END (voluntary | budget: see END), MA_LG_HARNESS (v1: the first prompt and observations; v2: budget line, shell
-facts, single-case and combined-finish notes; see HARNESS),
-fcs_agent's MA_AG_TURN / MA_AG_TIMEOUT / MA_AG_THINK / MA_AG_MAX_LEN / MA_AG_TRACE_DIR.
+history to this share of MA_LG_CTX_CHARS; 0.75 keeps the prefix cache for many steps), MA_LG_MAX_ROUNDS (2000, a safety
+cap), MA_LG_END (voluntary | budget: see END), MA_LG_HARNESS (v1: the first prompt and observations; v2: budget line,
+shell facts, single-case and combined-finish notes; see HARNESS), fcs_agent's MA_AG_TURN / MA_AG_TIMEOUT /
+MA_AG_THINK / MA_AG_MAX_LEN / MA_AG_TRACE_DIR.
 --custom-generate-function-path miles_team.fcs_agent_long.generate   (evaluation; training is not supported yet)
 """
 from __future__ import annotations
@@ -408,8 +409,8 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
             if not BUDGET_END:
                 return out
             a.idle_fin = getattr(a, "idle_fin", 0) + 1   # budget mode: the work goes on (episode() ends it after 3)
-            k, x = next((i, x) for i, x in reversed(list(enumerate(subs, 1))) if x["agent"] == a.name
-                        and x["sha"] == a.last_sha)
+            k, x = next(((i, x) for i, x in reversed(list(enumerate(subs, 1))) if x["agent"] == a.name
+                         and x["sha"] == a.last_sha), (len(subs), {"prov": 0.0}))
             return {"output": f"solution.cpp is unchanged since your submission #{k} (provisional {100 * x['prov']:.2f});"
                               f" nothing was submitted. About {max(0, TOKENS - a.generated):,} of your {TOKENS:,} "
                               "tokens are left. Keep improving solution.cpp.\n", "returncode": 0, "exception_info": ""}
@@ -510,8 +511,8 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
     def total_min(key: str) -> float:   # summed over every agent's turns
         return sum(t.get(key) or 0.0 for a in agents for t in a.turns) / 60
     first = subs[0]["round"] if subs else -1
-    info = {"lg_harness": harness_tag(), "fo_S": S, "fo_R": S, "fo_lg_n": N, "fo_lg_shared_case": float(shared), "fo_lg_rounds": rounds,
-            "fo_lg_submissions": len(subs),
+    info = {"lg_harness": harness_tag(), "fo_S": S, "fo_R": S, "fo_lg_n": N, "fo_lg_shared_case": float(shared),
+            "fo_lg_rounds": rounds, "fo_lg_submissions": len(subs),
             "fo_lg_S_auto": best_auto["final"] if best_auto else 0.0, "fo_lg_auto_judged": float(bool(auto_sub)),
             "fo_lg_best_prov": best["prov"] if best else 0.0, "fo_lg_oracle_final": oracle,
             "fo_lg_selection_loss": oracle - S, "fo_lg_first_submit_round": first,
