@@ -5,10 +5,11 @@ N = 1 the same code is the lone-agent control at the same per-agent budget, and 
 
 What changes against fcs_agent_team (one submission, no feedback, no messages):
   submit [file]   (the whole action) judges the file (default solution.cpp) at once. The agent sees its PROVISIONAL score:
-                  the mean over the even-numbered test cases, with per-case scores and compiler errors, like a contest's
-                  provisional board. Every submission and its provisional score goes to SCORES.md and to every agent.
-                  An agent may submit as often as it likes. A judge infrastructure failure is judged again (twice,
-                  after 2 s and 4 s); one that stays is told to the agent and never picked as best unless all are.
+                  the mean over the cases at 0-based even indices (files 1.in, 3.in, ...), with per-case scores and
+                  compiler errors, like a contest's provisional board. Every submission and its provisional score goes
+                  to SCORES.md and to every agent. An agent may submit as often as it likes. A judge infrastructure
+                  failure is judged again (twice, after 2 s and 4 s); one that stays is told to the agent and never
+                  picked as best unless all are.
   post <message>  (the whole action) sends a message to every other agent. New messages and new submissions of the
                   others are shown at the top of each agent's next observation, so the agents keep talking without
                   having to poll files; BOARD.md keeps the whole log.
@@ -19,8 +20,9 @@ What changes against fcs_agent_team (one submission, no feedback, no messages):
   the end         an agent stops when it runs the finish command on an unchanged solution.cpp, uses up MA_LG_TOKENS
                   generated tokens, or makes three format errors in a row. When every agent has stopped, the submission
                   with the highest provisional score (the earliest on a tie) is the team's answer, and its FINAL score
-                  (the mean over the odd-numbered cases, never shown to the agents) is the episode's score. A problem
-                  with a single test case uses it for both (flagged "shared_case" in the trace).
+                  (the mean over the cases at 0-based odd indices, files 2.in, 4.in, ..., never shown to the agents) is
+                  the episode's score. A problem with a single test case uses it for both, so its final score is not
+                  held out (flagged "shared_case" in the trace).
   context         a long episode overflows the 65k-token context, so before each step the oldest steps of an agent's
                   chat are dropped (MA_LG_CTX_CHARS of history kept) and its instance message says how many; the agents
                   are told to keep what matters in files (notes, SCORES.md, BOARD.md).
@@ -125,7 +127,8 @@ def instance(problem: str, name: str) -> str:
 
 
 def split_cases(n: int) -> tuple[list[int], list[int], bool]:
-    """(provisional, final, shared): even-numbered cases are provisional, odd-numbered final; one case serves both."""
+    """(provisional, final, shared): cases at 0-based even indices (files 1.in, 3.in, ...) are provisional, odd
+    indices (2.in, 4.in, ...) final; a single case serves both (no held-out final)."""
     if n <= 1:
         return [0], [0], True
     return list(range(0, n, 2)), list(range(1, n, 2)), False
