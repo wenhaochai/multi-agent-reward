@@ -392,8 +392,7 @@ class Checkpoint:
         except Exception as e:   # unreadable: start fresh
             print(f"checkpoint {self.path}: unreadable ({e!r}), starting fresh", flush=True)
             return None
-        self.prior_s = float(st.get("wall_s", 0.0))
-        return st
+        return st   # the episode sets prior_s once the state matches and its tar is restored
 
     def due(self, submitted: bool) -> bool:
         return self.stop or submitted or time.time() - self.saved_at >= self.every
@@ -618,6 +617,7 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
         if st is not None:   # the end of the saved round; the work dir replaces whatever a later command half did
             rounds, run_s, subs, board, events = st["rounds"], st["run_s"], st["subs"], st["board"], st["events"]
             t_ep = time.monotonic() - st["wall_ep"]   # fo_lg_wall_min counts the earlier runs up to the saved round
+            ckpt.prior_s = float(st.get("wall_s", 0.0))   # a state not resumed leaves the row's minutes this run's
             rng.setstate(st["rng"])
             for a, d in zip(agents, st["agents"]):
                 for k, v in d["agent"].items():

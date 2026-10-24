@@ -140,9 +140,25 @@ check("resume after a mid-round kill ends as the uninterrupted run", eq, diff)
 st = L.Checkpoint(path).load()
 check("finished episode leaves its last save (the driver clears it)", st is not None)
 L.TOKENS += 1
-res = run(L.Checkpoint(path, every=1e9))
+ck = L.Checkpoint(path, every=1e9)
+res = run(ck)
 L.TOKENS -= 1
 check("other settings: fresh start", res["rounds"] == ref["rounds"] and len(res["prompts"]) == len(ref["prompts"]))
+check("other settings: no earlier wall time", ck.prior_s == 0.0, ck.prior_s)
+# a state whose tar is unreadable: fresh start, no earlier wall time
+ck = L.Checkpoint(path, every=1e9)
+hook.update(stop_at=("agent1", 3), ckpt=ck)
+try:
+    run(ck)
+except L.Paused:
+    pass
+hook["stop_at"] = None
+for t in glob.glob(path + ".r*.tgz"):
+    open(t, "wb").write(b"not a tar")
+ck = L.Checkpoint(path, every=1e9)
+res = run(ck)
+check("unreadable tar: fresh start, no earlier wall time", ("agent1", 0) in res["prompts"] and ck.prior_s == 0.0
+      and same(ref, res)[0], (ck.prior_s, same(ref, res)[1]))
 
 # a save that fails (a full quota, a file that shrinks while the tar reads it) logs; the episode goes on and the last
 # good save stays
