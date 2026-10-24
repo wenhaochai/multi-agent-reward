@@ -10,13 +10,20 @@ shell runs lost points without it), and fcs_agent_long.trim_chat counts it again
   python3 tools/chat_eval_long.py --base-url http://127.0.0.1:8000 --model flint --data data_v11/fcs11_val40_agent.jsonl \
       --out <dir> [--episodes 1] [--concurrency 40]
 Game settings come from the environment as in miles: MA_LG_N, MA_LG_TOKENS, MA_LG_CTX_CHARS, MA_AG_TURN, MA_AG_MAX_LEN,
-MA_AG_TRACE_DIR (defaults to <out>/traces). Output: <out>/results.jsonl, one line per finished episode (resumable)."""
+MA_AG_TRACE_DIR (defaults to <out>/traces). Output: <out>/results.jsonl, one line per finished episode (resumable).
+
+Exit status (wq requeues a --partial job on 99): 0 when every episode has a clean score or has failed
+--max-episode-tries times; 99 when some episode can still be retried, so the next run resumes only those; 1 when every
+episode this run started crashed (a bug: fail fast instead of looping). An exception in one episode (a 400 reply, a bad
+JSON reply, a bug) becomes that episode's aborted row and no longer stops the other episodes."""
 import argparse
 import asyncio
 import json
 import os
 import sys
 import time
+import traceback
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,6 +40,8 @@ ap.add_argument("--top-p", type=float, default=0.95)
 ap.add_argument("--top-k", type=int, default=20)
 ap.add_argument("--request-timeout", type=float, default=3600)
 ap.add_argument("--textbased", action="store_true", help="mini_textbased.yaml format instead of tool calls")
+ap.add_argument("--max-episode-tries", type=int, default=3,
+                help="an episode whose rows are all aborted or judge-infra after this many runs is given up")
 args = ap.parse_args()
 OUT = Path(args.out)
 OUT.mkdir(parents=True, exist_ok=True)
@@ -176,6 +185,18 @@ if TOOLCALL:
     assert L._LONE_ENV in L._FLAT and L._LONE_SUBMIT in L._FLAT
 
 
+class _BadReply(Exception):
+    """A 200 reply without a usable body: retried as a transport error."""
+
+
+class _HttpAborted(Aborted):
+    """The server did not answer after the retries; url is the server it was sent to."""
+
+    def __init__(self, msg: str, url: str):
+        super().__init__(msg)
+        self.url = url
+
+
 def _block(cmd: str) -> str:
     return f"\n\n```mswea_bash_command\n{cmd}\n```"
 
@@ -247,19 +268,26 @@ class ChatSession:
             body["tools"] = [BASH_TOOL]
         out = None
         for attempt in range(4):
+            url = getattr(self.input, "base_url", URLS[0])
             try:
-                async with _http.post(f"{getattr(self.input, 'base_url', URLS[0])}/v1/chat/completions", json=body) as r:
+                async with _http.post(f"{url}/v1/chat/completions", json=body) as r:
                     if r.status == 400:
                         err = await r.text()
                         if "context" in err.lower() or "length" in err.lower():
                             return "", True
-                        raise RuntimeError(f"400: {err[:500]}")
+                        # e.g. a strict-grammar compile failure (the kit fails the request): this episode only
+                        raise Aborted(f"{self.name}: 400: {err[:500]}")
                     r.raise_for_status()
-                    out = await r.json()
+                    try:
+                        out = await r.json()
+                    except ValueError as e:   # malformed JSON (a wrong content type is a ClientError already)
+                        raise _BadReply(f"bad JSON: {e!r}")
+                    if not isinstance(out, dict) or not out.get("choices"):
+                        raise _BadReply(f"no choices: {str(out)[:300]}")
                 break
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError, _BadReply) as e:
                 if attempt == 3:
-                    raise Aborted(f"{self.name}: {e!r}")
+                    raise _HttpAborted(f"{self.name}: {e!r}", url)
                 await asyncio.sleep(10 * (attempt + 1))
         ch, usage = out["choices"][0], out.get("usage") or {}
         msg = ch["message"]
@@ -313,20 +341,69 @@ L.Session = ChatSession
 L._Agent = _Agent
 
 
+def _clean(r: dict) -> bool:
+    """A row whose score counts: S is set and no submission met a judge infrastructure error (its 0 is not the
+    model's), so a rerun keeps it and skips the episode."""
+    return r.get("S") is not None and not (r.get("info") or {}).get("fo_judge_infra_error")
+
+
+def _read(path: Path) -> list:
+    """results.jsonl's rows; a line cut short by a kill is skipped (its episode reruns)."""
+    rows = []
+    for line in (path.read_text().splitlines() if path.exists() else []):
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            pass
+    return rows
+
+
+def outcome(want: list, recs: list, ran: list, max_tries: int, episodes: int) -> tuple[str, int]:
+    """The summary line and the exit status. A key (pid, episode) of `want` is complete with a clean row, or given up
+    after max_tries rows that are not clean (aborted, crashed or judge-infra); the others are retried by the next run
+    (exit 99). The mean covers the clean rows only, and the line says how many keys it leaves out."""
+    by: dict = {}
+    for r in recs:
+        by.setdefault((r["pid"], r["episode"]), []).append(r)
+    ok, retry, given_up, infra = {}, [], [], 0
+    for k in want:
+        clean = [r for r in by.get(k, []) if _clean(r)]
+        if clean:
+            ok[k] = clean[-1]
+            continue
+        (given_up if len(by.get(k, [])) >= max_tries else retry).append(k)
+        infra += any(r.get("S") is not None for r in by.get(k, []))
+
+    def mean(xs):
+        return 100 * sum(r["S"] for r in xs) / len(xs) if xs else float("nan")
+    by_ep = " ".join(f"ep{e} {mean([r for (_, ep), r in ok.items() if ep == e]):.2f}" for e in range(episodes))
+    line = (f"{'INCOMPLETE' if retry else 'DONE'} {len(ok)}/{len(want)} clean episodes (to rerun {len(retry)}, given "
+            f"up after {max_tries} tries {len(given_up)}, judge-infra among them {infra}); mean final score "
+            f"{mean(list(ok.values())):.2f} over clean episodes; {by_ep}")
+    if ran and not any(_clean(r) for r in ran) and all(r.get("crash") for r in ran):
+        return line + f"\nFAILED: all {len(ran)} episodes of this run crashed", 1
+    return line, 99 if retry else 0
+
+
 async def main():
     global _http
     rows = [json.loads(line) for line in open(args.data) if line.strip()]
     if args.limit:
         rows = rows[: args.limit]
     res_path = OUT / "results.jsonl"
-    done = set()
-    if res_path.exists():
-        done = {(r["pid"], r["episode"]) for r in map(json.loads, res_path.read_text().splitlines()) if r.get("S") is not None}
-    todo = [(i, e, r) for e in range(args.episodes) for i, r in enumerate(rows) if (r["metadata"]["pid"], e) not in done]
-    print(f"{len(rows)} problems x {args.episodes} episodes; {len(done)} done, {len(todo)} to run; model {args.model}; "
+    old = _read(res_path)
+    done = {(r["pid"], r["episode"]) for r in old if _clean(r)}
+    tries = Counter((r["pid"], r["episode"]) for r in old if not _clean(r))
+    want = [(r["metadata"]["pid"], e) for e in range(args.episodes) for r in rows]
+    todo = [(i, e, r) for e in range(args.episodes) for i, r in enumerate(rows)
+            if (r["metadata"]["pid"], e) not in done and tries[(r["metadata"]["pid"], e)] < args.max_episode_tries]
+    n_cap = sum(k not in done and tries[k] >= args.max_episode_tries for k in want)
+    print(f"{len(rows)} problems x {args.episodes} episodes; {len(done)} done, {len(todo)} to run, {n_cap} given up "
+          f"after {args.max_episode_tries} tries; model {args.model}; "
           f"N={L.N} tokens={L.TOKENS} ctx_chars={L.CTX_CHARS} turn={A.TURN} max_len={A.MAX_LEN}", flush=True)
     sem = asyncio.Semaphore(args.concurrency)
     _http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=args.request_timeout))
+    ran = []   # this run's rows
 
     async def one(i, e, r):
         async with sem:
@@ -341,22 +418,29 @@ async def main():
                 rec.update(S=S, info=info)
             except Aborted as ex:
                 rec.update(S=None, aborted=str(ex))
+            except Exception as ex:   # one episode's bug or bad reply; CancelledError (a BaseException) still stops all
+                traceback.print_exc()
+                rec.update(S=None, aborted=f"{type(ex).__name__}: {ex}"[:500], crash=True,
+                           traceback=traceback.format_exc()[-4000:])
             finally:
                 _active[url] -= 1
             rec["minutes"] = round((time.time() - t0) / 60, 1)
             with open(res_path, "a") as f:
                 f.write(json.dumps(rec) + "\n")
+            ran.append(rec)
             print(f"[{rec['pid']} ep{e}] S={rec.get('S')} subs={(rec.get('info') or {}).get('fo_lg_submissions')} "
-                  f"tokens={(rec.get('info') or {}).get('fo_lg_tokens')} {rec['minutes']} min", flush=True)
+                  f"tokens={(rec.get('info') or {}).get('fo_lg_tokens')} {rec['minutes']} min"
+                  + (f" ABORTED {rec['aborted'][:200]}" if rec.get("S") is None else ""), flush=True)
 
     try:
         await asyncio.gather(*(one(i, e, r) for i, e, r in todo))
     finally:
         await _http.close()
-    recs = [json.loads(x) for x in res_path.read_text().splitlines()]
-    ok = [r for r in recs if r.get("S") is not None]
-    if ok:
-        print(f"DONE {len(ok)} episodes, mean final score {100 * sum(r['S'] for r in ok) / len(ok):.2f}", flush=True)
+    line, code = outcome(want, _read(res_path), ran, args.max_episode_tries, args.episodes)
+    print(line, flush=True)
+    if code:
+        print(f"exit {code}" + (": rerun the same command to resume" if code == 99 else ""), flush=True)
+        sys.exit(code)
 
 
 asyncio.run(main())
