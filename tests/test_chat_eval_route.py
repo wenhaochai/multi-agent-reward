@@ -80,8 +80,12 @@ class _Http:
         pass
 
 
+_real_sleep = asyncio.sleep
+
+
 async def _fast(t, *a, **k):
     clock[0] += t
+    await _real_sleep(0)
 
 
 g["_http"] = _Http()
@@ -161,7 +165,7 @@ check(x.moves == 1 and [p[0] for p in posts] == [x.base_url] * 2 and _active[U[0
 
 
 # (c), (e): whole runs through main(), episodes stubbed to make a few turns each
-async def fake_episode(inp, messages, label):
+async def fake_episode(inp, messages, label, ckpt=None):
     s = CS(inp, "agent1", True, max_len=262144)
     for _ in range(5):
         s.used = 0
@@ -176,6 +180,7 @@ g["aiohttp"] = SimpleNamespace(ClientSession=lambda **k: _Http(), ClientTimeout=
 
 
 def run(out):
+    g["_stop"][0] = None
     g["OUT"] = TMP / out
     g["OUT"].mkdir(exist_ok=True)
     try:

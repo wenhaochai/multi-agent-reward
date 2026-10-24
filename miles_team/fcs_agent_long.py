@@ -26,18 +26,26 @@ What changes against fcs_agent_team (one submission, no feedback, no messages):
   memory          in evaluation only the last turn's segment is kept (every turn re-renders the whole chat, so keeping
                   every segment would hold hundreds of full contexts per agent); generated tokens are counted apart.
 
+  checkpoint      (episode(..., ckpt=Checkpoint(path)), tools/chat_eval_long.py only) an episode saves its state at the end
+                  of a round, every MA_LG_CKPT_S seconds and after every round with a submission, and a later call
+                  with the same path resumes from it: a 1M-token episode outlasts one 3-6 h wq piece. Without ckpt
+                  nothing changes (generate() and the miles path pass none).
+
 Env: MA_LG_N (4), MA_LG_TOKENS (500000 per agent), MA_LG_CTX_CHARS (110000), MA_LG_MAX_ROUNDS (2000, a safety cap),
-fcs_agent's MA_AG_TURN / MA_AG_TIMEOUT / MA_AG_THINK / MA_AG_MAX_LEN / MA_AG_TRACE_DIR.
+MA_LG_CKPT_S (300), fcs_agent's MA_AG_TURN / MA_AG_TIMEOUT / MA_AG_THINK / MA_AG_MAX_LEN / MA_AG_TRACE_DIR.
 --custom-generate-function-path miles_team.fcs_agent_long.generate   (evaluation; training is not supported yet)
 """
 from __future__ import annotations
 
 import asyncio
+import glob
 import hashlib
 import os
+import pickle
 import random
 import re
 import shutil
+import tarfile
 import time
 import uuid
 from copy import deepcopy
@@ -54,6 +62,7 @@ N = int(os.environ.get("MA_LG_N", "4"))
 TOKENS = int(os.environ.get("MA_LG_TOKENS", "500000"))
 CTX_CHARS = int(os.environ.get("MA_LG_CTX_CHARS", "110000"))
 MAX_ROUNDS = int(os.environ.get("MA_LG_MAX_ROUNDS", "2000"))
+CKPT_S = float(os.environ.get("MA_LG_CKPT_S", "300"))
 MAX_FILE = 256 << 10          # bytes of a submitted file
 MAX_POST = 2000               # characters of one message
 SUBMIT_RE = re.compile(r"\s*submit(?:\s+(\S+))?\s*")
@@ -208,18 +217,112 @@ class _Agent(T._Agent):
             self.exit = "Finished"
 
 
-async def episode(input: GenerateFnInput, messages: list, label: str):
+class Paused(Exception):
+    """The caller set ckpt.stop: the episode saved its state at the end of a round and stopped; a rerun resumes."""
+
+
+_AGENT_STATE = ("chat", "steps", "fmt_run", "fmt_total", "timeouts", "cut_n", "done", "exit", "turns", "generated",
+                "dropped", "seen", "n_submit", "n_post", "last_sha")
+_SESS_STATE = ("used", "queue", "cont", "n_cont", "last_reasoning", "fresh")   # the chat driver's Session fields
+_TAR_MAX = 32 << 20   # a larger file (a generated test input) stays out of the checkpoint; the agent can rebuild it
+
+
+def _tar_member(ti: tarfile.TarInfo):
+    return ti if (ti.isdir() or ti.issym() or (ti.isfile() and ti.size <= _TAR_MAX)) else None
+
+
+def _untar_member(ti: tarfile.TarInfo, dest: str):
+    try:   # tarfile's "data" rules (no absolute paths, nothing outside dest); a member that breaks them is skipped
+        return tarfile.data_filter(ti, dest)
+    except tarfile.FilterError:
+        return None
+
+
+class Checkpoint:
+    """An episode's saved state: <path>.r<round>.tgz holds the work dir (.git included) and <path>.pkl the rest. The
+    tar is written first under a new name, then the pickle (atomically) names it, then older tars go: a kill at any
+    point leaves a pickle and the tar of the same round. stop: set by the caller; the episode saves and raises Paused
+    at the end of its round. prior_s: wall seconds of the earlier runs; saves: how many this run made."""
+
+    def __init__(self, path, every: float = CKPT_S):
+        self.path, self.every, self.stop = str(path), every, False
+        self.t0 = self.saved_at = time.time()
+        self.prior_s, self.saves = 0.0, 0
+
+    def exists(self) -> bool:
+        return os.path.exists(self.path + ".pkl")
+
+    def load(self) -> dict | None:
+        try:
+            with open(self.path + ".pkl", "rb") as f:
+                st = pickle.load(f)
+        except FileNotFoundError:
+            return None
+        except Exception as e:   # unreadable: start fresh
+            print(f"checkpoint {self.path}: unreadable ({e!r}), starting fresh", flush=True)
+            return None
+        self.prior_s = float(st.get("wall_s", 0.0))
+        return st
+
+    def due(self, submitted: bool) -> bool:
+        return self.stop or submitted or time.time() - self.saved_at >= self.every
+
+    def save(self, state: dict, work: str) -> None:
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        tgz = f"{self.path}.r{state['rounds']}.tgz"
+        with tarfile.open(tgz + ".tmp", "w:gz", compresslevel=1) as t:
+            t.add(work, arcname=".", filter=_tar_member)
+        os.replace(tgz + ".tmp", tgz)
+        state = {**state, "tar": os.path.basename(tgz), "wall_s": self.prior_s + time.time() - self.t0}
+        with open(self.path + ".pkl.tmp", "wb") as f:
+            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(self.path + ".pkl.tmp", self.path + ".pkl")
+        for old in glob.glob(glob.escape(self.path) + ".r*.tgz"):
+            if os.path.basename(old) != state["tar"]:
+                os.remove(old)
+        self.saved_at, self.saves = time.time(), self.saves + 1
+
+    def restore(self, st: dict, work: str) -> None:
+        with tarfile.open(os.path.join(os.path.dirname(self.path), st["tar"]), "r:gz") as t:
+            t.extractall(work, filter=_untar_member)
+
+    def clear(self) -> None:
+        for f in [self.path + ".pkl", self.path + ".pkl.tmp"] + glob.glob(glob.escape(self.path) + ".r*.tgz*"):
+            try:
+                os.remove(f)
+            except FileNotFoundError:
+                pass
+
+
+async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Checkpoint | None = None):
     from miles_team.fcs_judge import load_problem
     from pathlib import Path
     problem = A.problem_text(messages)
     agents = [_Agent(input, j, problem) for j in range(N)]
     n_cases = len(load_problem(Path(label))["cases"])
     prov_idx, final_idx, shared = split_cases(n_cases)
-    work = os.path.join(os.environ.get("TMPDIR", "/tmp"), "agent_long", uuid.uuid4().hex)
+    if ckpt is None:
+        work = os.path.join(os.environ.get("TMPDIR", "/tmp"), "agent_long", uuid.uuid4().hex)
+    else:   # one name per checkpoint, so paths the agent wrote still hold after a resume in the same job
+        work = os.path.join(os.environ.get("TMPDIR", "/tmp"), "agent_long", os.path.basename(ckpt.path))
+        shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work)
     loop = asyncio.get_running_loop()
     rng = random.Random(f"{label}:{input.sample.index}:{getattr(input.sample, 'group_index', 0)}")
     rounds, run_s, subs, board, events = 0, 0.0, [], [], []
+    # what a checkpoint must match: the episode and every setting that shapes its prompts and budget
+    config = {"v": 1, "label": label, "index": input.sample.index, "group": getattr(input.sample, "group_index", 0),
+              "N": N, "TOKENS": TOKENS, "CTX_CHARS": CTX_CHARS, "TURN": A.TURN, "MAX_LEN": A.MAX_LEN,
+              "prompt": hashlib.sha1((A.SYSTEM + instance(problem, "agent1")).encode()).hexdigest()[:12]}
+
+    def state() -> dict:
+        return {"config": config, "rounds": rounds, "run_s": run_s, "subs": subs, "board": board, "events": events,
+                "rng": rng.getstate(),
+                "agents": [{"agent": {k: getattr(a, k) for k in _AGENT_STATE} | {   # the trace keeps 4000 chars
+                    "turns": [{**t, "text": t.get("text", "")[-4000:]} for t in a.turns]},
+                    "sess": {k: getattr(a.sess, k) for k in _SESS_STATE if hasattr(a.sess, k)}} for a in agents]}
 
     def write_logs():
         with open(os.path.join(work, "SCORES.md"), "w") as f:
@@ -294,14 +397,36 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
         return "<team_updates>\n" + "".join(f"[round {r}] {n} {t}\n" for r, n, t in new) + "</team_updates>\n"
 
     try:
-        await loop.run_in_executor(A._POOL, T.repo_init, work)
-        await loop.run_in_executor(A._POOL, write_logs)
+        st = (await loop.run_in_executor(A._POOL, ckpt.load)) if ckpt is not None else None
+        if st is not None and st.get("config") != config:
+            print(f"checkpoint {ckpt.path}: other settings ({st.get('config')} vs {config}), starting fresh", flush=True)
+            st = None
+        if st is not None:
+            try:
+                await loop.run_in_executor(A._POOL, ckpt.restore, st, work)
+            except Exception as e:
+                print(f"checkpoint {ckpt.path}: tar unreadable ({e!r}), starting fresh", flush=True)
+                shutil.rmtree(work, ignore_errors=True)
+                os.makedirs(work)
+                st = None
+        if st is not None:   # the end of the saved round; the work dir replaces whatever a later command half did
+            rounds, run_s, subs, board, events = st["rounds"], st["run_s"], st["subs"], st["board"], st["events"]
+            rng.setstate(st["rng"])
+            for a, d in zip(agents, st["agents"]):
+                for k, v in d["agent"].items():
+                    setattr(a, k, v)
+                for k, v in d["sess"].items():
+                    setattr(a.sess, k, v)
+        else:
+            await loop.run_in_executor(A._POOL, T.repo_init, work)
+            await loop.run_in_executor(A._POOL, write_logs)
         while any(not a.done for a in agents) and rounds < MAX_ROUNDS:
             rounds += 1
             active = [a for a in agents if not a.done]
             cmds = await asyncio.gather(*[a.think() for a in active])
             todo = [(a, c) for a, c in zip(active, cmds) if c is not None]
             rng.shuffle(todo)
+            n_subs = len(subs)
             for k, (a, cmd) in enumerate(todo):
                 m_sub, m_post = SUBMIT_RE.fullmatch(cmd), POST_RE.fullmatch(cmd)
                 if m_sub:
@@ -321,6 +446,16 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
                 if upd:
                     out = {**out, "output": upd + out["output"]}
                 a.observe(cmd, out, rounds, k)
+            if ckpt is not None and any(not a.done for a in agents) and rounds < MAX_ROUNDS \
+                    and ckpt.due(len(subs) > n_subs):
+                fut = loop.run_in_executor(A._POOL, ckpt.save, state(), work)
+                try:
+                    await asyncio.shield(fut)
+                except asyncio.CancelledError:   # finish the save before the finally below removes the work dir
+                    await fut
+                    raise
+                if ckpt.stop:
+                    raise Paused(f"paused after round {rounds}")
         best = max(subs, key=lambda x: (x["prov"], -subs.index(x))) if subs else None
         shares = (await loop.run_in_executor(A._POOL, T.blame_shares, work, best["file"], best["rev"])) if best else {}
         log = (await loop.run_in_executor(A._POOL, lambda: T._git(work, "log", "--format=%an %s").stdout))[-20000:]

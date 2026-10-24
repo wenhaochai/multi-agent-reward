@@ -12,10 +12,18 @@ shell runs lost points without it), and fcs_agent_long.trim_chat counts it again
 Game settings come from the environment as in miles: MA_LG_N, MA_LG_TOKENS, MA_LG_CTX_CHARS, MA_AG_TURN, MA_AG_MAX_LEN,
 MA_AG_TRACE_DIR (defaults to <out>/traces). Output: <out>/results.jsonl, one line per finished episode (resumable).
 
+Checkpoints (default on, --no-ckpt off): each episode saves its state to <out>/state/<pid>_e<episode>.{pkl,r<round>.tgz}
+at the end of a round every MA_LG_CKPT_S seconds (300) and after every round with a submission
+(fcs_agent_long.Checkpoint), and the next run resumes it there. A transport abort keeps the state; a crash or a
+finished row removes it. The run stops early, pausing every episode at the end of its round (up to STOP_GRACE_S, then
+cancelled at its last save), 10 min before SLURM_JOB_END_TIME, when a server is down (its GPUs idle; the requeue
+starts fresh ones), or with --tail-exit-min M when every episode has started and a server has had none for M minutes.
+
 Exit status (wq requeues a --partial job on 99): 0 when every episode has a clean score or has failed
---max-episode-tries times; 99 when some episode can still be retried, so the next run resumes only those; 1 when every
-episode this run started crashed (a bug: fail fast instead of looping). An exception in one episode (a 400 reply, a bad
-JSON reply, a bug) becomes that episode's aborted row and no longer stops the other episodes."""
+--max-episode-tries times; 99 when some episode can still be retried or resumed, so the next run takes only those;
+3 after a --tail-exit-min stop (for a job script that resubmits on fewer GPUs); 1 when every episode this run started
+crashed (a bug: fail fast instead of looping) or the run wrote no row and saved no checkpoint. An exception in one
+episode (a 400 reply, a bad JSON reply, a bug) becomes that episode's aborted row and no longer stops the others."""
 import argparse
 import asyncio
 import json
@@ -42,6 +50,9 @@ ap.add_argument("--request-timeout", type=float, default=3600)
 ap.add_argument("--textbased", action="store_true", help="mini_textbased.yaml format instead of tool calls")
 ap.add_argument("--max-episode-tries", type=int, default=3,
                 help="an episode whose rows are all aborted or judge-infra after this many runs is given up")
+ap.add_argument("--no-ckpt", action="store_true", help="no episode checkpoints: a stopped run restarts its episodes")
+ap.add_argument("--tail-exit-min", type=float, default=0,
+                help="stop (exit 3) once every episode has started and a server has had none for this many minutes")
 args = ap.parse_args()
 OUT = Path(args.out)
 OUT.mkdir(parents=True, exist_ok=True)
@@ -65,6 +76,8 @@ DOWN: set = set()   # servers that failed the retries and a /health probe: no re
 # every server at least every IDLE_S + (servers - 1) * DWELL_S + one turn (36 min with 4 servers).
 IDLE_S = float(os.environ.get("MA_CE_IDLE_S", 1200))
 DWELL_S = 300
+WATCH_S, STOP_MARGIN_S, STOP_GRACE_S = 60, 600, 420   # stop checks; stop this long before the end; pause wait
+_stop: list = [None]   # why the run stops early: "time", "down" or "tail"
 TOOLCALL = not args.textbased
 
 # ---- mini-swe-agent 2.4.6 mini.yaml (the tool-calling config; Flint's SWE-Bench evals ran mini-swe-agent) ------------
@@ -497,23 +510,41 @@ async def main():
     print(f"{len(rows)} problems x {args.episodes} episodes; {len(done)} done, {len(todo)} to run, {n_cap} given up "
           f"after {args.max_episode_tries} tries; model {args.model}; "
           f"N={L.N} tokens={L.TOKENS} ctx_chars={L.CTX_CHARS} turn={A.TURN} max_len={A.MAX_LEN}", flush=True)
+    def ckpt_for(pid, e):
+        return L.Checkpoint(OUT / "state" / f"{str(pid).replace('/', '_')}_e{e}")
+    if not args.no_ckpt:
+        for k in done:   # a kill between an episode's row and its clear left the state
+            ckpt_for(*k).clear()
+        n_res = sum(ckpt_for(r["metadata"]["pid"], e).exists() for _, e, r in todo)
+        print(f"{n_res} of them resume from a checkpoint", flush=True)
     sem = asyncio.Semaphore(args.concurrency)
     _http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=args.request_timeout))
-    ran = []   # this run's rows
+    ran, cks, running, started, paused = [], [], {}, [0], [0]   # this run's rows and checkpoints; episodes in flight
 
     async def one(i, e, r):
         async with sem:
-            if DOWN:   # a server died: no new episode starts; the requeue (exit 99) runs it on fresh servers
+            started[0] += 1
+            if DOWN or _stop[0]:   # a server died or the run stops: the requeue (exit 99) runs it on fresh servers
                 return
             t0 = time.time()
+            key = (r["metadata"]["pid"], e)
+            ck = None if args.no_ckpt else ckpt_for(*key)
+            if ck is not None:
+                cks.append(ck)
+            running[key] = ck
             url = min(URLS, key=_active.get)
             _active[url] += 1
             inp = SimpleNamespace(evaluation=True, sampling_params={}, base_url=url, moved_at=t0, moves=0,
                                   sample=SimpleNamespace(index=i, group_index=e, label=r["label"], metadata=r["metadata"]))
             rec = {"pid": r["metadata"]["pid"], "episode": e, "model": args.model}
             try:
-                _, S, info = await L.episode(inp, r["metadata"]["messages"], r["label"])
+                _, S, info = await L.episode(inp, r["metadata"]["messages"], r["label"],
+                                             **({"ckpt": ck} if ck is not None else {}))
                 rec.update(S=S, info=info)
+            except L.Paused as ex:   # the run stops: the state is saved, no row; the rerun resumes it
+                paused[0] += 1
+                rec = None
+                print(f"[{key[0]} ep{e}] {ex}", flush=True)
             except _HttpAborted as ex:
                 rec.update(S=None, aborted=str(ex))
                 if ex.url in DOWN:   # every server is down: not the episode's failure, no row; the rerun resumes it
@@ -526,28 +557,72 @@ async def main():
                            traceback=traceback.format_exc()[-4000:])
             finally:
                 _active[inp.base_url] -= 1   # the server it ended on
+                running.pop(key, None)
             if rec is None:
-                print(f"[{r['metadata']['pid']} ep{e}] stopped: no live server", flush=True)
                 return
             rec["moves"] = inp.moves
-            rec["minutes"] = round((time.time() - t0) / 60, 1)
+            rec["minutes"] = round(((ck.prior_s if ck is not None else 0.0) + time.time() - t0) / 60, 1)   # all runs
             with open(res_path, "a") as f:
                 f.write(json.dumps(rec) + "\n")
             ran.append(rec)
+            if ck is not None and (rec["S"] is not None or rec.get("crash")):   # a transport abort resumes
+                ck.clear()
             print(f"[{rec['pid']} ep{e}] S={rec.get('S')} subs={(rec.get('info') or {}).get('fo_lg_submissions')} "
                   f"tokens={(rec.get('info') or {}).get('fo_lg_tokens')} {rec['minutes']} min moves={inp.moves}"
                   + (f" ABORTED {rec['aborted'][:200]}" if rec.get("S") is None else ""), flush=True)
 
+    tasks = [asyncio.create_task(one(i, e, r)) for i, e, r in todo]
+
+    async def watch():
+        zero = {u: None for u in URLS}   # since when a live server has had no episode
+        while True:
+            await asyncio.sleep(WATCH_S)
+            now, end = time.time(), os.environ.get("SLURM_JOB_END_TIME", "")
+            for u in URLS:
+                zero[u] = (zero[u] or now) if _active[u] == 0 and u not in DOWN else None
+            if end.isdigit() and now > int(end) - STOP_MARGIN_S:
+                _stop[0] = "time"
+            elif DOWN:
+                _stop[0] = "down"
+            elif args.tail_exit_min > 0 and started[0] >= len(todo) and running and \
+                    any(z is not None and now - z >= 60 * args.tail_exit_min for z in zero.values()):
+                _stop[0] = "tail"
+            if _stop[0]:
+                break
+        print(f"stopping ({_stop[0]}): {len(running)} episodes in flight pause at the end of their round", flush=True)
+        for ck in running.values():
+            if ck is not None:
+                ck.stop = True
+        t_end = time.time() + STOP_GRACE_S
+        while any(ck is not None for ck in running.values()) and time.time() < t_end:
+            await asyncio.sleep(min(WATCH_S, 5))
+        for t in tasks:   # the rest lose the work since their last save
+            t.cancel()
+
+    watcher = asyncio.create_task(watch())
     try:
-        await asyncio.gather(*(one(i, e, r) for i, e, r in todo))
+        if tasks:
+            await asyncio.wait(tasks)
     finally:
+        watcher.cancel()
         await _http.close()
+    for t in tasks:
+        if not t.cancelled() and t.exception() is not None:   # the driver's own bug (one() catches the episode's)
+            raise t.exception()
     line, code = outcome(want, _read(res_path), ran, args.max_episode_tries, args.episodes)
     print(line, flush=True)
     if DOWN:
         print(f"servers down: {sorted(DOWN)}", flush=True)
+    n_cut = sum(t.cancelled() for t in tasks)
+    if _stop[0] or paused[0] or n_cut:
+        print(f"stopped ({_stop[0]}): {paused[0]} episodes paused at a checkpoint, {n_cut} cancelled", flush=True)
+    if code and _stop[0] == "tail":
+        code = 3
+    elif code == 99 and not ran and not sum(ck.saves for ck in cks):   # no row, no checkpoint: a rerun would repeat
+        print("no progress in this run", flush=True)
+        code = 1
     if code:
-        print(f"exit {code}" + (": rerun the same command to resume" if code == 99 else ""), flush=True)
+        print(f"exit {code}" + (": rerun the same command to resume" if code in (3, 99) else ""), flush=True)
         sys.exit(code)
 
 
