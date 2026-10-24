@@ -61,8 +61,11 @@ import yaml
 
 FCS_ROOT = Path(os.environ.get("FCS_ROOT", "/scratch/gpfs/GROUP/USER/project/Frontier-CS/algorithmic"))
 TESTLIB_DIR = FCS_ROOT / "judge" / "include"
-CACHE = Path(os.environ.get("FCS_JUDGE_CACHE", "/tmp/fcs_judge_cache"))
-TMP = Path(os.environ.get("FCS_JUDGE_TMP", "/tmp"))
+# work dirs (each case's stdout, up to 128 MiB) and the helper cache follow TMPDIR (a job's per-job scratch dir, removed by
+# its EXIT trap) when FCS_JUDGE_TMP / FCS_JUDGE_CACHE are unset: on shared node /tmp a full disk cut outputs short and
+# scored them WA, silently (2026-10-08), and a killed job left its fcsj_* dirs behind. Without TMPDIR: /tmp as before
+TMP = Path(os.environ.get("FCS_JUDGE_TMP") or tempfile.gettempdir())
+CACHE = Path(os.environ.get("FCS_JUDGE_CACHE") or TMP / "fcs_judge_cache")
 CASE_WORKERS = int(os.environ.get("FCS_CASE_WORKERS", "8"))
 
 
