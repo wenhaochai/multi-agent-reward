@@ -82,12 +82,15 @@ hist = [{"role": "system", "content": "s"}, {"role": "user", "content": "inst"}]
 t1, c1 = asyncio.run(sess.turn(hist, 1000))
 check(A.ACTION_RE.findall(t1) == ["g++ a.cpp"] and t1.startswith("<think>R</think>plan") and not c1 and sess.queue == ["submit a.cpp"],
       "turn 1: first call is the action, second queued")
+lc = sess.last_call
+check(lc["prompt_tokens"] == 100 and lc["completion_tokens"] == 50 and lc["attempts"] == 1 and lc["llm_s"] >= 0
+      and lc["cached_tokens"] is None and lc["finish_reason"] == "tool_calls", f"turn 1: last_call {lc}")
 hist += [{"role": "assistant", "content": "plan" + g["_block"]("g++ a.cpp"), "reasoning_content": "R"},
          {"role": "user", "content": '{"returncode": 0}'}]
 n_seg = len(sess.segments)
 t2, c2 = asyncio.run(sess.turn(hist, 1000))
 check(A.ACTION_RE.findall(t2) == ["submit a.cpp"] and len(calls) == 1 and len(sess.segments) == n_seg and sess.cont
-      and not sess.fresh, "turn 2: queued call, no model call, no tokens")
+      and not sess.fresh and sess.last_call == {"llm_s": 0.0, "queued_call": True}, "turn 2: queued call, no model call, no tokens")
 hist += [{"role": "assistant", "content": g["_block"]("submit a.cpp"), "_cont": True},
          {"role": "user", "content": '{"returncode": 0, "output": "provisional 61"}'}]
 api = g["to_api"](hist)

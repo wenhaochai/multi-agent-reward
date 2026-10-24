@@ -187,8 +187,13 @@ class _Agent(T._Agent):
         self.chat, self.dropped = trim_chat(self.chat, CTX_CHARS, self.dropped, int(CTX_LOW * CTX_CHARS))
         self.steps += 1
         self.sess.last_messages = None
-        n_seg = len(self.sess.segments)
+        n_seg, g0, t0 = len(self.sess.segments), self.generated, time.monotonic()
         text, cut = await self.sess.turn(self.chat, min(A.TURN, TOKENS - self.generated))
+        # the turn's accounting for the trace: completion tokens, prompt + completion of the call (None without a new
+        # segment, so a stale count is not reused), the history dropped so far, the wall time of the model call and,
+        # from a session that records it (chat_eval_long.ChatSession.last_call), the server's own numbers
+        acct = {"tokens": 0, "used": None, "dropped": self.dropped, "think_s": round(time.monotonic() - t0, 3),
+                "t": round(time.time(), 1), **(getattr(self.sess, "last_call", None) or {})}
         for tok in A._SPECIAL:
             text = text.replace(tok, "")
         if len(self.sess.segments) > n_seg:
@@ -197,13 +202,14 @@ class _Agent(T._Agent):
             self.last_seg = seg
             if self.sess.input.evaluation:   # keep one segment: the episode returns only the last one
                 self.sess.segments = [seg]
+            acct.update(tokens=self.generated - g0, used=getattr(self.sess, "used", None))
         if not text and cut:
             self.done, self.exit = True, "ContextExceeded"
-            self.turns.append({"step": self.steps, "text": "", "cut": True})
+            self.turns.append({"step": self.steps, "text": "", "cut": True, **acct})
             return None
         vis = "" if cut else answer(text, A.THINK).strip()
         actions = [] if cut else [a.strip() for a in A.ACTION_RE.findall(vis)]
-        rec = {"step": self.steps, "text": text, "cut": bool(cut)}
+        rec = {"step": self.steps, "text": text, "cut": bool(cut), **acct}
         if len(actions) != 1:
             self.fmt_run, self.fmt_total, self.cut_n = self.fmt_run + 1, self.fmt_total + 1, self.cut_n + bool(cut)
             msg = A.LENGTH_ERROR if cut else A.FORMAT_ERROR.format(
@@ -218,7 +224,11 @@ class _Agent(T._Agent):
         return actions[0]
 
     def observe(self, cmd: str, out: dict, rnd: int, order: int) -> None:
+        timing = out.get("_timing") or {}   # the episode's waits for this action (judge, command queue, harness)
+        out = {k: v for k, v in out.items() if k != "_timing"}
         T._Agent.observe(self, cmd, out, rnd, order)
+        if self.turns:
+            self.turns[-1].update(seconds=round(out.get("seconds", 0.0), 3), **timing)
         if self.exit == "Submitted":   # the finish command on an unchanged solution.cpp (episode's finish()) ends it
             self.exit = "Finished"
 
@@ -234,7 +244,7 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
     os.makedirs(work)
     loop = asyncio.get_running_loop()
     rng = random.Random(f"{label}:{input.sample.index}:{getattr(input.sample, 'group_index', 0)}")
-    rounds, run_s, subs, board, events = 0, 0.0, [], [], []
+    rounds, run_s, subs, board, events, t_ep = 0, 0.0, [], [], [], time.monotonic()
 
     def _put(name: str, text: str) -> None:
         """Write work/name for the agents to read without following what they put there (audit 2026-10-24: an
@@ -279,12 +289,15 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
         p, code = got
         if code is None:
             return {"output": f"submit: {path} is larger than {MAX_FILE} bytes\n", "returncode": 1, "exception_info": ""}
+        t0 = time.monotonic()
         res = await judge_code(label, code)
+        judge_s = round(time.monotonic() - t0, 3)
         cases = res["cases"]
         prov, final = subset_mean(cases, prov_idx), subset_mean(cases, final_idx)
         rev = (await loop.run_in_executor(A._POOL, lambda: T._git(work, "rev-parse", "HEAD").stdout.strip()))
         s = {"agent": a.name, "round": rounds, "step": a.steps, "file": path, "status": res["status"], "prov": prov,
-             "final": final, "infra": bool(res["infra_error"]), "rev": rev, "sha": sha1(code), "code": code}
+             "final": final, "infra": bool(res["infra_error"]), "rev": rev, "sha": sha1(code), "judge_s": judge_s,
+             "code": code}
         subs.append(s)
         a.n_submit += 1
         if p == os.path.realpath(os.path.join(work, "solution.cpp")):
@@ -342,25 +355,33 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
             for k, (a, cmd) in enumerate(todo):
                 m_sub, m_post = SUBMIT_RE.fullmatch(cmd), POST_RE.fullmatch(cmd)
                 ends = False   # the finish command on an unchanged solution.cpp: finish() passes `out` on to end it
+                timing, t0 = {}, time.monotonic()   # wall times from here, so waits for a worker are seen
                 if m_sub:
                     out, secs = await do_submit(a, m_sub.group(1) or "solution.cpp"), 0.0
+                    timing["judge_s"] = round(time.monotonic() - t0, 3)
                 elif m_post:
                     out, secs = do_post(a, m_post.group(1)), 0.0
                 else:
                     out = await loop.run_in_executor(A._POOL, A.run_command, cmd, work, True)
                     secs = out["seconds"]
+                    wall = time.monotonic() - t0
+                    timing.update(cmd_wall_s=round(wall, 3), cmd_queue_s=round(wall - secs, 3))
                     lines = out["output"].lstrip().splitlines()
                     if lines and lines[0].strip() == A.MARK and out["returncode"] == 0:
+                        t1 = time.monotonic()
                         res = await finish(a, out)
                         ends = res is out
                         out = {**res, "seconds": secs}
+                        timing["judge_s"] = round(time.monotonic() - t1, 3)
                 run_s += secs
+                t1 = time.monotonic()
                 await loop.run_in_executor(A._POOL, write_logs)
                 await loop.run_in_executor(A._POOL, T.commit_as, work, a.name, a.steps)
+                timing["harness_s"] = round(time.monotonic() - t1, 3)
                 upd = updates_for(a)
                 if upd and not ends:   # an ending observation keeps the MARK as its first line
                     out = {**out, "output": upd + out["output"]}
-                a.observe(cmd, out, rounds, k)
+                a.observe(cmd, {**out, "_timing": timing}, rounds, k)
         best = max(subs, key=lambda x: (x["prov"], -subs.index(x))) if subs else None
         shares = (await loop.run_in_executor(A._POOL, T.blame_shares, work, best["file"], best["rev"])) if best else {}
         log = (await loop.run_in_executor(A._POOL, lambda: T._git(work, "log", "--format=%an %s").stdout))[-20000:]
@@ -368,6 +389,9 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
         shutil.rmtree(work, ignore_errors=True)
     S = best["final"] if best else 0.0
     oracle = max((s["final"] for s in subs), default=0.0)
+
+    def total_min(key: str) -> float:   # summed over every agent's turns
+        return sum(t.get(key) or 0.0 for a in agents for t in a.turns) / 60
     first = subs[0]["round"] if subs else -1
     info = {"fo_S": S, "fo_R": S, "fo_lg_n": N, "fo_lg_rounds": rounds, "fo_lg_submissions": len(subs),
             "fo_lg_best_prov": best["prov"] if best else 0.0, "fo_lg_oracle_final": oracle,
@@ -379,15 +403,21 @@ async def episode(input: GenerateFnInput, messages: list, label: str):
             "fo_ag_no_code": float(best is None), "fo_ag_top_author": max(shares.values()) if shares else 0.0,
             **{f"fo_ag_exit_{e}": sum(a.exit == e for a in agents) / N for e in
                ("Finished", "TokensExceeded", "ContextExceeded", "RepeatedFormatError")},
-            "fo_judge_infra_error": float(any(s["infra"] for s in subs))}
+            "fo_judge_infra_error": float(any(s["infra"] for s in subs)),
+            # where the episode's wall time went (audit 2026-10-24): model calls as the server saw them (llm) and as the
+            # agent waited for them (think), commands' waits for a worker, the judge, the harness's logs and commits
+            "fo_lg_wall_min": (time.monotonic() - t_ep) / 60, "fo_lg_llm_min": total_min("llm_s"),
+            "fo_lg_think_min": total_min("think_s"), "fo_lg_cmd_queue_min": total_min("cmd_queue_s"),
+            "fo_lg_judge_min": total_min("judge_s"), "fo_lg_harness_min": total_min("harness_s")}
     A._trace({"time": round(time.time(), 1), "eval": input.evaluation, "game": "agent_long", "label": label, "S": S,
               "n": N, "budget": TOKENS, "rounds": rounds, "shared_case": shared, "n_cases": n_cases,
-              "submissions": [{k: v for k, v in s.items() if k != "code"} for s in subs],
-              "best": {k: v for k, v in best.items()} if best else None, "board": board, "blame": shares,
-              "git_log": log,
+              "submissions": subs, "best": {k: v for k, v in best.items() if k != "code"} if best else None,
+              "board": board, "blame": shares, "git_log": log,
+              # full turns (text = <think>reasoning</think>answer) and submissions with their code (audit 2026-10-24:
+              # the last 4000 characters of a turn hid the reasoning; ~4 MB per 1M-token episode)
               "agents": [{"name": a.name, "exit": a.exit, "steps": a.steps, "generated": a.generated,
-                          "dropped": a.dropped, "submits": a.n_submit, "posts": a.n_post,
-                          "turns": [{**t, "text": t.get("text", "")[-4000:]} for t in a.turns]} for a in agents]})
+                          "dropped": a.dropped, "submits": a.n_submit, "posts": a.n_post, "turns": a.turns}
+                         for a in agents]})
     return agents, S, info
 
 

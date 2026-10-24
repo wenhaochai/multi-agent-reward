@@ -225,11 +225,15 @@ class ChatSession:
         self.max_len = max_len or A.MAX_LEN
         self.segments, self.last_messages = [], None
         self.last_reasoning, self.fresh, self.used = "", False, 0   # used: prompt + completion tokens of the last call
+        self.last_call = {}   # the last turn's numbers for the trace (see turn)
         self.queue, self.cont, self.n_cont = [], False, 0   # calls a response made beyond its first; cont: this turn
         # handed one out; n_cont: how many since the last model call
 
     async def turn(self, messages: list, max_tokens: int) -> tuple[str, bool]:
+        """last_call: this turn's numbers for the trace (fcs_agent_long merges them into the turn record)."""
+        self.last_call = {"llm_s": 0.0}
         if self.queue:   # the next call of the last response: no model call, no tokens
+            self.last_call["queued_call"] = True
             self.cont, self.fresh, self.n_cont = True, False, self.n_cont + 1
             block = _block(self.queue.pop(0))
             return (f"<think></think>{block}" if self.think else block), False
@@ -239,19 +243,21 @@ class ChatSession:
         self.cont, self.n_cont = False, 0
         room = self.max_len - est
         if room <= 256:
+            self.last_call["no_room"] = True
             return "", True
         body = {"model": args.model, "messages": to_api(messages) if TOOLCALL else messages,
                 "max_tokens": min(max_tokens, room), "temperature": args.temperature, "top_p": args.top_p,
                 "top_k": args.top_k}
         if TOOLCALL:
             body["tools"] = [BASH_TOOL]
-        out = None
+        out, t_req, t0 = None, round(time.time(), 1), time.monotonic()
         for attempt in range(4):
             try:
                 async with _http.post(f"{getattr(self.input, 'base_url', URLS[0])}/v1/chat/completions", json=body) as r:
                     if r.status == 400:
                         err = await r.text()
                         if "context" in err.lower() or "length" in err.lower():
+                            self.last_call.update(llm_s=round(time.monotonic() - t0, 3), context_400=True)
                             return "", True
                         raise RuntimeError(f"400: {err[:500]}")
                     r.raise_for_status()
@@ -262,6 +268,11 @@ class ChatSession:
                     raise Aborted(f"{self.name}: {e!r}")
                 await asyncio.sleep(10 * (attempt + 1))
         ch, usage = out["choices"][0], out.get("usage") or {}
+        # cached_tokens needs SGLang's --enable-cache-report; None means not reported, not zero
+        self.last_call = {"t_req_start": t_req, "llm_s": round(time.monotonic() - t0, 3), "attempts": attempt + 1,
+                          "prompt_tokens": usage.get("prompt_tokens"), "completion_tokens": usage.get("completion_tokens"),
+                          "cached_tokens": (usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
+                          "finish_reason": ch.get("finish_reason")}
         msg = ch["message"]
         reasoning, content = msg.get("reasoning_content") or "", msg.get("content") or ""
         cmds = []
