@@ -718,8 +718,11 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
             "fo_ag_no_code": float(best is None), "fo_ag_top_author": max(shares.values()) if shares else 0.0,
             **{f"fo_ag_exit_{e}": sum(a.exit == e for a in agents) / N for e in
                ("Finished", "IdleFinish", "TokensExceeded", "ContextExceeded", "RepeatedFormatError")},
-            "fo_judge_infra_error": float(any(s["infra"] or s["infra_retries"] for s in subs)),   # any infra judge call
-            "fo_judge_infra_unresolved": float(any(s["infra"] for s in subs)),   # still infra after the retries
+            # fo_judge_infra_error keeps its meaning (a submission still infra after the retries; chat_eval_long reruns
+            # such a row, and the training paths drop on it) and equals fo_judge_infra_unresolved
+            "fo_judge_infra_error": float(any(s["infra"] for s in subs)),
+            "fo_judge_infra_unresolved": float(any(s["infra"] for s in subs)),
+            "fo_judge_infra_any": float(any(s["infra"] or s["infra_retries"] for s in subs)),   # any infra judge call
             "fo_judge_infra_retries": sum(s["infra_retries"] for s in subs), "fo_lg_verdicts": float(VERDICTS),
             # where the episode's wall time went (audit 2026-10-24): model calls as the server saw them (llm) and as the
             # agent waited for them (think), commands' waits for a worker, the judge (every submission and the

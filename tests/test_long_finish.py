@@ -128,8 +128,9 @@ a = run(["printf 'int main(){}\\n' > solution.cpp", "submit"])
 sub = last_trace()["submissions"][0]
 check("infra once: one retry, then a real result", len(judged) == 2 and sub["infra_retries"] == 1 and not sub["infra"]
       and sub["prov"] == 0.5 and "could not finish" not in a.outs[1], (judged, sub, a.outs))
-check("infra info keys", run.info["fo_judge_infra_retries"] == 1 and run.info["fo_judge_infra_unresolved"] == 0.0
-      and run.info["fo_judge_infra_error"] == 1.0, run.info)
+check("infra info keys: a resolved retry is no infra error", run.info["fo_judge_infra_retries"] == 1
+      and run.info["fo_judge_infra_unresolved"] == 0.0 and run.info["fo_judge_infra_error"] == 0.0
+      and run.info["fo_judge_infra_any"] == 1.0, run.info)
 
 # an infra failure that stays: told, and never picked over a real result even with a higher provisional score
 RESULT = lambda code, k: infra([1.0] * 10) if "A" in code else fake_ok(code)
@@ -140,8 +141,8 @@ check("persistent infra: 3 tries, then told", len(judged) == 4 and subs[0]["infr
       and "could not finish this submission after 3 tries (status: done)" in a.outs[1], (judged, subs, a.outs))
 check("infra entry with a higher prov is not the best", tr["best"]["sha"] == subs[1]["sha"] and tr["S"] == 0.5
       and run.info["fo_lg_best_prov"] == 0.5 and "Best provisional so far: 50.00 (#2" in a.outs[3], (tr["best"], a.outs))
-check("unresolved infra flagged", run.info["fo_judge_infra_unresolved"] == 1.0 and run.info["fo_judge_infra_retries"] == 2,
-      run.info)
+check("unresolved infra flagged", run.info["fo_judge_infra_unresolved"] == 1.0 and run.info["fo_judge_infra_error"] == 1.0
+      and run.info["fo_judge_infra_any"] == 1.0 and run.info["fo_judge_infra_retries"] == 2, run.info)
 a = run(["printf 'int main(){A;}\\n' > solution.cpp", "submit"])
 check("all infra: the infra one is still the answer", last_trace()["best"]["infra"] and run.info["fo_lg_submissions"] == 1)
 RESULT = None
