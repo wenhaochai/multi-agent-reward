@@ -71,7 +71,7 @@ _http: aiohttp.ClientSession | None = None
 URLS = [u.strip().rstrip("/") for u in args.base_url.split(",") if u.strip()]
 _active = {u: 0 for u in URLS}   # episodes running per server; a new episode takes the least busy one
 _last = {u: time.time() for u in URLS}   # the last request start or end on each server
-DOWN: set = set()   # servers that failed the retries and a /health probe: no request goes to them again in this run
+DOWN: set = set()   # servers that failed the retries and a health probe: no request goes to them again in this run
 # An episode moves to another server (one cold prefill) when its server has 2 or more episodes more than the least
 # busy one, or when a server without episodes has had no request for IDLE_S seconds (the cluster mails at 30 min of
 # 0% GPU and cancels the whole host at 90) and the episode has stayed DWELL_S where it is. A lone episode then visits
@@ -237,8 +237,10 @@ def _route(inp) -> str:
 
 
 async def _healthy(url: str) -> bool:
+    """SGLang's /health_generate runs a one-token generation, so a hung engine fails it; its plain /health answers 200
+    from the HTTP server without touching the engine."""
     try:
-        async with _http.get(f"{url}/health", timeout=aiohttp.ClientTimeout(total=10)) as r:
+        async with _http.get(f"{url}/health_generate", timeout=aiohttp.ClientTimeout(total=30)) as r:
             return r.status == 200
     except (aiohttp.ClientError, asyncio.TimeoutError):
         return False
@@ -378,7 +380,7 @@ class ChatSession:
                 if attempt < 4:
                     await asyncio.sleep(10 * attempt)
                     continue
-                # ~60 s of failures: a server that also fails /health is down, and the episode goes on elsewhere
+                # ~60 s of failures: a server that also fails /health_generate is down, and the episode goes on elsewhere
                 if url in _active and url not in DOWN and not await _healthy(url):
                     DOWN.add(url)
                     print(f"server {url} is down after {e!r}: no new episodes start in this run", flush=True)

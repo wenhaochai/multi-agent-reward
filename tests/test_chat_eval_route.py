@@ -2,7 +2,7 @@
 end, the next turns move episodes until no two servers differ by 2 or more; (b) a lone episode on 4 servers keeps
 every server from idling longer than the bound, without moving on every turn; (c) after a run whose episodes moved,
 every server's count is 0; (d) the agents of one episode move together; (e) a dead server (failed retries and
-/health) gets no new episodes, its episode goes on elsewhere, and the run exits 99; the rerun resumes and exits 0."""
+/health_generate) gets no new episodes, its episode goes on elsewhere, and the run exits 99; the rerun resumes and exits 0."""
 import asyncio
 import json
 import sys
@@ -37,7 +37,7 @@ def check(c, what, detail=""):
 clock = [1e6]
 g["time"] = SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0])   # llm_s reads monotonic
 TURN_S = 60.0
-posts, dead = [], set()   # posts: (url, start, end)
+posts, dead, probes = [], set(), []   # posts: (url, start, end); probes: (url, timeout)
 
 
 class _Resp:
@@ -74,6 +74,7 @@ class _Http:
         return _Resp(200, REPLY)
 
     def get(self, url, timeout=None):
+        probes.append((url, timeout.total if timeout else None))
         return _Resp(None if url.rsplit("/health", 1)[0] in dead else 200, {})
 
     async def close(self):
@@ -204,11 +205,13 @@ c = run("o1")
 check(c == 0 and all(v == 0 for v in _active.values()), "(c) all counts 0 after the run", (c, _active))
 
 reset()
-dead.add(U[1])   # s1 refuses connections: its episode fails the retries and /health, then goes on elsewhere
+dead.add(U[1])   # s1 refuses connections: its episode fails the retries and /health_generate, then goes on elsewhere
 c = run("o2")
 rows = g["_read"](TMP / "o2/results.jsonl")
 after = [p for p in posts if p[0] == U[1]]
 check(g["DOWN"] == {U[1]} and not after, "(e) dead server marked down, never posted to", (g["DOWN"], after))
+check(probes and all(u == U[1] + "/health_generate" and t == 30 for u, t in probes),
+      "(e) the probe is /health_generate (it runs the engine), 30 s", probes)
 check(c == 99 and 0 < len(rows) < 6 and all(r["S"] == 0.5 for r in rows) and all(v == 0 for v in _active.values()),
       "(e) its episode finished elsewhere; no new episodes after; exit 99 while rows are missing", (c, rows, _active))
 dead.clear()
