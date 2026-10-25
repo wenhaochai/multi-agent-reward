@@ -1,9 +1,10 @@
 """fcs_cmd.run_command's limits on what a command leaves behind (audit 2026-10-24): a background child that keeps the
 output open cannot hold the call past MA_AG_TIMEOUT, every process the command started is gone when the call returns,
-and a command cannot reach an abstract unix socket made outside its sandbox. Run it twice, with FCS_CASE_PROC=1 (case
-workers, as in the evals) and FCS_CASE_PROC=0 (in the caller); the worktree goes first on sys.path, so the case
-workers import this code."""
+a command cannot reach an abstract unix socket made outside its sandbox, and a long-game command gets a private /tmp and
+no mount of its own. Run it twice, with FCS_CASE_PROC=1 (case workers, as in the evals) and FCS_CASE_PROC=0 (in the
+caller); the worktree goes first on sys.path, so the case workers import this code."""
 import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -48,9 +49,36 @@ with tempfile.TemporaryDirectory(dir=base) as work:
     check("return code kept", r["returncode"] == 3 and r["exception_info"] == "", r)
     r = C.run_command("cat /dev/urandom | head -c 4 | wc -c", work)
     check("/dev/urandom readable", r["output"].strip() == "4", r)
-    if C.J.LANDLOCK_ABI:   # what fcs_agent_long's v2 prompt says about /tmp
+    if C.J.LANDLOCK_ABI:
         r = C.run_command("ls /tmp; touch /tmp/fcs_probe_$$ && echo WROTE", work)
         check("/tmp can be neither listed nor written", "Permission denied" in r["output"] and "WROTE" not in r["output"], r)
+    # the long game (harness=True): a private /tmp beside the repository, what fcs_agent_long's v2 prompt says
+    probe = f"fcs_probe_{uuid.uuid4().hex}"
+    r = C.run_command(f"echo hi > /tmp/{probe} && ls /tmp && cat /tmp/{probe}", work, True)
+    check("long game: /tmp is writable and listable", r["returncode"] == 0 and r["output"] == f"{probe}\nhi\n", r)
+    check("long game: the file is in private_tmp, not in the repo or the node's /tmp",
+          os.path.isfile(os.path.join(C.private_tmp(work), probe)) and not os.path.exists(f"/tmp/{probe}")
+          and probe not in os.listdir(work))
+    r = C.run_command(f"cat /tmp/{probe}", work, True)
+    check("long game: /tmp persists across commands", r["output"] == "hi\n", r)
+    r = C.run_command(f"ls /tmp/{probe}", work)
+    check("other commands do not see it", r["returncode"] != 0, r)
+    if C.J.LANDLOCK_ABI:
+        r = C.run_command("touch ../outside_$$ && echo WROTE; mkdir /var/tmp/x_$$ && echo WROTE", work, True)
+        check("long game: paths outside the repo and /tmp stay closed", "WROTE" not in r["output"], r)
+        other = tempfile.mkdtemp(dir=base) + ".tmp"
+        os.makedirs(other)
+        r = C.run_command(f"ls {other} && echo READ; touch {other}/x && echo WROTE", work, True)
+        check("long game: another episode's /tmp stays closed", "READ" not in r["output"] and "WROTE" not in r["output"], r)
+        shutil.rmtree(other)
+        os.rmdir(other[: -len(".tmp")])
+        r = C.run_command("umount /tmp && echo UMOUNTED; mount -t tmpfs none /usr && echo MOUNTED; "
+                          "unshare -rm sh -c 'mount -t tmpfs none /etc && echo NESTED'", work, True)
+        check("long game: no mount of its own", not any(w in r["output"] for w in ("UMOUNTED", "MOUNTED", "NESTED")), r)
+    shutil.rmtree(C.private_tmp(work))   # the agent removed it
+    r = C.run_command("touch /tmp/again && echo OK", work, True)
+    check("long game: a removed /tmp comes back", r["output"] == "OK\n", r)
+    shutil.rmtree(C.private_tmp(work))
     t = time.monotonic()
     r = C.run_command("sleep 100", work)
     dt = time.monotonic() - t

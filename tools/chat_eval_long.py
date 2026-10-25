@@ -538,6 +538,17 @@ async def main():
           f"after {args.max_episode_tries} tries; model {args.model}; "
           f"N={L.N} tokens={L.TOKENS} ctx_chars={L.CTX_CHARS} ctx_low={L.CTX_LOW} turn={A.TURN} max_len={A.MAX_LEN} "
           f"harness={L.harness_tag()}", flush=True)
+    if todo:   # each command gets a private /tmp (fcs_cmd.private_tmp): on a node that refuses the namespace every
+        # command of every episode would fail, so the run stops here (exit 1, not a requeue)
+        probe = os.path.join(os.environ.get("TMPDIR", "/tmp"), "agent_long", f"probe_{os.getpid()}")
+        os.makedirs(probe, exist_ok=True)
+        r = await asyncio.get_running_loop().run_in_executor(A._POOL, L.C.run_command, "echo ok > /tmp/p && cat /tmp/p",
+                                                             probe, True)
+        L.rm_work(probe)
+        if r["output"] != "ok\n":
+            print(f"PRIVATE_TMP_FAIL {r}", flush=True)
+            sys.exit(1)
+
     def ckpt_for(pid, e):
         return L.Checkpoint(OUT / "state" / f"{str(pid).replace('/', '_')}_e{e}")
     if not args.no_ckpt:

@@ -119,11 +119,11 @@ _TEAM_ENV = ("You are {name}, one of {n} agents working at the same time in this
              "commits.")
 _SOLO_ENV = ("You work alone in a git repository with a Linux shell (g++, python3, git and the usual command-line "
              "tools; no internet).")
-# v2's facts about the shell (no braces: _TEAM_ENV goes through .format). 50 of 866 smoke turns failed on /tmp; one
-# episode spent ~110 steps on a heap crash after ASan could not start; Flint restored code by full rewrites.
-_ENV_FS = (" Your current directory is the repository and the only place where you can create or change files: /tmp "
-           "and every other path outside it cannot be written (/tmp cannot even be listed), so keep all files there, "
-           "scratch files included, and use relative paths.")
+# v2's facts about the shell (no braces: _TEAM_ENV goes through .format). 50 of 866 smoke turns failed on /tmp (each
+# command now gets a private one, fcs_cmd.private_tmp); one episode spent ~110 steps on a heap crash after ASan could not
+# start; Flint restored code by full rewrites.
+_ENV_FS = (" Your current directory is the repository. Outside it, only /tmp can be written: a scratch directory that "
+           "is not committed and is emptied when your work is resumed after a restart.")
 _ENV_ASAN = (" Each command runs with a 4 GB address-space limit, so -fsanitize=address cannot start; to find memory "
              "errors use -fsanitize=undefined, -D_GLIBCXX_ASSERTIONS or gdb.")
 assert C.CMD_MEM == 4 << 30, "_ENV_ASAN names the limit"
@@ -443,6 +443,12 @@ class Checkpoint:
                 pass
 
 
+def rm_work(work: str) -> None:
+    """Remove an episode's repository and its commands' /tmp."""
+    for d in (work, C.private_tmp(work)):
+        shutil.rmtree(d, ignore_errors=True)
+
+
 async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Checkpoint | None = None):
     from miles_team.fcs_judge import load_problem
     from pathlib import Path
@@ -454,7 +460,7 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
         work = os.path.join(os.environ.get("TMPDIR", "/tmp"), "agent_long", uuid.uuid4().hex)
     else:   # one name per checkpoint, so paths the agent wrote still hold after a resume in the same job
         work = os.path.join(os.environ.get("TMPDIR", "/tmp"), "agent_long", os.path.basename(ckpt.path))
-        shutil.rmtree(work, ignore_errors=True)
+        rm_work(work)
     os.makedirs(work)
     loop = asyncio.get_running_loop()
     rng = random.Random(f"{label}:{input.sample.index}:{getattr(input.sample, 'group_index', 0)}")
@@ -699,7 +705,7 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
         shares = (await loop.run_in_executor(A._POOL, T.blame_shares, work, best["file"], best["rev"])) if best else {}
         log = (await loop.run_in_executor(A._POOL, lambda: T._git(work, "log", "--format=%an %s").stdout))[-20000:]
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        rm_work(work)
     S = best["final"] if best else 0.0
     oracle = max((s["final"] for s in subs), default=0.0)
 

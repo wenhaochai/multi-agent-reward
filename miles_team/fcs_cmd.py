@@ -65,20 +65,50 @@ def _restrict_net(rules):
 
 
 def _sandbox(work: str, harness: bool = False):
-    """The command's Landlock rules: the compiler's, plus /dev/urandom (git add and commit read it) and the stubs."""
+    """The command's Landlock rules: the compiler's, plus /dev/urandom (git add and commit read it), and for a
+    long-game command the stubs and its private /tmp."""
     rules = J._compile_sandbox(J.Path(work))
     if rules is not None:
         rules = rules + J._landlock_rules([("/dev/urandom", J._FS_READ_FILE)]
-                                          + ([(HARNESS_BIN, J._FS_RX)] if harness else []))
+                                          + ([(HARNESS_BIN, J._FS_RX), (private_tmp(work), J._HANDLED)] if harness else []))
     return rules
 
 
+# ---- the long game's /tmp ---------------------------------------------------------------------------------------------
+# Flint writes scratch files to /tmp out of habit (50 of 866 smoke turns failed on it; smoke w153 again). A long-game
+# command (harness=True) runs in its own user and mount namespace with private_tmp(work) bound on /tmp: a directory
+# beside the repository, so the auto-commits never see it, removed with the work dir (fcs_agent_long.rm_work). The
+# node's /tmp stays closed, and Landlock then refuses the command any mount of its own.
+_MS_BIND, _MS_REC, _MS_PRIVATE = 4096, 1 << 14, 1 << 18
+
+
+def private_tmp(work: str) -> str:
+    return work.rstrip("/") + ".tmp"
+
+
+def _bind_tmp(tmp: str, uid: int, gid: int) -> None:
+    """In the forked child: a new user and mount namespace (same uid and gid) with tmp on /tmp."""
+    os.unshare(os.CLONE_NEWUSER | os.CLONE_NEWNS)
+    for name, text in (("setgroups", "deny"), ("uid_map", f"{uid} {uid} 1"), ("gid_map", f"{gid} {gid} 1")):
+        with open(f"/proc/self/{name}", "w") as f:
+            f.write(text)
+    for src, dst, flags in ((None, "/", _MS_REC | _MS_PRIVATE), (tmp, "/tmp", _MS_BIND)):
+        if J._libc.mount(src and src.encode(), dst.encode(), None, ctypes.c_ulong(flags), None) != 0:
+            raise OSError(ctypes.get_errno(), f"mount {dst}")
+
+
 def _preexec(work: str, nproc: int, harness: bool = False):
+    tmp = private_tmp(work) if harness else None
+    if tmp:
+        os.makedirs(tmp, exist_ok=True)   # again on every command: the agent may have removed it
     rules = _sandbox(work, harness)
+    uid, gid = os.getuid(), os.getgid()
 
     def f():
         import resource
         os.setsid()
+        if tmp:
+            _bind_tmp(tmp, uid, gid)
         resource.setrlimit(resource.RLIMIT_CPU, (TIMEOUT + 1,) * 2)
         resource.setrlimit(resource.RLIMIT_AS, (CMD_MEM, CMD_MEM))
         resource.setrlimit(resource.RLIMIT_FSIZE, (J.STDOUT_MAX, J.STDOUT_MAX))
@@ -91,7 +121,8 @@ def _preexec(work: str, nproc: int, harness: bool = False):
 
 def run_command(command: str, work: str, harness: bool = False) -> dict:
     """One action in the episode's work dir (blocking; run in fcs_agent's _POOL). mini-swe-agent's output dict, plus
-    "seconds", the command's wall time (the run time that the reward charges). harness: HARNESS_BIN first on PATH."""
+    "seconds", the command's wall time (the run time that the reward charges). harness (the long game): HARNESS_BIN
+    first on PATH and a private /tmp."""
     return J._in_proc(_timed, command, work, harness, J.CASE_PROC)
 
 
