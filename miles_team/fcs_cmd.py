@@ -64,13 +64,14 @@ def _restrict_net(rules):
         os.close(rs)
 
 
-def _sandbox(work: str, harness: bool = False):
-    """The command's Landlock rules: the compiler's, plus /dev/urandom (git add and commit read it), and for a
-    long-game command the stubs and its private /tmp."""
+def _sandbox(work: str, harness: bool = False, read: tuple = ()):
+    """The command's Landlock rules: the compiler's, plus /dev/urandom (git add and commit read it), for a long-game
+    command the stubs and its private /tmp, and `read` read-only (the harness's git between agents' repositories)."""
     rules = J._compile_sandbox(J.Path(work))
     if rules is not None:
         rules = rules + J._landlock_rules([("/dev/urandom", J._FS_READ_FILE)]
-                                          + ([(HARNESS_BIN, J._FS_RX), (private_tmp(work), J._HANDLED)] if harness else []))
+                                          + ([(HARNESS_BIN, J._FS_RX), (private_tmp(work), J._HANDLED)] if harness else [])
+                                          + [(p, J._FS_RX) for p in read])
     return rules
 
 
@@ -248,18 +249,19 @@ def _run_command(command: str, work: str, harness: bool = False, reap: bool = Fa
 
 
 # ---- the harness's git, under the command sandbox ---------------------------------------------------------------------
-def run_git(work: str, args: list, env: dict, timeout: float = 60) -> subprocess.CompletedProcess:
+def run_git(work: str, args: list, env: dict, timeout: float = 60, read: tuple = ()) -> subprocess.CompletedProcess:
     """git <args> in an episode's repo for the harness (fcs_agent_team._git), in a case worker and under the agents'
     sandbox: config the agents wrote into .git (filter.*.clean, gpg.program, core.pager, ...) then runs with their rights
-    only, not the trainer's (audit 2026-10-24). Raises subprocess.TimeoutExpired after `timeout` s."""
-    rc, out, err = J._in_proc(_git_proc, work, list(args), env, timeout, J.CASE_PROC)
+    only, not the trainer's (audit 2026-10-24); `read`: paths it may also read (another agent's repository, team.git).
+    Raises subprocess.TimeoutExpired after `timeout` s."""
+    rc, out, err = J._in_proc(_git_proc, work, list(args), env, timeout, J.CASE_PROC, tuple(read))
     if rc is None:
         raise subprocess.TimeoutExpired(["git", *args[:1]], timeout)
     return subprocess.CompletedProcess(["git", *args], rc, out, err)
 
 
-def _git_proc(work: str, args: list, env: dict, timeout: float, reap: bool = False):
-    rules = _sandbox(work)
+def _git_proc(work: str, args: list, env: dict, timeout: float, reap: bool = False, read: tuple = ()):
+    rules = _sandbox(work, read=read)
     nproc = J._nproc_limit()
 
     def pre():

@@ -80,11 +80,11 @@ _GIT_SAFE = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c
 MAX_COMMIT_BYTES = 1 << 20   # files the harness commits; a large .in/.txt stays uncommitted (git timeout, review 2026-10-20)
 
 
-def _git(work: str, *args, env: dict | None = None) -> subprocess.CompletedProcess:
+def _git(work: str, *args, env: dict | None = None, read: tuple = ()) -> subprocess.CompletedProcess:
     e = {"PATH": "/usr/bin:/bin", "LANG": "C", "HOME": work, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
          **(env or {})}
     try:
-        return C.run_git(work, [*_GIT_SAFE, *args], e)
+        return C.run_git(work, [*_GIT_SAFE, *args], e, read=read)
     except (subprocess.SubprocessError, OSError, C.J._WorkerDied) as ex:   # a timeout or a failing preexec_fn: an
         # aborted episode is resubmitted; a crash would end the run
         raise Aborted(f"harness git {args[:1]}: {type(ex).__name__}") from ex

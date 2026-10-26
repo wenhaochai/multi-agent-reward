@@ -41,7 +41,7 @@ What changes against fcs_agent_team (one submission, no feedback, no messages):
 Env: MA_LG_N (4), MA_LG_TOKENS (500000 per agent), MA_LG_CTX_CHARS (110000), MA_LG_CTX_LOW (1.0: a trim cuts the
 history to this share of MA_LG_CTX_CHARS; 0.75 keeps the prefix cache for many steps), MA_LG_MAX_ROUNDS (2000, a safety
 cap), MA_LG_END (voluntary | budget: see END), MA_LG_HARNESS (v1: the first prompt and observations; v2: budget line,
-shell facts, single-case and combined-finish notes; see HARNESS), MA_LG_CKPT_S (300), MA_LG_VERDICTS (0; 1 shows each
+shell facts, single-case and combined-finish notes; see HARNESS), MA_LG_CKPT_S (300), MA_LG_REPOS (shared | own: see REPOS), MA_LG_VERDICTS (0; 1 shows each
 provisional test's verdict, OK / WA / TLE / MLE / RE / OLE / CE, beside its score: a different game, recorded as
 fo_lg_verdicts, so never pool runs across it), fcs_agent's MA_AG_TURN / MA_AG_TIMEOUT / MA_AG_THINK / MA_AG_MAX_LEN /
 MA_AG_TRACE_DIR.
@@ -97,6 +97,15 @@ END = os.environ.get("MA_LG_END", "voluntary")
 assert END in ("voluntary", "budget"), END
 BUDGET_END = END == "budget"
 IDLE_FINISHES = 3
+# where the team's code lives (owner 2026-10-25: a shared message board, and code shared through git). shared: one
+# repository and working tree for every agent (the first team game: one agent's rewrite of solution.cpp overwrites
+# another's work, and all build on one file). own: each agent works in a repository of its own that only it changes;
+# after each of its commands the harness publishes its HEAD to a bare team.git as branch agent<k> (only the harness
+# writes team.git), and before each command fetches every branch into the agent's repository as team/agent<k>, so a
+# teammate's work is one `git diff`, `git show` or `git cherry-pick` away. Messages are the same. Never pool the two.
+REPOS = os.environ.get("MA_LG_REPOS", "shared")
+assert REPOS in ("shared", "own") and (REPOS == "shared" or N > 1), (REPOS, N)
+OWN = REPOS == "own"
 MAX_FILE = 256 << 10          # bytes of a submitted file
 MAX_POST = 2000               # characters of one message
 INFRA_RETRIES, INFRA_BACKOFF = 2, 2.0   # a judge infra failure is judged again, after 2 s, then 4 s
@@ -117,6 +126,14 @@ _TEAM_ENV = ("You are {name}, one of {n} agents working at the same time in this
              "each round every agent runs one command, in a random order. After every command the repository's "
              "source files are committed under the name of the agent that ran it, so you see the others' files and "
              "commits.")
+_TEAM_OWN_ENV = ("You are {name}, one of {n} agents working at the same time on this problem, with a Linux shell (g++, "
+                 "python3, git and the usual command-line tools; no internet). The agents act in rounds: in each round "
+                 "every agent runs one command, in a random order. Each agent works in a git repository of its own, "
+                 "which no one else can change. After every command your repository's source files are committed and "
+                 "published, and before every command the other agents' latest commits are fetched: team/agent1 to "
+                 "team/agent{n} are the agents' branches (yours too). To use a teammate's work, run for example `git "
+                 "diff team/agent2 -- solution.cpp`, `git show team/agent2:solution.cpp > solution.cpp` or `git "
+                 "cherry-pick <commit>`.")
 _SOLO_ENV = ("You work alone in a git repository with a Linux shell (g++, python3, git and the usual command-line "
              "tools; no internet).")
 # v2's facts about the shell (no braces: _TEAM_ENV goes through .format). 50 of 866 smoke turns failed on /tmp (each
@@ -181,7 +198,7 @@ def instance(problem: str, name: str, shared: bool = False) -> str:
         when_end=(("every agent has used up its token budget" if team else "your token budget is used up") if BUDGET_END
                   else "every agent has finished" if team else "you finish"))
     steps = f" You have at most {A.STEPS} steps." if A.STEPS > 0 else ""
-    env = _TEAM_ENV if team else _SOLO_ENV
+    env = (_TEAM_OWN_ENV if OWN else _TEAM_ENV) if team else _SOLO_ENV
     if V2:
         env += ("" if team else _ENV_COMMITS) + (_ENV_FS if C.J.LANDLOCK_ABI else "") + _ENV_ASAN
     text = (_FLAT.replace(_LONE_ENV, env).replace(_LONE_SUBMIT, _STEP6.replace(_FIN_END, "") if BUDGET_END else _STEP6))
@@ -229,7 +246,7 @@ def subset_mean(cases: list[float], idx: list[int]) -> float:
 def harness_tag() -> str:
     """The settings that change what the agents see or how the episode ends, for results.jsonl and the trace: rows
     with different tags are different protocols."""
-    return f"long-{HARNESS}{'-budget' if BUDGET_END else ''}-ctxlow{CTX_LOW:g}"
+    return f"long-{HARNESS}{'-budget' if BUDGET_END else ''}-ctxlow{CTX_LOW:g}{'-own' if OWN else ''}"
 
 
 def sha1(code: str) -> str:
@@ -357,6 +374,8 @@ _TAR_MAX = 32 << 20   # a larger file (a generated test input) stays out of the 
 
 
 def _tar_member(ti: tarfile.TarInfo):
+    if OWN and ti.name.split("/")[1:2] and ti.name.split("/")[1].endswith(".tmp"):   # an agent's /tmp starts empty
+        return None
     return ti if (ti.isdir() or ti.issym() or (ti.isfile() and ti.size <= _TAR_MAX)) else None
 
 
@@ -443,6 +462,52 @@ class Checkpoint:
                 pass
 
 
+def _ok(r):
+    if r.returncode:
+        raise Aborted(f"own repos: git {r.args[1:3]} exit {r.returncode}: {r.stderr.strip()[:300]}")
+    return r
+
+
+def own_init(work: str, names: list) -> None:
+    """MA_LG_REPOS=own: work/team.git (bare) and a repository work/<name> per agent, all on one empty start commit,
+    each with the agent as its git user and SCORES.md and BOARD.md (written by the harness) never committed."""
+    team = os.path.join(work, "team.git")
+    dirs = [os.path.join(work, n) for n in names]
+    for d in [team] + dirs:
+        os.makedirs(d)
+    T.repo_init(dirs[0])
+    _ok(T._git(team, "init", "-q", "--bare", "-b", "main"))
+    _ok(publish(work, names[0]))
+    for n, d in zip(names, dirs):
+        if d != dirs[0]:
+            _ok(T._git(d, "init", "-q", "-b", "main"))
+            _ok(fetch_team(work, d))
+            _ok(T._git(d, "reset", "-q", "--hard", f"team/{names[0]}"))
+        _ok(T._git(d, "config", "user.name", n))
+        _ok(T._git(d, "config", "user.email", f"{n}@team"))
+        os.makedirs(os.path.join(d, ".git", "info"), exist_ok=True)
+        with open(os.path.join(d, ".git", "info", "exclude"), "a") as f:
+            f.write("SCORES.md\nBOARD.md\n")
+    for n, d in zip(names, dirs):
+        _ok(publish(work, n))
+    for d in dirs:
+        _ok(fetch_team(work, d))
+
+
+def publish(work: str, name: str):
+    """team.git's branch <name> := HEAD of agent <name>'s repository: git with team.git's rights, reading the agent's
+    repository (whose hooks and config cannot write team.git: _GIT_SAFE, and upload-pack runs no repository hook)."""
+    d = os.path.join(work, name)
+    return T._git(os.path.join(work, "team.git"), "fetch", "-q", "--no-tags", d, f"+HEAD:refs/heads/{name}", read=(d,))
+
+
+def fetch_team(work: str, d: str):
+    """Every team.git branch into the agent's repository d as refs/remotes/team/*: by path, not by a remote that the
+    agent could redefine; with the agent's rights, reading team.git."""
+    team = os.path.join(work, "team.git")
+    return T._git(d, "fetch", "-q", "--no-tags", "--prune", team, "+refs/heads/*:refs/remotes/team/*", read=(team,))
+
+
 def rm_work(work: str) -> None:
     """Remove an episode's repository and its commands' /tmp."""
     for d in (work, C.private_tmp(work)):
@@ -462,6 +527,9 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
         work = os.path.join(os.environ.get("TMPDIR", "/tmp"), "agent_long", os.path.basename(ckpt.path))
         rm_work(work)
     os.makedirs(work)
+    for a in agents:   # not in the checkpoint: a resume in another job has another TMPDIR
+        a.dir = os.path.join(work, a.name) if OWN else work
+    dir_of = {a.name: a.dir for a in agents}
     loop = asyncio.get_running_loop()
     rng = random.Random(f"{label}:{input.sample.index}:{getattr(input.sample, 'group_index', 0)}")
     rounds, run_s, subs, board, events, t_ep = 0, 0.0, [], [], [], time.monotonic()
@@ -470,6 +538,8 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
               "N": N, "TOKENS": TOKENS, "CTX_CHARS": CTX_CHARS, "CTX_LOW": CTX_LOW, "HARNESS": HARNESS, "END": END,
               "VERDICTS": VERDICTS, "TURN": A.TURN, "MAX_LEN": A.MAX_LEN,
               "prompt": sha1(A.SYSTEM + instance(problem, "agent1", shared))}
+    if OWN:
+        config["REPOS"] = REPOS
 
     def state() -> dict:   # whole turns: the trace keeps them whole too
         return {"config": config, "rounds": rounds, "run_s": run_s, "subs": subs, "board": board, "events": events,
@@ -477,12 +547,12 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
                 "agents": [{"agent": {k: getattr(a, k) for k in _AGENT_STATE},
                             "sess": {k: getattr(a.sess, k) for k in _SESS_STATE if hasattr(a.sess, k)}} for a in agents]}
 
-    def _put(name: str, text: str) -> None:
-        """Write work/name for the agents to read without following what they put there (audit 2026-10-24: an
+    def _put(name: str, text: str, d: str) -> None:
+        """Write d/name (d: an agent's repository) for the agents to read without following what they put there (audit 2026-10-24: an
         `ln -sf ~/x SCORES.md` made the harness overwrite ~/x): a new file under a unique name, then a rename over
         whatever is at the path (a symlink is replaced, not followed). Never raises; on an error the log is stale."""
-        path = os.path.join(work, name)
-        tmp = os.path.join(work, f".{name}.{uuid.uuid4().hex}")
+        path = os.path.join(d, name)
+        tmp = os.path.join(d, f".{name}.{uuid.uuid4().hex}")
         try:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
             with os.fdopen(fd, "w") as f:
@@ -497,19 +567,23 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
                 pass
 
     def write_logs():
+        for d in dict.fromkeys(a.dir for a in agents):
+            _write_logs(d)
+
+    def _write_logs(d: str):
         _put("SCORES.md", "# Submissions (provisional score = mean over half of the hidden tests)\n\n"
              "| # | round | agent | file | status | provisional |\n|---|---|---|---|---|---|\n"
              + "".join(f"| {i} | {s['round']} | {s['agent']} | {s['file']} | {s['status']} | {100 * s['prov']:.2f} |\n"
-                       for i, s in enumerate(subs, 1)))
-        _put("BOARD.md", "# Messages\n\n" + "".join(f"- [round {r}] {a}: {m}\n" for r, a, m in board))
+                       for i, s in enumerate(subs, 1)), d)
+        _put("BOARD.md", "# Messages\n\n" + "".join(f"- [round {r}] {a}: {m}\n" for r, a, m in board), d)
 
-    def read_code(path: str):
+    def read_code(path: str, d: str):
         """(real path, text or None when larger than MAX_FILE) of a regular file inside the repository (a symlink out
         of it is refused), or None when there is no such file. A file the agent made unreadable (chmod 000; the harness
         runs as the same uid) is None too, so submit, the finish command and the auto-judge never raise on it."""
         try:
-            p = os.path.realpath(os.path.join(work, path))
-            if not p.startswith(os.path.realpath(work) + os.sep) or not os.path.isfile(p):
+            p = os.path.realpath(os.path.join(d, path))
+            if not p.startswith(os.path.realpath(d) + os.sep) or not os.path.isfile(p):
                 return None
             with open(p, "rb") as f:
                 code = f.read(MAX_FILE + 1)
@@ -530,7 +604,7 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
         return res, tries, round(time.monotonic() - t0, 3)
 
     async def do_submit(a, path: str) -> dict:
-        got = read_code(path)
+        got = read_code(path, a.dir)
         if got is None:
             return {"output": f"submit: no file {path} in the repository\n", "returncode": 1, "exception_info": ""}
         p, code = got
@@ -539,7 +613,7 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
         res, tries, judge_s = await judge(code)
         cases = res["cases"]
         prov, final = subset_mean(cases, prov_idx), subset_mean(cases, final_idx)
-        rev = (await loop.run_in_executor(A._POOL, lambda: T._git(work, "rev-parse", "HEAD").stdout.strip()))
+        rev = (await loop.run_in_executor(A._POOL, lambda: T._git(a.dir, "rev-parse", "HEAD").stdout.strip()))
         s = {"agent": a.name, "round": rounds, "step": a.steps, "file": path, "status": res["status"], "prov": prov,
              "final": final, "infra": bool(res["infra_error"]), "infra_retries": tries, "rev": rev, "sha": sha1(code),
              "code": code, "judge_s": judge_s,
@@ -547,9 +621,10 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
              "cases": [round(c, 4) for c in cases], "case_info": res.get("case_info", [])}
         subs.append(s)
         a.n_submit += 1
-        if p == os.path.realpath(os.path.join(work, "solution.cpp")):
+        if p == os.path.realpath(os.path.join(a.dir, "solution.cpp")):
             a.last_sha = s["sha"]
-        events.append((rounds, a.name, f"submitted {path}: {res['status']}, provisional {100 * prov:.2f}"))
+        where = f" (commit {rev[:7]} on team/{a.name})" if OWN else ""
+        events.append((rounds, a.name, f"submitted {path}{where}: {res['status']}, provisional {100 * prov:.2f}"))
         best = best_of(subs)   # an infra one only when every submission is: then there is no best yet
         best_txt = "none yet" if best["infra"] else f"{100 * best['prov']:.2f} (#{subs.index(best) + 1}, {best['agent']})"
         v = (res.get("verdicts") or []) if VERDICTS else []
@@ -568,7 +643,7 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
 
     async def finish(a, out: dict) -> dict:
         """The finish command: submit solution.cpp and go on, or (unchanged since a.last_sha) pass `out` on to end."""
-        got = read_code("solution.cpp")
+        got = read_code("solution.cpp", a.dir)
         if got is None:
             return {**out, "output": "Finish command received, but there is no solution.cpp to submit. Write "
                                      "solution.cpp and run the command again.\n"}
@@ -631,7 +706,10 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
                 for k, v in d["sess"].items():
                     setattr(a.sess, k, v)
         else:
-            await loop.run_in_executor(A._POOL, T.repo_init, work)
+            if OWN:
+                await loop.run_in_executor(A._POOL, own_init, work, [a.name for a in agents])
+            else:
+                await loop.run_in_executor(A._POOL, T.repo_init, work)
             await loop.run_in_executor(A._POOL, write_logs)
         while any(not a.done for a in agents) and rounds < MAX_ROUNDS:
             rounds += 1
@@ -645,13 +723,16 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
                 ends = False   # the finish command on an unchanged solution.cpp: finish() passes `out` on to end it
                 fin = False    # the finish command ran (budget mode counts the unchanged ones in a row)
                 timing, t0 = {}, time.monotonic()   # wall times from here, so waits for a worker are seen
+                if OWN and not (m_sub or m_post):   # the teammates' latest commits, as of this command
+                    await loop.run_in_executor(A._POOL, fetch_team, work, a.dir)
+                    timing["fetch_s"], t0 = round(time.monotonic() - t0, 3), time.monotonic()
                 n_sub = len(subs)
                 if m_sub:
                     out, secs = await do_submit(a, m_sub.group(1) or "solution.cpp"), 0.0
                 elif m_post:
                     out, secs = do_post(a, m_post.group(1)), 0.0
                 else:
-                    out = await loop.run_in_executor(A._POOL, A.run_command, cmd, work, True)
+                    out = await loop.run_in_executor(A._POOL, A.run_command, cmd, a.dir, True)
                     secs = out["seconds"]
                     wall = time.monotonic() - t0
                     timing.update(cmd_wall_s=round(wall, 3), cmd_queue_s=round(wall - secs, 3))
@@ -668,7 +749,9 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
                     timing["judge_s"] = subs[-1]["judge_s"]
                 t1 = time.monotonic()
                 await loop.run_in_executor(A._POOL, write_logs)
-                await loop.run_in_executor(A._POOL, T.commit_as, work, a.name, a.steps)
+                await loop.run_in_executor(A._POOL, T.commit_as, a.dir, a.name, a.steps)
+                if OWN:
+                    await loop.run_in_executor(A._POOL, publish, work, a.name)
                 timing["harness_s"] = round(time.monotonic() - t1, 3)
                 upd = updates_for(a)
                 if upd and not ends:   # an ending observation keeps the MARK as its first line
@@ -692,18 +775,26 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
         # context, format errors, the round cap) may leave a better solution.cpp unsubmitted. It is judged once, apart
         # from subs: S keeps the documented rule (only submissions count) and S_auto - S measures the cut.
         auto_sub = []
-        if any(a.exit != "Finished" for a in agents):
-            got = read_code("solution.cpp")
-            if got is not None and got[1] and got[1].strip() and sha1(got[1]) not in {x["sha"] for x in subs}:
+        late = [a for a in agents if a.exit != "Finished"]
+        for a in late if OWN else late[:1]:   # own repos: each such agent's solution.cpp; shared: the one repository
+            got = read_code("solution.cpp", a.dir)
+            if got is not None and got[1] and got[1].strip() and sha1(got[1]) not in {x["sha"] for x in subs + auto_sub}:
                 res, tries, judge_s = await judge(got[1])
-                auto_sub.append({"agent": "auto", "round": rounds, "file": "solution.cpp", "status": res["status"],
+                auto_sub.append({**({"owner": a.name} if OWN else {}), "agent": "auto", "round": rounds, "file": "solution.cpp", "status": res["status"],
                                  "prov": subset_mean(res["cases"], prov_idx), "final": subset_mean(res["cases"], final_idx),
                                  "infra": bool(res["infra_error"]), "infra_retries": tries, "sha": sha1(got[1]),
                                  "judge_s": judge_s, "auto": True, "code": got[1]})
         best = best_of(subs) if subs else None
         best_auto = best_of(subs + auto_sub) if subs or auto_sub else None   # an infra auto-judge never beats a real one
-        shares = (await loop.run_in_executor(A._POOL, T.blame_shares, work, best["file"], best["rev"])) if best else {}
-        log = (await loop.run_in_executor(A._POOL, lambda: T._git(work, "log", "--format=%an %s").stdout))[-20000:]
+        shares = (await loop.run_in_executor(A._POOL, T.blame_shares, dir_of[best["agent"]], best["file"], best["rev"])
+                  if best else {})
+        team_git = os.path.join(work, "team.git")
+        log = (await loop.run_in_executor(A._POOL, lambda: (T._git(team_git, "log", "--all", "--format=%an %s") if OWN
+                                                            else T._git(work, "log", "--format=%an %s")).stdout))[-20000:]
+        foreign = {}   # own repos: commits by others in each agent's branch (cherry-picks keep their author; merges)
+        for a in agents if OWN else []:
+            r = await loop.run_in_executor(A._POOL, T._git, team_git, "log", "--format=%an", a.name)
+            foreign[a.name] = sum(x not in (a.name, "harness") for x in r.stdout.split())
     finally:
         rm_work(work)
     S = best["final"] if best else 0.0
@@ -736,12 +827,15 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
             "fo_lg_wall_min": (time.monotonic() - t_ep) / 60, "fo_lg_llm_min": total_min("llm_s"),
             "fo_lg_think_min": total_min("think_s"), "fo_lg_cmd_queue_min": total_min("cmd_queue_s"),
             "fo_lg_judge_min": sum(s["judge_s"] for s in subs + auto_sub) / 60,
-            "fo_lg_harness_min": total_min("harness_s")}
+            "fo_lg_harness_min": total_min("harness_s"),
+            **({"fo_lg_own_repos": 1.0, "fo_lg_foreign_commits": sum(foreign.values()) / N,
+                "fo_lg_fetch_min": total_min("fetch_s")} if OWN else {})}
     A._trace({"time": round(time.time(), 1), "eval": input.evaluation, "game": "agent_long", "harness": harness_tag(),
               "label": label, "S": S, "n": N, "budget": TOKENS, "verdicts": VERDICTS, "rounds": rounds,
               "shared_case": shared, "n_cases": n_cases,
               "submissions": subs, "best": {k: v for k, v in best.items() if k != "code"} if best else None,
-              "auto_submission": auto_sub[0] if auto_sub else None, "board": board, "blame": shares, "git_log": log,
+              "auto_submission": auto_sub[0] if auto_sub else None,
+              **({"repos": REPOS, "auto_submissions": auto_sub, "foreign_commits": foreign} if OWN else {}), "board": board, "blame": shares, "git_log": log,
               # full turns (text = <think>reasoning</think>answer) and submissions with their code (audit 2026-10-24:
               # the last 4000 characters of a turn hid the reasoning; ~4 MB per 1M-token episode)
               "agents": [{"name": a.name, "exit": a.exit, "steps": a.steps, "generated": a.generated,
