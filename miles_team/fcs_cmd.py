@@ -260,9 +260,17 @@ def run_git(work: str, args: list, env: dict, timeout: float = 60, read: tuple =
     return subprocess.CompletedProcess(["git", *args], rc, out, err)
 
 
+# RLIMIT_NPROC counts every task of the user on the node, and J._nproc_limit() is that count as of up to 5 s ago plus
+# 128. When the user's other work on the node (other jobs, the judge, the agents' commands) starts more than 128 tasks
+# inside that window, git cannot fork (git fetch forks upload-pack) and exits 128: own-repos fetches and publishes
+# failed so for a round or two in smokes w260 and w412 (2026-10-26; reproduced by a stale cached count). The harness's
+# git gets this much more room; a fork bomb planted in .git config is still bounded.
+GIT_NPROC_MARGIN = 4096
+
+
 def _git_proc(work: str, args: list, env: dict, timeout: float, reap: bool = False, read: tuple = ()):
     rules = _sandbox(work, read=read)
-    nproc = J._nproc_limit()
+    nproc = J._nproc_limit() + GIT_NPROC_MARGIN
 
     def pre():
         import resource

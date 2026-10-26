@@ -858,7 +858,7 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
             for k, (a, cmd) in enumerate(todo):
                 m_sub, m_post = SUBMIT_RE.fullmatch(cmd), POST_RE.fullmatch(cmd)
                 # MA_LG_POST=submit: while a post is owed, any command but a post with a message is not run
-                refused = MUST_POST and a.owe_post and not (m_post and m_post.group(1).strip().strip("'\""))
+                refused = MUST_POST and a.owe_post and not (m_post and m_post.group(1).strip().strip("'\"").strip())
                 ends = False   # the finish command on an unchanged solution.cpp: finish() passes `out` on to end it
                 fin = False    # the finish command ran (budget mode counts the unchanged ones in a row)
                 timing, t0 = {}, time.monotonic()   # wall times from here, so waits for a worker are seen

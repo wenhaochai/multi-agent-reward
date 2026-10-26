@@ -26,7 +26,7 @@ from miles_team import fcs_agent_long as L  # noqa: E402
 LABEL = "/scratch/gpfs/GROUP/USER/project/Frontier-CS-v1.1/algorithmic/problems/0"
 FIN = "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 SCRIPT = {
-    "agent1": ["printf 'int main(){return 0;}\\n' > solution.cpp", "submit", "touch marker1", "post ''",
+    "agent1": ["printf 'int main(){return 0;}\\n' > solution.cpp", "submit", "touch marker1", "post ''", 'post " "',
                "post a stub, provisional 14; next a real algorithm", "ls marker1 2>&1; echo rc=$?",
                "printf 'int main(){int y;return 0;}\\n' > solution.cpp", FIN, FIN, "post second version", FIN],
     "agent2": ["ls", "echo hi > b.txt", "cat BOARD.md", "submit b.txt", "cat SCORES.md", "post agent2 tried b.txt"],
@@ -73,7 +73,7 @@ def turn_of(a, cmd):
 
 
 def broken(rec) -> int:
-    """The smoke gate's check (flint_smoke_v2.sh): a command that ran while a post was owed."""
+    """The smoke gate's check (flint_smoke_v2.sh): a command that ran while a post was owed, by the harness's rule."""
     bad = 0
     for a in rec["agents"]:
         owe = False
@@ -81,7 +81,8 @@ def broken(rec) -> int:
             c = t.get("command")
             if c is None or t.get("post_refused"):
                 continue
-            bad += owe and not c.lstrip().startswith("post")
+            m = L.POST_RE.fullmatch(c)
+            bad += owe and not (m and m.group(1).strip().strip("'\"").strip())
             owe = "judge_s" in t
     return bad
 
@@ -97,9 +98,9 @@ check("a submission's output ends by asking for the post", t["output"].endswith(
 t = turn_of(a1, "touch marker1")
 check("a command while a post is owed is not run: flagged, exit 1, the reply asks for the post",
       t.get("post_refused") and t["returncode"] == 1 and t["output"].endswith(L._POST_REFUSED), t)
-t = turn_of(a1, "post ''")
-check("an empty post is refused too, and not posted", t.get("post_refused")
-      and all(m.strip() for _, n, m in rec["board"] if n == "agent1"), (t, rec["board"]))
+t, t2 = turn_of(a1, "post ''"), turn_of(a1, 'post " "')
+check("an empty post, or one of quoted spaces, is refused too, and not posted", t.get("post_refused")
+      and t2.get("post_refused") and all(m.strip() for _, n, m in rec["board"] if n == "agent1"), (t, t2, rec["board"]))
 t = turn_of(a1, "ls marker1 2>&1; echo rc=$?")
 check("after the post, commands run again; the refused one never ran", not t.get("post_refused")
       and "No such file" in t["output"] and "rc=2" in t["output"], t["output"])
@@ -108,7 +109,7 @@ check("a finish command that submitted makes the next one wait for a post (an un
       len(fins) == 3 and "judge_s" in fins[0] and fins[0]["output"].endswith(L._POST_NEXT)
       and fins[1].get("post_refused") and not fins[2].get("post_refused") and a1.exit == "Finished",
       [(t.get("judge_s"), t.get("post_refused"), t["output"][:80]) for t in fins] + [a1.exit])
-check("refusals are counted per agent", a1.post_refused == 3 and a2.post_refused == 1,
+check("refusals are counted per agent", a1.post_refused == 4 and a2.post_refused == 1,
       (a1.post_refused, a2.post_refused))
 check("the board holds the posts in order", [(n, m) for _, n, m in rec["board"] if m != "done"] ==
       [("agent1", "a stub, provisional 14; next a real algorithm"), ("agent2", "agent2 tried b.txt"),
@@ -116,8 +117,8 @@ check("the board holds the posts in order", [(n, m) for _, n, m in rec["board"] 
 check("every agent ended; no command ran while a post was owed (the smoke gate's check)",
       a2.exit == "Finished" and broken(rec) == 0 and a1.owe_post is False, (a2.exit, broken(rec), a1.owe_post))
 check("info, the harness tag and the trace name the rule", info["fo_lg_must_post"] == 1.0
-      and info["fo_lg_post_refused"] == 2.0 and info["lg_harness"] == "long-v1-ctxlow1-mustpost"
-      and rec["post"] == "submit" and [x["post_refused"] for x in rec["agents"]] == [3, 1],
+      and info["fo_lg_post_refused"] == 2.5 and info["lg_harness"] == "long-v1-ctxlow1-mustpost"
+      and rec["post"] == "submit" and [x["post_refused"] for x in rec["agents"]] == [4, 1],
       (info.get("fo_lg_post_refused"), info["lg_harness"], rec.get("post")))
 
 # a checkpoint taken right after the submission keeps the owed post: the resumed run refuses the next command and ends
