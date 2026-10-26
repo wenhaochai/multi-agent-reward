@@ -1,7 +1,8 @@
-"""fcs_agent_long with MA_LG_END=budget (audit 2026-10-24): only the budget ends the work. The finish command on an
-unchanged solution.cpp is not judged and the work goes on, however many come in a row (owner 2026-10-25: the reply
-says the work goes on until the budget is used up, with next steps; each is counted); the submit reply says how many
-tokens are left; the prompt and the format error drop the end sentence, and a run of format errors does not end it.
+"""fcs_agent_long with MA_LG_END=budget and MA_LG_ON_STOP=reply (audit 2026-10-24): only the budget ends the work.
+The finish command on an unchanged solution.cpp is not judged and the work goes on, however many come in a row
+(owner 2026-10-25: the reply says the work goes on until the budget is used up, with next steps; each is counted);
+the submit reply says how many tokens are left; the prompt and the format error drop the end sentence, and a run of
+format errors does not end it.
 Scripted agent (and the real think for the format errors), stubbed judge."""
 import asyncio
 import os
@@ -11,6 +12,7 @@ from types import SimpleNamespace
 
 os.environ.setdefault("FCS_CASE_PROC", "0")
 os.environ["MA_LG_END"] = "budget"
+os.environ["MA_LG_ON_STOP"] = "reply"   # the fresh restart: test_long_fresh.py
 os.environ["MA_LG_N"] = "1"
 os.environ["MA_LG_TOKENS"] = "100000"
 os.environ["TMPDIR"] = tempfile.mkdtemp()

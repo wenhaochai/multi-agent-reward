@@ -19,8 +19,9 @@ What changes against fcs_agent_team (one submission, no feedback, no messages):
                   agent's work.
   the end         an agent stops when it runs the finish command on an unchanged solution.cpp, uses up MA_LG_TOKENS
                   generated tokens, or makes three format errors in a row (MA_LG_END=budget: only the budget, the
-                  context or the round cap end it; an unchanged finish command or a run of format errors gets a
-                  reply that the work goes on). When every agent has stopped, the submission
+                  context or the round cap end it; an unchanged finish command or a run of format errors starts the
+                  agent's conversation over, its files kept, with a note that the work goes on; MA_LG_ON_STOP=reply
+                  only replies that it goes on). When every agent has stopped, the submission
                   with the highest provisional score (the earliest on a tie) is the team's answer, and its FINAL score
                   (the mean over the cases at 0-based odd indices, files 2.in, 4.in, ..., never shown to the agents) is
                   the episode's score. A problem with a single test case uses it for both, so its final score is not
@@ -41,7 +42,8 @@ What changes against fcs_agent_team (one submission, no feedback, no messages):
 
 Env: MA_LG_N (4), MA_LG_TOKENS (500000 per agent), MA_LG_CTX_CHARS (110000), MA_LG_CTX_LOW (1.0: a trim cuts the
 history to this share of MA_LG_CTX_CHARS; 0.75 keeps the prefix cache for many steps), MA_LG_MAX_ROUNDS (2000, a safety
-cap), MA_LG_END (voluntary | budget: see END), MA_LG_HARNESS (v1: the first prompt and observations; v2: budget line,
+cap), MA_LG_END (voluntary | budget: see END), MA_LG_ON_STOP (fresh | reply: see ON_STOP), MA_LG_HARNESS (v1: the
+first prompt and observations; v2: budget line,
 shell facts, single-case and combined-finish notes; see HARNESS), MA_LG_CKPT_S (300), MA_LG_REPOS (shared | own: see REPOS), MA_LG_VERDICTS (0; 1 shows each
 provisional test's verdict, OK / WA / TLE / MLE / RE / OLE / CE, beside its score: a different game, recorded as
 fo_lg_verdicts, so never pool runs across it), fcs_agent's MA_AG_TURN / MA_AG_TIMEOUT / MA_AG_THINK / MA_AG_MAX_LEN /
@@ -103,6 +105,23 @@ _KEEP_GOING = ("Your work goes on until your token budget is used up: about {lef
                "Keep improving solution.cpp: for example, test it on new and larger inputs, compare it with a "
                "brute-force solution on small inputs, measure its running time on the largest inputs, or try a "
                "different algorithm.")
+# what a stop attempt gets in budget mode (smoke w251, 2026-10-26: after that reply, none of 4 Flints changed
+# solution.cpp again; each spent 42-54% of a 200k budget resubmitting the same file, running the finish command again
+# and in 32k-token turns that repeat "The task is complete"). fresh: the agent's conversation starts over from the
+# system message and its instance message with _RESTART (its files, SCORES.md and BOARD.md stay), so no earlier "the
+# task is complete" is left in its context. reply: the reply alone, in the same conversation (w250, w251). Never pool
+# the two.
+ON_STOP = os.environ.get("MA_LG_ON_STOP", "fresh")
+assert ON_STOP in ("fresh", "reply"), ON_STOP
+FRESH = BUDGET_END and ON_STOP == "fresh"
+_RESTART_SEP = "\n\n[Continued: "
+_RESTART = (_RESTART_SEP + "your earlier conversation on this problem has ended, and this one goes on with the same "
+            "work. Your files are still here: solution.cpp, any notes and tests you wrote, SCORES.md (every submission "
+            "and its provisional score) and BOARD.md. {best} The task is not finished: your work goes on until your "
+            "token budget is used up, and about {left:,} of your {total:,} tokens are left. Read SCORES.md and your "
+            "notes first, then keep improving solution.cpp: for example, find out why it scores low on some tests, "
+            "test it on new and larger inputs, compare it with a brute-force solution on small inputs, or try a "
+            "different algorithm.]")
 # where the team's code lives (owner 2026-10-25: a shared message board, and code shared through git). shared: one
 # repository and working tree for every agent (the first team game: one agent's rewrite of solution.cpp overwrites
 # another's work, and all build on one file). own: each agent works in a repository of its own that only it changes;
@@ -252,7 +271,8 @@ def subset_mean(cases: list[float], idx: list[int]) -> float:
 def harness_tag() -> str:
     """The settings that change what the agents see or how the episode ends, for results.jsonl and the trace: rows
     with different tags are different protocols."""
-    return f"long-{HARNESS}{'-budget' if BUDGET_END else ''}-ctxlow{CTX_LOW:g}{'-own' if OWN else ''}"
+    return (f"long-{HARNESS}{'-budget' if BUDGET_END else ''}{'-fresh' if FRESH else ''}-ctxlow{CTX_LOW:g}"
+            f"{'-own' if OWN else ''}")
 
 
 def sha1(code: str) -> str:
@@ -285,6 +305,7 @@ def trim_chat(chat: list, keep_chars: int, dropped: int, low_chars: int | None =
 class _Agent(T._Agent):
     """fcs_agent_team's agent with a token budget of its own (segments are trimmed in evaluation) and a chat that is
     trimmed to the context."""
+    restarts = 0   # conversations started over (MA_LG_ON_STOP=fresh)
 
     def __init__(self, input, j: int, problem: str, shared: bool = False):
         self.name = f"agent{j + 1}"
@@ -297,6 +318,17 @@ class _Agent(T._Agent):
         self.n_submit = self.n_post = 0
         self.last_sha = None   # sha of solution.cpp at this agent's last submission of it
         self.idle_fin = 0      # unchanged finish commands in a row (MA_LG_END=budget)
+
+    def restart(self, note: str) -> None:
+        """MA_LG_ON_STOP=fresh: the conversation starts over from the system message and the instance message with
+        `note` (an earlier restart's note and the trim note go, and `dropped` counts from 0 again); the session
+        forgets the old conversation's calls."""
+        base = self.chat[1]["content"].split("\n\n[Note: ")[0].split(_RESTART_SEP)[0]
+        self.chat = [self.chat[0], {"role": "user", "content": base + note}]
+        self.restarts, self.dropped, self.fmt_run, self.idle_fin = self.restarts + 1, 0, 0, 0
+        for k, v in (("queue", []), ("cont", False), ("n_cont", 0), ("used", 0), ("fresh", False)):
+            if hasattr(self.sess, k):   # chat_eval_long.ChatSession's state of the old conversation
+                setattr(self.sess, k, v)
 
     def gen(self) -> int:
         return self.generated
@@ -353,7 +385,8 @@ class _Agent(T._Agent):
             if self.fmt_run >= A.MAX_FORMAT_ERRORS:
                 if not BUDGET_END:
                     self.done, self.exit = True, "RepeatedFormatError"
-                else:   # budget mode: the work goes on (each turn spends tokens, so the budget still ends it)
+                elif not FRESH:   # budget mode: the work goes on (each turn spends tokens, so the budget still ends
+                    # it); fresh: the episode starts the conversation over after this round
                     self.chat[-1] = {**self.chat[-1], "content": self.chat[-1]["content"] + "\n" + _KEEP_GOING.format(
                         left=max(0, TOKENS - self.generated), total=TOKENS)}
             return None
@@ -378,7 +411,7 @@ class Paused(Exception):
 
 
 _AGENT_STATE = ("chat", "steps", "fmt_run", "fmt_total", "timeouts", "cut_n", "done", "exit", "turns", "generated",
-                "dropped", "seen", "n_submit", "n_post", "last_sha", "idle_fin")
+                "dropped", "seen", "n_submit", "n_post", "last_sha", "idle_fin", "restarts")
 _SESS_STATE = ("used", "queue", "cont", "n_cont", "last_reasoning", "fresh")   # the chat driver's Session fields
 _TAR_MAX = 32 << 20   # a larger file (a generated test input) stays out of the checkpoint; the agent can rebuild it
 
@@ -599,6 +632,8 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
               "prompt": sha1(A.SYSTEM + instance(problem, "agent1", shared))}
     if OWN:
         config["REPOS"] = REPOS
+    if BUDGET_END:
+        config["ON_STOP"] = ON_STOP
 
     def state() -> dict:   # whole turns: the trace keeps them whole too
         return {"config": config, "rounds": rounds, "run_s": run_s, "subs": subs, "board": board, "events": events,
@@ -745,6 +780,15 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
             return ""
         return "<team_updates>\n" + "".join(f"[round {r}] {n} {t}\n" for r, n, t in new) + "</team_updates>\n"
 
+    def start_over(a) -> None:
+        """MA_LG_ON_STOP=fresh: a stop attempt (the turn just recorded) starts a's conversation over."""
+        best = best_of(subs) if subs else None
+        what = (f"The best provisional score so far is {100 * best['prov']:.2f} (submission "
+                f"#{next(i for i, x in enumerate(subs, 1) if x is best)}, by {best['agent']})." if best else
+                "Nothing has been submitted yet.")
+        a.turns[-1]["restart"] = True
+        a.restart(_RESTART.format(best=what, left=max(0, TOKENS - a.generated), total=TOKENS))
+
     try:
         st = (await loop.run_in_executor(A._POOL, ckpt.load)) if ckpt is not None else None
         if st is not None and st.get("config") != config:
@@ -783,6 +827,9 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
             rounds += 1
             active = [a for a in agents if not a.done]
             cmds = await asyncio.gather(*[a.think() for a in active])
+            for a, c in zip(active, cmds):   # fresh: a run of format errors is a stop attempt too
+                if FRESH and c is None and not a.done and a.fmt_run >= A.MAX_FORMAT_ERRORS:
+                    start_over(a)
             todo = [(a, c) for a, c in zip(active, cmds) if c is not None]
             rng.shuffle(todo)
             n_subs = len(subs)
@@ -866,6 +913,8 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
                     sep = "\n" if out["output"] and not out["output"].endswith("\n") else ""
                     out = {**out, "output": out["output"] + sep + "".join(f"[harness] {n}\n" for n in notes)}
                 a.observe(cmd, {**out, "_timing": timing}, rounds, k)
+                if FRESH and timing.get("idle_finish"):   # an unchanged finish command: the agent tries to stop
+                    start_over(a)
                 if not fin:
                     a.idle_fin = 0
             if ckpt is not None and any(not a.done for a in agents) and rounds < MAX_ROUNDS \
@@ -940,6 +989,7 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
             "fo_lg_harness_min": total_min("harness_s"),
             **({"fo_lg_idle_finishes": sum(bool(t.get("idle_finish")) for a in agents for t in a.turns) / N}
                if BUDGET_END else {}),
+            **({"fo_lg_restarts": sum(a.restarts for a in agents) / N} if FRESH else {}),
             **({"fo_lg_own_repos": 1.0, "fo_lg_adoptions": len(adoptions), "fo_lg_fetch_min": total_min("fetch_s"),
                 "fo_lg_fetch_fail": sync["fetch_fail"], "fo_lg_commit_skipped": sync["commit_skipped"],
                 "fo_lg_git_fail": sync["git_fail"]} if OWN else {})}
@@ -953,7 +1003,8 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
               # full turns (text = <think>reasoning</think>answer) and submissions with their code (audit 2026-10-24:
               # the last 4000 characters of a turn hid the reasoning; ~4 MB per 1M-token episode)
               "agents": [{"name": a.name, "exit": a.exit, "steps": a.steps, "generated": a.generated,
-                          "dropped": a.dropped, "submits": a.n_submit, "posts": a.n_post, "turns": a.turns}
+                          "dropped": a.dropped, "submits": a.n_submit, "posts": a.n_post, "restarts": a.restarts,
+                          "turns": a.turns}
                          for a in agents]})
     return agents, S, info
 
