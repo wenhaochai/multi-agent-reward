@@ -12,7 +12,8 @@ What changes against fcs_agent_team (one submission, no feedback, no messages):
                   picked as best unless all are.
   post <message>  (the whole action) sends a message to every other agent. New messages and new submissions of the
                   others are shown at the top of each agent's next observation, so the agents keep talking without
-                  having to poll files; BOARD.md keeps the whole log.
+                  having to poll files; BOARD.md keeps the whole log. MA_LG_POST=submit: after each of its submissions
+                  an agent's next command must be a post (see POST).
   finish          `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` (mini-swe-agent's submit, which Flint uses to submit: smoke
                   w69 had it say "Let me submit" and run it, 0 submits in 4 episodes) submits solution.cpp as `submit`
                   does and the agent goes on; when solution.cpp has not changed since its last submission it ends the
@@ -44,7 +45,8 @@ Env: MA_LG_N (4), MA_LG_TOKENS (500000 per agent), MA_LG_CTX_CHARS (110000), MA_
 history to this share of MA_LG_CTX_CHARS; 0.75 keeps the prefix cache for many steps), MA_LG_MAX_ROUNDS (2000, a safety
 cap), MA_LG_END (voluntary | budget: see END), MA_LG_ON_STOP (fresh | reply: see ON_STOP), MA_LG_HARNESS (v1: the
 first prompt and observations; v2: budget line,
-shell facts, single-case and combined-finish notes; see HARNESS), MA_LG_CKPT_S (300), MA_LG_REPOS (shared | own: see REPOS), MA_LG_VERDICTS (0; 1 shows each
+shell facts, single-case and combined-finish notes; see HARNESS), MA_LG_CKPT_S (300), MA_LG_REPOS (shared | own: see REPOS),
+MA_LG_POST (free | submit: see POST), MA_LG_VERDICTS (0; 1 shows each
 provisional test's verdict, OK / WA / TLE / MLE / RE / OLE / CE, beside its score: a different game, recorded as
 fo_lg_verdicts, so never pool runs across it), fcs_agent's MA_AG_TURN / MA_AG_TIMEOUT / MA_AG_THINK / MA_AG_MAX_LEN /
 MA_AG_TRACE_DIR.
@@ -131,6 +133,21 @@ _RESTART = (_RESTART_SEP + "your earlier conversation on this problem has ended,
 REPOS = os.environ.get("MA_LG_REPOS", "shared")
 assert REPOS in ("shared", "own") and (REPOS == "shared" or N > 1), (REPOS, N)
 OWN = REPOS == "own"
+# when an agent posts (owner 2026-10-26 popup; four team smokes, 32 agents and 3,196 commands, had no post: the teams
+# that may talk did not). free: when it likes (the first protocol). submit: after each of its submissions, an agent's
+# next command must be `post <message>` with a message; any other command is not run, and the reply asks for the post.
+# Never pool the two.
+POST = os.environ.get("MA_LG_POST", "free")
+assert POST in ("free", "submit") and (POST == "free" or N > 1), (POST, N)
+MUST_POST = POST == "submit"
+_POST_RULE = (" After each of your submissions, your next command must be `post <message>`: tell the team what you "
+              "changed, its provisional score and what you will try next. Until you post, no other command of yours is "
+              "run.")
+_POST_NEXT = ("Your next command must be `post <message>`, alone: tell the team what you changed, this provisional "
+              "score and what you will try next.\n")
+_POST_REFUSED = ("Nothing was run: after each of your submissions, your next command must be `post <message>` with a "
+                 "message, alone. Tell the team what you changed, its provisional score and what you will try next, "
+                 "then send your command again.\n")
 MAX_FILE = 256 << 10          # bytes of a submitted file
 MAX_POST = 2000               # characters of one message
 INFRA_RETRIES, INFRA_BACKOFF = 2, 2.0   # a judge infra failure is judged again, after 2 s, then 4 s
@@ -218,7 +235,8 @@ def instance(problem: str, name: str, shared: bool = False) -> str:
                      else ""),
         post_text=("sends the message to every other agent; their messages appear at the top of your next "
                    "observations, and BOARD.md keeps them all. Use it to split the work, report what you found and "
-                   "agree on the next step." if team else "there are no other agents, so this only writes BOARD.md."),
+                   "agree on the next step." + (_POST_RULE if MUST_POST else "") if team else
+                   "there are no other agents, so this only writes BOARD.md."),
         fin_end="" if BUDGET_END else _FIN_END,
         when_end=(("every agent has used up its token budget" if team else "your token budget is used up") if BUDGET_END
                   else "every agent has finished" if team else "you finish"))
@@ -272,7 +290,7 @@ def harness_tag() -> str:
     """The settings that change what the agents see or how the episode ends, for results.jsonl and the trace: rows
     with different tags are different protocols."""
     return (f"long-{HARNESS}{'-budget' if BUDGET_END else ''}{'-fresh' if FRESH else ''}-ctxlow{CTX_LOW:g}"
-            f"{'-own' if OWN else ''}")
+            f"{'-own' if OWN else ''}{'-mustpost' if MUST_POST else ''}")
 
 
 def sha1(code: str) -> str:
@@ -306,6 +324,8 @@ class _Agent(T._Agent):
     """fcs_agent_team's agent with a token budget of its own (segments are trimmed in evaluation) and a chat that is
     trimmed to the context."""
     restarts = 0   # conversations started over (MA_LG_ON_STOP=fresh)
+    owe_post = False   # MA_LG_POST=submit: it has submitted and not posted since
+    post_refused = 0   # commands not run because a post was owed
 
     def __init__(self, input, j: int, problem: str, shared: bool = False):
         self.name = f"agent{j + 1}"
@@ -411,7 +431,7 @@ class Paused(Exception):
 
 
 _AGENT_STATE = ("chat", "steps", "fmt_run", "fmt_total", "timeouts", "cut_n", "done", "exit", "turns", "generated",
-                "dropped", "seen", "n_submit", "n_post", "last_sha", "idle_fin", "restarts")
+                "dropped", "seen", "n_submit", "n_post", "last_sha", "idle_fin", "restarts", "owe_post", "post_refused")
 _SESS_STATE = ("used", "queue", "cont", "n_cont", "last_reasoning", "fresh")   # the chat driver's Session fields
 _TAR_MAX = 32 << 20   # a larger file (a generated test input) stays out of the checkpoint; the agent can rebuild it
 
@@ -634,6 +654,8 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
         config["REPOS"] = REPOS
     if BUDGET_END:
         config["ON_STOP"] = ON_STOP
+    if MUST_POST:
+        config["POST"] = POST
 
     def state() -> dict:   # whole turns: the trace keeps them whole too
         return {"config": config, "rounds": rounds, "run_s": run_s, "subs": subs, "board": board, "events": events,
@@ -835,11 +857,13 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
             n_subs = len(subs)
             for k, (a, cmd) in enumerate(todo):
                 m_sub, m_post = SUBMIT_RE.fullmatch(cmd), POST_RE.fullmatch(cmd)
+                # MA_LG_POST=submit: while a post is owed, any command but a post with a message is not run
+                refused = MUST_POST and a.owe_post and not (m_post and m_post.group(1).strip().strip("'\""))
                 ends = False   # the finish command on an unchanged solution.cpp: finish() passes `out` on to end it
                 fin = False    # the finish command ran (budget mode counts the unchanged ones in a row)
                 timing, t0 = {}, time.monotonic()   # wall times from here, so waits for a worker are seen
                 notes = []   # own repos: what the harness's git could not do, told to the agent after the output
-                if OWN and not (m_sub or m_post):   # the teammates' latest commits, as of this command
+                if OWN and not (m_sub or m_post or refused):   # the teammates' latest commits, as of this command
                     r = await loop.run_in_executor(A._POOL, fetch_team, work, a.dir)
                     if r.returncode:
                         sync["fetch_fail"] += 1
@@ -847,10 +871,15 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
                                      f"{r.returncode}), so team/* may be out of date.")
                     timing["fetch_s"], t0 = round(time.monotonic() - t0, 3), time.monotonic()
                 n_sub = len(subs)
-                if m_sub:
+                if refused:
+                    a.post_refused += 1
+                    timing["post_refused"] = True
+                    out, secs = {"output": _POST_REFUSED, "returncode": 1, "exception_info": ""}, 0.0
+                elif m_sub:
                     out, secs = await do_submit(a, m_sub.group(1) or "solution.cpp"), 0.0
                 elif m_post:
                     out, secs = do_post(a, m_post.group(1)), 0.0
+                    a.owe_post = False
                 else:
                     out = await loop.run_in_executor(A._POOL, A.run_command, cmd, a.dir, True)
                     secs = out["seconds"]
@@ -869,6 +898,9 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
                 run_s += secs
                 if len(subs) > n_sub:   # submit, or a finish command that submitted: the judge time of do_submit
                     timing["judge_s"] = subs[-1]["judge_s"]
+                    if MUST_POST:
+                        a.owe_post = True
+                        out = {**out, "output": out["output"] + _POST_NEXT}
                 t1 = time.monotonic()
                 await loop.run_in_executor(A._POOL, write_logs)
                 if OWN:
@@ -990,6 +1022,8 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
             **({"fo_lg_idle_finishes": sum(bool(t.get("idle_finish")) for a in agents for t in a.turns) / N}
                if BUDGET_END else {}),
             **({"fo_lg_restarts": sum(a.restarts for a in agents) / N} if FRESH else {}),
+            **({"fo_lg_must_post": 1.0, "fo_lg_post_refused": sum(a.post_refused for a in agents) / N}
+               if MUST_POST else {}),
             **({"fo_lg_own_repos": 1.0, "fo_lg_adoptions": len(adoptions), "fo_lg_fetch_min": total_min("fetch_s"),
                 "fo_lg_fetch_fail": sync["fetch_fail"], "fo_lg_commit_skipped": sync["commit_skipped"],
                 "fo_lg_git_fail": sync["git_fail"]} if OWN else {})}
@@ -999,12 +1033,13 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
               "submissions": subs, "best": {k: v for k, v in best.items() if k != "code"} if best else None,
               "auto_submission": auto_sub[0] if auto_sub else None,
               **({"repos": REPOS, "auto_submissions": auto_sub, "adoptions": adoptions, "sync": sync} if OWN else {}),
+              **({"post": POST} if MUST_POST else {}),
               "board": board, "blame": shares, "git_log": log,
               # full turns (text = <think>reasoning</think>answer) and submissions with their code (audit 2026-10-24:
               # the last 4000 characters of a turn hid the reasoning; ~4 MB per 1M-token episode)
               "agents": [{"name": a.name, "exit": a.exit, "steps": a.steps, "generated": a.generated,
                           "dropped": a.dropped, "submits": a.n_submit, "posts": a.n_post, "restarts": a.restarts,
-                          "turns": a.turns}
+                          **({"post_refused": a.post_refused} if MUST_POST else {}), "turns": a.turns}
                          for a in agents]})
     return agents, S, info
 
