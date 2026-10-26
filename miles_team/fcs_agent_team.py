@@ -97,17 +97,32 @@ def repo_init(work: str) -> None:
     _git(work, "commit", "-q", "--allow-empty", "-m", "start", env=who)
 
 
-def commit_as(work: str, name: str, step: int) -> None:
+def commit_as(work: str, name: str, step: int, staged: bool = False) -> str:
     """The harness's commit after a command: the repo's source files, under the acting agent's name (trusted code,
-    outside the sandbox; the agents' own git use stays possible)."""
+    outside the sandbox; the agents' own git use stays possible). staged: also commit what the agent staged itself
+    when no file needs adding (`git checkout <rev> -- file` and `git add` update the index, so ls-files --modified
+    misses them; fcs_agent_long's own repos). Returns "" or the git steps that failed (callers may ignore it;
+    "nothing to commit" is not a failure)."""
     who = {"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": f"{name}@team", "GIT_COMMITTER_NAME": name,
            "GIT_COMMITTER_EMAIL": f"{name}@team"}
-    changed = _git(work, "ls-files", "-z", "--others", "--modified", "--deleted", "--exclude-standard").stdout
+    ls = _git(work, "ls-files", "-z", "--others", "--modified", "--deleted", "--exclude-standard")
+    changed = ls.stdout
     files = sorted({f for f in changed.split("\0") if f.endswith(SOURCES)
                     and not (os.path.isfile(os.path.join(work, f)) and os.path.getsize(os.path.join(work, f)) > MAX_COMMIT_BYTES)})
+    fail = [f"git ls-files exit {ls.returncode}"] if ls.returncode else []
     if files:  # (a pathspec that matches nothing would fail the whole add)
-        _git(work, "add", "-A", "--", *files, env=who)
-        _git(work, "commit", "-q", "-m", f"{name} step {step}", env=who)
+        r = _git(work, "add", "-A", "--", *files, env=who)
+        if r.returncode:
+            fail.append(f"git add exit {r.returncode}")
+        r = _git(work, "commit", "-q", "-m", f"{name} step {step}", env=who)
+        if r.returncode and not any(t in r.stdout for t in ("nothing to commit", "nothing added to commit",
+                                                              "no changes added to commit")):
+            fail.append(f"git commit exit {r.returncode}")
+    elif staged and _git(work, "diff", "--cached", "--quiet").returncode == 1:
+        r = _git(work, "commit", "-q", "-m", f"{name} step {step}", env=who)
+        if r.returncode:
+            fail.append(f"git commit exit {r.returncode}")
+    return "; ".join(fail)
 
 
 def snapshot(work: str, path: str = "solution.cpp") -> tuple:
