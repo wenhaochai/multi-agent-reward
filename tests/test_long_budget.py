@@ -1,7 +1,8 @@
 """fcs_agent_long with MA_LG_END=budget (audit 2026-10-24): only the budget ends the work. The finish command on an
-unchanged solution.cpp is not judged and the work goes on; three in a row end it as IdleFinish; the submit reply
-says how many tokens are left; the prompt and the format error drop the end sentence. Scripted agent (and the real
-think for the format error), stubbed judge."""
+unchanged solution.cpp is not judged and the work goes on, however many come in a row (owner 2026-10-25: the reply
+says the work goes on until the budget is used up, with next steps; each is counted); the submit reply says how many
+tokens are left; the prompt and the format error drop the end sentence, and a run of format errors does not end it.
+Scripted agent (and the real think for the format errors), stubbed judge."""
 import asyncio
 import os
 import sys
@@ -75,9 +76,14 @@ def run(script):
 L.judge_code, L._Agent = fake_judge, Scripted
 a, info = run(["printf 'int main(){}\\n' > solution.cpp", FIN, FIN, "true", FIN, FIN, FIN, "true"])
 check("an unchanged finish is not judged and the work goes on", len(judged) == 1 and not a.outs[2].startswith(L.A.MARK)
-      and "nothing was submitted" in a.outs[2] and "tokens are left" in a.outs[2] and a.steps == 7, (judged, a.outs))
-check("three unchanged finishes in a row end as IdleFinish", a.exit == "IdleFinish" and info["fo_ag_exit_IdleFinish"] == 1.0
-      and info["fo_ag_exit_Finished"] == 0.0, (a.exit, info))
+      and "nothing was submitted" in a.outs[2] and "tokens are left" in a.outs[2]
+      and "Your work goes on until your token budget is used up" in a.outs[2] and "brute-force" in a.outs[2], (judged, a.outs))
+check("three unchanged finishes in a row do not end it: the script runs out (TokensExceeded)", a.steps == 8
+      and a.exit == "TokensExceeded" and info["fo_ag_exit_IdleFinish"] == 0.0 and info["fo_ag_exit_Finished"] == 0.0,
+      (a.exit, a.steps, info))
+check("the unchanged finishes are counted", info["fo_lg_idle_finishes"] == 4.0
+      and [bool(t.get("idle_finish")) for t in a.turns] == [False, False, True, False, True, True, True, False],
+      (info.get("fo_lg_idle_finishes"), [t.get("idle_finish") for t in a.turns]))
 check("the finish reply on a changed file names no way to end", "ends your work" not in a.outs[1], a.outs[1])
 check("the harness tag names the protocol", info["lg_harness"] == "long-v1-budget-ctxlow1", info["lg_harness"])
 a, info = run(["printf 'int main(){}\\n' > solution.cpp", "submit", "printf 'int main(){return 0;}\\n' > solution.cpp",
@@ -104,5 +110,9 @@ ag = Real(SimpleNamespace(sample=SimpleNamespace(index=0), evaluation=True), 0, 
 asyncio.run(ag.think())
 check("format error: submit alone, no end sentence", L._FORMAT_ERROR_END_BUDGET in ag.chat[-1]["content"]
       and "not be able to continue" not in ag.chat[-1]["content"], ag.chat[-1]["content"][-300:])
+for _ in range(4):
+    asyncio.run(ag.think())
+check("five format errors in a row do not end it, and the reply says the work goes on", not ag.done and ag.fmt_run == 5
+      and "Your work goes on until your token budget is used up" in ag.chat[-1]["content"], (ag.done, ag.exit, ag.fmt_run))
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)

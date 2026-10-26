@@ -18,8 +18,9 @@ What changes against fcs_agent_team (one submission, no feedback, no messages):
                   does and the agent goes on; when solution.cpp has not changed since its last submission it ends the
                   agent's work.
   the end         an agent stops when it runs the finish command on an unchanged solution.cpp, uses up MA_LG_TOKENS
-                  generated tokens, or makes three format errors in a row (MA_LG_END=budget: not on an unchanged
-                  finish command, unless it is the third in a row). When every agent has stopped, the submission
+                  generated tokens, or makes three format errors in a row (MA_LG_END=budget: only the budget, the
+                  context or the round cap end it; an unchanged finish command or a run of format errors gets a
+                  reply that the work goes on). When every agent has stopped, the submission
                   with the highest provisional score (the earliest on a tie) is the team's answer, and its FINAL score
                   (the mean over the cases at 0-based odd indices, files 2.in, 4.in, ..., never shown to the agents) is
                   the episode's score. A problem with a single test case uses it for both, so its final score is not
@@ -91,12 +92,17 @@ assert HARNESS in ("v1", "v2"), HARNESS
 V2 = HARNESS == "v2"
 # how an agent's work ends (audit 2026-10-24: Flint ended voluntarily at 16-46% of a 300k budget, so the 500k and 1M
 # rows would repeat the 150k one). voluntary: the finish command on an unchanged solution.cpp ends it (the first
-# protocol). budget: nothing ends it but the budget (or the context, or format errors); the finish command on an
-# unchanged file says so and goes on, and three of those in a row end the agent as IdleFinish. Never pool the two.
+# protocol). budget: nothing ends it but the budget (or the context or the round cap). The finish command on an
+# unchanged file is not judged; its reply says that the work goes on until the budget is used up, and suggests next
+# steps (owner 2026-10-25: "只按预算结束，如果他们提前结束请注入prompt强迫继续"; until then three in a row ended the agent
+# as IdleFinish), and format errors in a row no longer end it. Never pool the two.
 END = os.environ.get("MA_LG_END", "voluntary")
 assert END in ("voluntary", "budget"), END
 BUDGET_END = END == "budget"
-IDLE_FINISHES = 3
+_KEEP_GOING = ("Your work goes on until your token budget is used up: about {left:,} of your {total:,} tokens are left. "
+               "Keep improving solution.cpp: for example, test it on new and larger inputs, compare it with a "
+               "brute-force solution on small inputs, measure its running time on the largest inputs, or try a "
+               "different algorithm.")
 # where the team's code lives (owner 2026-10-25: a shared message board, and code shared through git). shared: one
 # repository and working tree for every agent (the first team game: one agent's rewrite of solution.cpp overwrites
 # another's work, and all build on one file). own: each agent works in a repository of its own that only it changes;
@@ -345,7 +351,11 @@ class _Agent(T._Agent):
             self.chat = self.chat + [{"role": "assistant", "content": vis or "(cut off)"},
                                      {"role": "user", "content": msg + self._usage()}]
             if self.fmt_run >= A.MAX_FORMAT_ERRORS:
-                self.done, self.exit = True, "RepeatedFormatError"
+                if not BUDGET_END:
+                    self.done, self.exit = True, "RepeatedFormatError"
+                else:   # budget mode: the work goes on (each turn spends tokens, so the budget still ends it)
+                    self.chat[-1] = {**self.chat[-1], "content": self.chat[-1]["content"] + "\n" + _KEEP_GOING.format(
+                        left=max(0, TOKENS - self.generated), total=TOKENS)}
             return None
         self.fmt_run = 0
         self._pending = (vis, rec)
@@ -702,12 +712,13 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
         if got[1] is not None and sha1(got[1]) == a.last_sha:
             if not BUDGET_END:
                 return out
-            a.idle_fin = getattr(a, "idle_fin", 0) + 1   # budget mode: the work goes on (episode() ends it after 3)
+            a.idle_fin = getattr(a, "idle_fin", 0) + 1   # budget mode: the work goes on, however many in a row
             k, x = next(((i, x) for i, x in reversed(list(enumerate(subs, 1))) if x["agent"] == a.name
                          and x["sha"] == a.last_sha), (len(subs), {"prov": 0.0}))
             return {"output": f"solution.cpp is unchanged since your submission #{k} (provisional {100 * x['prov']:.2f});"
-                              f" nothing was submitted. About {max(0, TOKENS - a.generated):,} of your {TOKENS:,} "
-                              "tokens are left. Keep improving solution.cpp.\n", "returncode": 0, "exception_info": ""}
+                              " nothing was submitted. " + _KEEP_GOING.format(left=max(0, TOKENS - a.generated),
+                                                                              total=TOKENS) + "\n",
+                    "returncode": 0, "exception_info": "", "idle_finish": True}
         a.idle_fin = 0
         res = await do_submit(a, "solution.cpp")
         left = max(0, TOKENS - a.generated)
@@ -803,6 +814,8 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
                         fin = True
                         res = await finish(a, out)
                         ends = res is out
+                        if res.pop("idle_finish", False):   # budget mode: an unchanged finish, counted in the trace
+                            timing["idle_finish"] = True
                         out = {**res, "seconds": secs}
                     elif V2 and _MARK_CMD_RE.search(cmd):   # combined with other commands: say it did not submit
                         out = {**out, "output": out["output"] + _COMBINED_NOTE}
@@ -855,8 +868,6 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
                 a.observe(cmd, {**out, "_timing": timing}, rounds, k)
                 if not fin:
                     a.idle_fin = 0
-                elif BUDGET_END and getattr(a, "idle_fin", 0) >= IDLE_FINISHES and not a.done:
-                    a.done, a.exit = True, "IdleFinish"
             if ckpt is not None and any(not a.done for a in agents) and rounds < MAX_ROUNDS \
                     and ckpt.due(len(subs) > n_subs):
                 fut = loop.run_in_executor(A._POOL, ckpt.save, state(), work)
@@ -927,6 +938,8 @@ async def episode(input: GenerateFnInput, messages: list, label: str, ckpt: Chec
             "fo_lg_think_min": total_min("think_s"), "fo_lg_cmd_queue_min": total_min("cmd_queue_s"),
             "fo_lg_judge_min": sum(s["judge_s"] for s in subs + auto_sub) / 60,
             "fo_lg_harness_min": total_min("harness_s"),
+            **({"fo_lg_idle_finishes": sum(bool(t.get("idle_finish")) for a in agents for t in a.turns) / N}
+               if BUDGET_END else {}),
             **({"fo_lg_own_repos": 1.0, "fo_lg_adoptions": len(adoptions), "fo_lg_fetch_min": total_min("fetch_s"),
                 "fo_lg_fetch_fail": sync["fetch_fail"], "fo_lg_commit_skipped": sync["commit_skipped"],
                 "fo_lg_git_fail": sync["git_fail"]} if OWN else {})}
