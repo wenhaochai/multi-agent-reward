@@ -224,18 +224,20 @@ def experts_reference(experts: nn.ModuleList, x: torch.Tensor, weights: torch.Te
 def grouped_experts(experts: nn.ModuleList, x: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor):
     """The experts for training: the token-expert pairs sorted by expert through two grouped GEMMs
     (torch._grouped_mm, bf16 with fp32 accumulation, differentiable), weighted and summed in fp32 like
-    ``experts_reference``. The per-expert weights are stacked per call, as the checkpoint keeps one module per expert."""
+    ``experts_reference``. Deterministic: the pairs move by permutations and each token's k outputs are summed in a
+    fixed order (no atomic index_add_). The per-expert weights are stacked per call, as the checkpoint keeps one
+    module per expert."""
+    n, k = ids.shape
     w13 = torch.stack([torch.cat([e.gate_proj.weight, e.up_proj.weight], dim=0) for e in experts])   # [E, 2I, H]
     w2 = torch.stack([e.down_proj.weight for e in experts])                                          # [E, H, I]
     flat = ids.flatten()
     order = torch.argsort(flat, stable=True)
-    tok = order // ids.shape[1]
     offs = torch.cumsum(torch.bincount(flat, minlength=len(experts)), dim=0).to(torch.int32)
-    gate, up = torch._grouped_mm(x[tok], w13.transpose(1, 2), offs=offs).chunk(2, dim=-1)
+    xs = x.unsqueeze(1).expand(n, k, x.shape[1]).reshape(n * k, -1)[order]                     # pairs by expert
+    gate, up = torch._grouped_mm(xs, w13.transpose(1, 2), offs=offs).chunk(2, dim=-1)
     y = torch._grouped_mm(F.silu(gate) * up, w2.transpose(1, 2), offs=offs)
-    out = torch.zeros(x.shape, dtype=acc_dtype(x.dtype), device=x.device)
-    out.index_add_(0, tok, y.to(out.dtype) * weights.flatten()[order, None])
-    return out.to(x.dtype)
+    y = y[torch.argsort(order)].view(n, k, -1).to(acc_dtype(x.dtype))                         # back to token order
+    return (y * weights.to(y.dtype).unsqueeze(-1)).sum(dim=1).to(x.dtype)
 
 
 class FlintSparseMoeBlock(nn.Module):

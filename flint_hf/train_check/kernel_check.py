@@ -144,6 +144,14 @@ def check_experts(dev):
                      block.experts[e0].down_proj.weight.grad.clone(), block.experts[e0].gate_proj.weight.grad.clone())
     for n, a, b in zip(("out", "dx", "drouter", "dexpert.down", "dexpert.gate"), res["grouped"], res["reference"]):
         diff(f"experts {n} (layer {layer}, 8192 tokens)", a, b)
+    block.experts_fn = M.grouped_experts   # deterministic: a second run is bitwise identical
+    block.zero_grad(set_to_none=True)
+    xi = x.clone().requires_grad_()
+    out = block(xi)
+    out.backward(gout)
+    same = torch.equal(out.detach(), res["grouped"][0]) and torch.equal(xi.grad, res["grouped"][1]) \
+        and torch.equal(block.gate.weight.grad, res["grouped"][2])
+    print(f"experts grouped run twice: bitwise identical {same}", flush=True)
 
 
 def check_head(dev):
