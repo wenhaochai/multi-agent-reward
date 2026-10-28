@@ -1,8 +1,8 @@
-"""The harness's git (fcs_cmd.run_git) and RLIMIT_NPROC. The limit counts every task of the user on the node, and
-fcs_judge._nproc_limit() is that count as of up to 5 s ago plus 128; when the user's other work on the node starts
+"""The harness's git (sandbox.run_git) and RLIMIT_NPROC. The limit counts every task of the user on the node, and
+judge._nproc_limit() is that count as of up to 5 s ago plus 128; when the user's other work on the node starts
 more than 128 tasks inside that window, a git run under that limit cannot fork upload-pack and exits 128 (own-repos
 fetches and publishes in smokes w260 and w412). A cached count far below the real one stands in for that: git under
-the plain limit fails so, and the harness's git, with fcs_cmd.GIT_NPROC_MARGIN more room, still fetches and publishes."""
+the plain limit fails so, and the harness's git, with sandbox.GIT_NPROC_MARGIN more room, still fetches and publishes."""
 import os
 import resource
 import subprocess
@@ -11,11 +11,10 @@ import tempfile
 import time
 
 os.environ.setdefault("FCS_CASE_PROC", "0")
-os.environ["MA_LG_N"], os.environ["MA_LG_REPOS"] = "4", "own"
 os.environ["TMPDIR"] = tempfile.mkdtemp()
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from miles_team import fcs_agent_long as L  # noqa: E402
-from miles_team import fcs_judge as J  # noqa: E402
+from flint import judge as J  # noqa: E402
+from flint import repo as L  # noqa: E402
 
 ok = True
 

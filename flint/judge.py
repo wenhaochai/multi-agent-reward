@@ -33,12 +33,15 @@ Deviations, all from the 2026-10-04 audit:
   * Landlock ABI >= 6 also scopes signals: a program cannot signal anything outside its sandbox (kill(getppid()) or
     kill(-1) reached the trainer before; audit 2026-10-11);
   * g++ gets a 2 GiB address space and the task limit (official: 512 MiB, 10 s CPU, 50 processes).
-usage: judge(problem_dir, cpp_source) -> {"score": 0-100, "status": ..., "cases": [...], "infra": bool}
+usage: judge(problem_dir, cpp_source) -> {"score": 0-100, "status": ..., "cases": [...], "infra": bool}; the game
+calls judge_code (the end of this file), which runs judge in a thread under a node-wide concurrency limit.
 """
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import fcntl
+import functools
 import hashlib
 import math
 import os
@@ -636,8 +639,7 @@ def _compile(work: Path, sol: Path):
 
 
 def judge(problem_dir, source: str, case_workers: int = CASE_WORKERS, pool: ThreadPoolExecutor | None = None) -> dict:
-    """pool: run the compile and every case in this executor instead (fcs_rm's background eval keeps its own slots,
-    so its cases never queue ahead of training's in the shared pool)."""
+    """pool: run the compile and every case in this executor instead of the shared case pool."""
     prob = load_problem(Path(problem_dir))
     if not prob["cases"]:
         return {"score": 0.0, "status": "no cases", "cases": []}
@@ -680,3 +682,69 @@ def _case(fn, *a):
         return _in_proc(_safe, fn, *a)
     except Exception as e:
         return 0.0, f"INFRA exception: {e}"[:200]
+
+
+# ---- the game's entry: judge_code ------------------------------------------------------------------------------------
+_SEM = None
+_THREADS = None
+
+
+def _sem() -> asyncio.Semaphore:
+    """At most FCS_RM_CONCURRENCY programs judged at once (default: the job's own cores, 8 kept for the servers, over
+    CASE_WORKERS)."""
+    global _SEM
+    if _SEM is None:
+        n = int(os.environ.get("FCS_RM_CONCURRENCY", max(1, (job_cpus() - 8) // CASE_WORKERS)))
+        _SEM = asyncio.Semaphore(n)
+        _SEM.size = n
+    return _SEM
+
+
+def _thread(fn, *a):
+    """fn(*a) in this module's own thread pool, a thread per semaphore slot plus 8: the loop's default executor holds
+    at most 32 threads on every node (audit 2026-10-07)."""
+    global _THREADS
+    if _THREADS is None:
+        _THREADS = ThreadPoolExecutor(max_workers=_sem().size + 8, thread_name_prefix="fcs-rm")
+    return asyncio.get_running_loop().run_in_executor(_THREADS, functools.partial(fn, *a))
+
+
+def judge_full(problem_dir: str, code: str) -> dict:
+    """Judge a program: {"score": [0, 1], "cases": per-case ratios (zeros when nothing ran), "status": ...,
+    "infra_error": bool, "msg": the compiler output of a compile error, "case_info": the judge's per-case lines, cut to
+    160 chars ([] when nothing ran), "verdicts": one per case (verdict(): OK, WA, TLE, ...; CE for a compile error, -
+    when nothing ran)}. Infrastructure failures are logged and flagged, never a silent 0. case_info can quote the
+    checker, which may print expected output: keep it out of what an agent sees (verdicts are safe to show)."""
+    n = len(load_problem(Path(problem_dir))["cases"])
+    if not code:
+        return {"score": 0.0, "cases": [0.0] * n, "status": "no code", "infra_error": False, "msg": "",
+                "case_info": [], "verdicts": ["-"] * n}
+    try:
+        r = judge(problem_dir, code)
+    except Exception as e:
+        print(f"[fcs_rm] JUDGE-ERROR {problem_dir}: {e}"[:500], file=sys.stderr, flush=True)
+        return {"score": 0.0, "cases": [0.0] * n, "status": "judge error", "infra_error": True, "msg": "",
+                "case_info": [], "verdicts": ["-"] * n}
+    cases = r.get("cases") or [0.0] * n
+    infra = bool(r.get("infra")) or r.get("status") == "infra error"
+    if infra:
+        print(f"[fcs_rm] JUDGE-INFRA {problem_dir}: {r.get('status')} {(r.get('msg') or '')[-200:]}"[:500],
+              file=sys.stderr, flush=True)
+    return {"score": r["score"] / 100.0, "cases": [float(c) for c in cases], "status": r["status"],
+            "infra_error": infra, "msg": r.get("msg", "") if r["status"] == "compile error" else "",
+            "case_info": [str(i)[:160] for i in (r.get("case_info") or [])],
+            "verdicts": ([verdict(str(i)) for i in r.get("case_info") or []] if r["status"] == "done" else
+                         ["CE"] * n if r["status"] == "compile error" else ["-"] * n)}
+
+
+async def judge_code(problem_dir: str, code: str) -> dict:
+    """judge_full in a thread under the shared FCS_RM_CONCURRENCY semaphore. The slot is held until the thread ends,
+    also when the caller is cancelled (an aborted episode): a cancelled await would otherwise free the slot while the
+    judge keeps running, and the extra judges oversubscribe the node."""
+    async with _sem():
+        fut = asyncio.ensure_future(_thread(judge_full, problem_dir, code))
+        try:
+            return await asyncio.shield(fut)
+        except asyncio.CancelledError:
+            await asyncio.wait([fut])
+            raise

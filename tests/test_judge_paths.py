@@ -1,4 +1,4 @@
-"""fcs_judge's work dirs and helper cache follow TMPDIR when FCS_JUDGE_TMP / FCS_JUDGE_CACHE are unset (a job's per-job
+"""The judge's work dirs and helper cache follow TMPDIR when FCS_JUDGE_TMP / FCS_JUDGE_CACHE are unset (a job's per-job
 scratch dir, removed by its EXIT trap), explicit variables still win, and with neither the paths stay /tmp. A judged
 program scores the same under TMPDIR as under /tmp, and its checker lands in TMPDIR's cache."""
 import json
@@ -28,20 +28,17 @@ def run(env_set: dict, code: str) -> str:
     return r.stdout.strip().splitlines()[-1]
 
 
-PATHS = "import miles_team.fcs_judge as J; print(J.TMP, J.CACHE)"
+PATHS = "import flint.judge as J; print(J.TMP, J.CACHE)"
 scratch = tempfile.mkdtemp(dir="/scratch/gpfs/GROUP/USER/tmp")
 check("no TMPDIR: /tmp as before", run({}, PATHS) == "/tmp /tmp/fcs_judge_cache", run({}, PATHS))
 check("TMPDIR: both follow it", run({"TMPDIR": scratch}, PATHS) == f"{scratch} {scratch}/fcs_judge_cache")
 check("explicit variables win", run({"TMPDIR": scratch, "FCS_JUDGE_TMP": "/a", "FCS_JUDGE_CACHE": "/b"}, PATHS) == "/a /b")
 check("TEMP and TMP without TMPDIR: /tmp", run({"TEMP": scratch, "TMP": scratch}, PATHS) == "/tmp /tmp/fcs_judge_cache")
-check("fcs_judge_v1 follows TMPDIR the same way", run({"TMPDIR": scratch, "TEMP": "/x"}, PATHS.replace("fcs_judge ", "fcs_judge_v1 "))
-      == f"{scratch} {scratch}/fcs_judge_cache" and run({"TMP": scratch}, PATHS.replace("fcs_judge ", "fcs_judge_v1 "))
-      == "/tmp /tmp/fcs_judge_cache")
 check("FCS_JUDGE_TMP alone sets the cache's parent", run({"FCS_JUDGE_TMP": "/a"}, PATHS) == "/a /a/fcs_judge_cache")
 
 # a program that reads the input and prints a constant: some cases fail, so the scores are not all zero or all one
 SRC = "#include <bits/stdc++.h>\nint main(){std::string s; while(std::cin>>s){} std::cout<<0<<std::endl;}\n"
-JUDGE = (f"import json, os, miles_team.fcs_judge as J; r = J.judge({LABEL!r}, {SRC!r}); "
+JUDGE = (f"import json, os, flint.judge as J; r = J.judge({LABEL!r}, {SRC!r}); "
          "print(json.dumps({'s': r['score'], 'c': r['cases'], 'st': r['status'], "
          "'left': sorted(p for p in os.listdir(J.TMP) if p.startswith('fcsj_')), 'cache': sorted(os.listdir(J.CACHE))}))")
 a = json.loads(run({"FCS_CASE_PROC": "0"}, JUDGE))

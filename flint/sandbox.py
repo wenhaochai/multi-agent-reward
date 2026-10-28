@@ -1,6 +1,6 @@
-"""The agent's command runner (mini-swe-agent's bash action), apart from fcs_agent so that the judge's case workers
-can import it without miles: every command runs in a case worker (fcs_judge._in_proc), since a Popen with a preexec_fn
-in the rollout process forks 13.5 GB under its mmap lock (fcs_judge, FCS_CASE_PROC). "seconds" is timed inside the
+"""The agent's command runner (mini-swe-agent's bash action), in a module of its own so that the judge's case workers
+can import it cheaply: every command runs in a case worker (judge._in_proc), since a Popen with a preexec_fn
+in the rollout process forks 13.5 GB under its mmap lock (judge.py, FCS_CASE_PROC). "seconds" is timed inside the
 worker, so a command that waits for a free worker is not charged for the wait.
 
 Output goes to an unlinked temp file, not a pipe, and only the command's own shell is waited for: a background child
@@ -21,12 +21,12 @@ import time
 import uuid
 from pathlib import Path
 
-from . import fcs_judge as J
+from . import judge as J
 
 TIMEOUT = int(os.environ.get("MA_AG_TIMEOUT", "60"))
 CMD_MEM = 4 << 30            # address space of a command and its children (g++ -O2 of a large file fits)
 # Stub `submit` and `post` executables for the long-horizon game. The harness handles both only as the whole action
-# (fcs_agent_long.SUBMIT_RE); Flint first looked them up with `which submit`, found nothing, and never submitted
+# (game.SUBMIT_RE); Flint first looked them up with `which submit`, found nothing, and never submitted
 # (smoke 16024925: 4 episodes, 0 submits). The stubs make the lookup succeed and say how to call them.
 HARNESS_BIN = str(Path(__file__).resolve().parent / "harness_bin")
 
@@ -38,7 +38,7 @@ _SCOPE_ABSTRACT_UNIX = 1 << 0   # LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET (ABI 6): n
 
 
 def _restrict_net(rules):
-    """fcs_judge._restrict with TCP handled (and no TCP rule, so no bind or connect) when the kernel has it."""
+    """judge._restrict with TCP handled (and no TCP rule, so no bind or connect) when the kernel has it."""
     if J.LANDLOCK_ABI < 4:
         return J._restrict(rules)
     scope = J._SCOPE_SIGNAL | _SCOPE_ABSTRACT_UNIX if J.LANDLOCK_ABI >= 6 else 0
@@ -78,7 +78,7 @@ def _sandbox(work: str, harness: bool = False, read: tuple = ()):
 # ---- the long game's /tmp ---------------------------------------------------------------------------------------------
 # Flint writes scratch files to /tmp out of habit (50 of 866 smoke turns failed on it; smoke w153 again). A long-game
 # command (harness=True) runs in its own user and mount namespace with private_tmp(work) bound on /tmp: a directory
-# beside the repository, so the auto-commits never see it, removed with the work dir (fcs_agent_long.rm_work). The
+# beside the repository, so the auto-commits never see it, removed with the work dir (game.rm_work). The
 # node's /tmp stays closed, and Landlock then refuses the command any mount of its own.
 _MS_BIND, _MS_REC, _MS_PRIVATE = 4096, 1 << 14, 1 << 18
 
@@ -121,7 +121,7 @@ def _preexec(work: str, nproc: int, harness: bool = False):
 
 
 def run_command(command: str, work: str, harness: bool = False) -> dict:
-    """One action in the episode's work dir (blocking; run in fcs_agent's _POOL). mini-swe-agent's output dict, plus
+    """One action in the episode's work dir (blocking; run in game.POOL). mini-swe-agent's output dict, plus
     "seconds", the command's wall time (the run time that the reward charges). harness (the long game): HARNESS_BIN
     first on PATH and a private /tmp."""
     return J._in_proc(_timed, command, work, harness, J.CASE_PROC)
@@ -250,7 +250,7 @@ def _run_command(command: str, work: str, harness: bool = False, reap: bool = Fa
 
 # ---- the harness's git, under the command sandbox ---------------------------------------------------------------------
 def run_git(work: str, args: list, env: dict, timeout: float = 60, read: tuple = ()) -> subprocess.CompletedProcess:
-    """git <args> in an episode's repo for the harness (fcs_agent_team._git), in a case worker and under the agents'
+    """git <args> in an episode's repo for the harness (repo.git), in a case worker and under the agents'
     sandbox: config the agents wrote into .git (filter.*.clean, gpg.program, core.pager, ...) then runs with their rights
     only, not the trainer's (audit 2026-10-24); `read`: paths it may also read (another agent's repository, team.git).
     Raises subprocess.TimeoutExpired after `timeout` s."""

@@ -1,4 +1,4 @@
-"""The long-horizon game's stub `submit` and `post` on PATH (fcs_cmd.HARNESS_BIN): `which submit` finds them inside the
+"""The long-horizon game's stub `submit` and `post` on PATH (sandbox.HARNESS_BIN): `which submit` finds them inside the
 sandbox, running one prints how to call it, and a command without harness=True does not see them."""
 import os
 import sys
@@ -6,7 +6,7 @@ import tempfile
 
 os.environ.setdefault("FCS_CASE_PROC", "0")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from miles_team import fcs_cmd as C  # noqa: E402
+from flint import sandbox as C  # noqa: E402
 
 ok = True
 

@@ -1,4 +1,4 @@
-"""fcs_cmd.run_command's limits on what a command leaves behind (audit 2026-10-24): a background child that keeps the
+"""sandbox.run_command's limits on what a command leaves behind (audit 2026-10-24): a background child that keeps the
 output open cannot hold the call past MA_AG_TIMEOUT, every process the command started is gone when the call returns,
 a command cannot reach an abstract unix socket made outside its sandbox, and a long-game command gets a private /tmp and
 no mount of its own. Run it twice, with FCS_CASE_PROC=1 (case workers, as in the evals) and FCS_CASE_PROC=0 (in the
@@ -13,7 +13,7 @@ import uuid
 
 os.environ.setdefault("MA_AG_TIMEOUT", "5")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from miles_team import fcs_cmd as C  # noqa: E402
+from flint import sandbox as C  # noqa: E402
 
 T = C.TIMEOUT
 WORKER = C.J.CASE_PROC
@@ -52,7 +52,7 @@ with tempfile.TemporaryDirectory(dir=base) as work:
     if C.J.LANDLOCK_ABI:
         r = C.run_command("ls /tmp; touch /tmp/fcs_probe_$$ && echo WROTE", work)
         check("/tmp can be neither listed nor written", "Permission denied" in r["output"] and "WROTE" not in r["output"], r)
-    # the long game (harness=True): a private /tmp beside the repository, what fcs_agent_long's v2 prompt says
+    # the long game (harness=True): a private /tmp beside the repository
     probe = f"fcs_probe_{uuid.uuid4().hex}"
     r = C.run_command(f"echo hi > /tmp/{probe} && ls /tmp && cat /tmp/{probe}", work, True)
     check("long game: /tmp is writable and listable", r["returncode"] == 0 and r["output"] == f"{probe}\nhi\n", r)

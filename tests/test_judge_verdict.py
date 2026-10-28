@@ -1,4 +1,4 @@
-"""fcs_judge.verdict reads a case's verdict from the case_info line the judge wrote, and fcs_rm.judge_full returns one
+"""judge.verdict reads a case's verdict from the case_info line the judge wrote, and judge.judge_full returns one
 per case ("verdicts"): unit tests on the line formats, then real judges on val problems 6 (classic, 1 s) and 10
 (interactive, 512 MiB) for each verdict, and the w93 pid6 best program when its trace is there."""
 import json
@@ -8,8 +8,7 @@ import tempfile
 
 os.environ["TMPDIR"] = tempfile.mkdtemp(dir="/scratch/gpfs/GROUP/USER/tmp")   # 128 MiB outputs off node /tmp
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from miles_team.fcs_judge import verdict  # noqa: E402
-from miles_team.fcs_rm import judge_full  # noqa: E402
+from flint.judge import judge_full, verdict  # noqa: E402
 
 P = "/scratch/gpfs/GROUP/USER/project/Frontier-CS-v1.1/algorithmic/problems/"
 W93 = "/scratch/gpfs/GROUP/USER/project/flint-eval/runs/smoke_tc_w93/traces/agent_419086.jsonl"

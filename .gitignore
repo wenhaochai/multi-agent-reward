@@ -1,11 +1,2 @@
-miles.sif
-apptainer_cache/
-cache/
-runs/
-logs/
-data/
-build.log
 __pycache__/
 *.pyc
-pyfix/
-wheels/
