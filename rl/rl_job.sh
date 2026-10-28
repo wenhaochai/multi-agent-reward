@@ -56,7 +56,9 @@ assert len(rows) == 1
 rows[0]["metadata"]["label"] = rows[0]["label"]
 open(sys.argv[2], "w").write((json.dumps(rows[0]) + "\n") * 1000)
 PY
-gpu_watch $$ "$OUT/gpu.log" &   # one line per GPU and minute; stops the job when a GPU idles (rl/gpu_watch.sh)
+# one line per GPU and minute; stops the job when a GPU idles (rl/gpu_watch.sh), counting from the first rollout
+# request: the start (actor weights 8 min in w583, then the engines; GPUs idle 11 min) may take up to 35 min
+gpu_watch $$ "$OUT/gpu.log" "grep -q 'POST /v1/chat/completions' '$OUT/train.log' 2>/dev/null" 35 &
 WD=$!
 ( while sleep 10; do echo "$(date +%s) $(free -m | awk '/Mem:/{print $3}')"; done ) > "$OUT/host_mem.txt" &
 MEM=$!
