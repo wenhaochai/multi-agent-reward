@@ -61,6 +61,7 @@ int main(int argc, char* argv[]) {
 
     // mas-rl patch (audit 2026-10-28): testlib reads "1e400" as +inf, and doubleEqual(actual, inf) is true (inf <= eps*inf),
     // so an infinite claim scored 100 with every point at the origin
+    // (filed upstream: https://github.com/FrontierCS/Frontier-CS/issues/202)
     if (!std::isfinite(claimed_min_dist)) {
         quitf(_wa, "Minimum distance is not a finite number");
     }
