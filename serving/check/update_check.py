@@ -2,8 +2,8 @@
 (training_utils/weight_update/session.py: pause, flush, begin_weight_update, buckets, end_weight_update, resume), with
 miles' SGLangApiClient, its NCCL group (protocols/broadcast.py connect/disconnect) and its bucketing
 (hf_weight_iterator.bucketing, 512 MiB). Each bucket is sent as broadcast.update_weights_from_distributed sends it (the
-HTTP request, then the NCCL broadcast from rank 0), but the broadcast is polled, so a request the server refuses
-stops this process at once instead of leaving rank 0 waiting for receivers that never join. HF-named tensors come
+HTTP request, then the NCCL broadcast from rank 0), but the group setup and the broadcast run in a thread, so a
+request the server refuses, or an NCCL setup that never completes, ends this process instead of blocking rank 0. HF-named tensors come
 from flint_hf (S1, c0b0cef) loaded on this process's GPUs, as the FSDP trainer would send them.
 On the first three S1 sequences (2k, 4k, 8k tokens):
 (a) every parameter sent back unchanged: the served logprobs stay bit-identical;
@@ -99,23 +99,48 @@ def assistant_mask():
     return torch.tensor(out)
 
 
+def in_thread(fn, poll=None):
+    """Run fn in a thread, so a blocked NCCL call (the communicator is built inside the first collective) cannot block
+    this process: poll() may end the process meanwhile, and the limit timer ends it in any case."""
+    box = {}
+
+    def run():
+        try:
+            box["r"] = fn()
+        except Exception as e:   # noqa: BLE001
+            box["e"] = e
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    deadline = time.time() + BUCKET_LIMIT_S
+    while th.is_alive():
+        if poll is not None:
+            poll()
+        if time.time() > deadline:
+            die(f"an NCCL step took over {BUCKET_LIMIT_S} s")
+        time.sleep(0.02)
+    if "e" in box:
+        die("an NCCL step failed", box["e"])
+    return box.get("r")
+
+
 def send_bucket(bucket):
     tensors = [t for _, t in bucket]
     fut = async_utils.submit(client.update_weights_from_distributed(
         names=[n for n, _ in bucket], dtypes=[t.dtype for t in tensors], shapes=[t.shape for t in tensors],
         group_name=GROUP, selector="all"))
-    handles = [dist.broadcast(t, 0, group=group, async_op=True) for t in tensors]
-    deadline = time.time() + BUCKET_LIMIT_S
-    while not (all(h.is_completed() for h in handles) and fut.done()):
+
+    def refused():
         if fut.done() and (fut.exception() is not None or not fut.result().get("success")):
             die("the server refused a bucket", fut.exception() or RuntimeError(str(fut.result())))
-        if time.time() > deadline:
-            die(f"a bucket took over {BUCKET_LIMIT_S} s (request done: {fut.done()})")
-        time.sleep(0.02)
-    for h in handles:
-        h.wait()
-    if fut.exception() is not None or not fut.result().get("success"):
-        die("the server refused a bucket", fut.exception() or RuntimeError(str(fut.result())))
+
+    def broadcast():
+        for h in [dist.broadcast(t, 0, group=group, async_op=True) for t in tensors]:
+            h.wait()
+
+    in_thread(broadcast, refused)
+    in_thread(lambda: fut.result(), refused)
+    refused()
 
 
 def send(named):
@@ -140,7 +165,7 @@ hf_base = hf_scores(model)
 asst = assistant_mask()
 params = dict(model.named_parameters())
 args = argparse.Namespace(rollout_num_gpus_per_engine=2, update_weight_transfer_mode="broadcast")
-group = connect_rollout_engines_from_distributed(args, GROUP, [client], engine_gpu_counts=[2])
+group = in_thread(lambda: connect_rollout_engines_from_distributed(args, GROUP, [client], engine_gpu_counts=[2]))
 res = {"n_params": sum(p.numel() for p in params.values()), "n_tensors": len(params)}
 
 # (a) + (c): every parameter, unchanged
