@@ -89,11 +89,17 @@ async def run(base_url: str, prompt, request_kwargs: dict, metadata: dict, **kwa
     return out
 
 
+def _samples(node) -> list:
+    return [s for x in node for s in _samples(x)] if isinstance(node, list) else [node]
+
+
 def drop_failed_groups(args, data) -> None:
-    """miles' sample filter: every sample of a group with a failed episode leaves the loss."""
+    """miles' sample filter: every sample of a group with a failed episode leaves the loss. A group holds one entry per
+    episode, a list of the episode's samples (one per session-tree leaf)."""
     for group in data:
-        if any((s.metadata or {}).get("flint_failed") for s in group):
-            for s in group:
+        samples = _samples(group)
+        if any((s.metadata or {}).get("flint_failed") for s in samples):
+            for s in samples:
                 s.remove_sample = True
 
 
