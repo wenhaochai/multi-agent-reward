@@ -33,6 +33,7 @@ t test_git_nproc X=1
 t test_judge_paths X=1
 t test_judge_runs X=1
 t test_judge_ratio X=1
+t test_checker_fixes X=1
 rm -rf "$TMPDIR"
 echo "${#fail[@]} failed${fail:+: ${fail[*]}}"
 [ ${#fail[@]} -eq 0 ]
