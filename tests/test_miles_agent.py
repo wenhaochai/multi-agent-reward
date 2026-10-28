@@ -86,6 +86,13 @@ groups = [[SimpleNamespace(metadata={"flint_failed": "judge infra error"}, remov
 MA.drop_failed_groups(None, groups)
 check("filter: a failed episode's group leaves the loss, others stay",
       [[x.remove_sample for x in g] for g in groups] == [[True, True], [False, False]])
+# as miles hands it over (w583): each group holds one list of samples per episode
+nested = [[[SimpleNamespace(metadata={}, remove_sample=False)],
+           [SimpleNamespace(metadata={}, remove_sample=False), SimpleNamespace(metadata={"flint_failed": "aborted"}, remove_sample=False)]],
+          [[SimpleNamespace(metadata={}, remove_sample=False)], [SimpleNamespace(metadata={}, remove_sample=False)]]]
+MA.drop_failed_groups(None, nested)
+check("filter: episodes as lists of samples", [[[x.remove_sample for x in e] for e in g] for g in nested]
+      == [[[True], [True, True]], [[False], [False]]])
 check("requests: sampling settings as given, tool not strict",
       all(b["temperature"] == 1.0 and b["top_p"] == 0.95 and b["top_k"] == 20 and not b["tools"][0]["function"]["strict"]
           for b in seen))
