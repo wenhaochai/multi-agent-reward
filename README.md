@@ -46,7 +46,7 @@ Two rules make the game work for Flint. Both come from test runs:
 | `jobs/` | wq jobs on Della: `arm.sh`, `eval.sh`, `smoke.sh`, `smoke_wq.sh` |
 | `flint/miles_agent.py` | One episode as a miles agent against a TITO session (RL rollouts), and its session message matcher |
 | `serving/` | The Flint SGLang plugin ported to miles' SGLang 0.5.23, and its checks |
-| `rl/` | Rollouts through miles v0.1.3 (rollout only for now), miles' GPU TITO check, the samples' checks |
+| `rl/` | RL through miles v0.1.3 (rollouts colocated with the FSDP actor of `flint_hf/`), the rollout-only runs, miles' GPU TITO check, the samples' checks |
 | `tests/` | The tests: `bash tests/run_all.sh` |
 
 ## Run
@@ -71,6 +71,13 @@ Rollouts through miles (one Flint per episode on the RL test problem, 4 H100s, t
 worktree `miles-rollout`, branch flint-grpo of wenhaochai/miles-private):
 
     wq submit --prio 10 --time 3:00:00 --project flint-eval rl/rollout_job.sh full   # 8 x 128k with and without top-32
+
+RL on the same problem, one 8-GPU block (4 engines at TP2 colocated with the FSDP actor; GRPO without std
+normalization, score centering over the top-32, routing replay, one step per 8 episodes of 128k, lr 2e-7):
+
+    wq submit --prio 10 --project flint-eval rl/rl_job.sh memprobe   # 2 training steps alone on a recorded rollout
+    wq submit --prio 10 --project flint-eval rl/rl_job.sh test2      # 2 RL steps
+    rl/steps.py <run dir>                                             # the per-step table
 
 ## Tests
 

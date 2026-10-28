@@ -2,7 +2,7 @@
 episode's game trace: its samples (one per session-tree leaf) and their tokens, the reward, the loss mask (only Flint's
 completions trained, each once), the score-centering candidates (miles' own validator) and the routed experts recorded
 for routing replay (rows per token, Flint's 49 layers x top-6; the 2 dense layers route nothing). Usage: inspect_rollout.py
-<run dir> (rollout_0.pt and traces/); prints a table and writes <run dir>/summary.json."""
+<run dir> [dump] (the dump, rollout_0.pt by default, and traces/); prints a table and writes <run dir>/summary.json."""
 import glob
 import json
 import os
@@ -20,7 +20,7 @@ FLINT = "/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint"
 ROLES = ("<|system|>", "<|user|>", "<|assistant|>", "<|observation|>")
 
 d = sys.argv[1]
-dump = torch.load(os.path.join(d, "rollout_0.pt"), weights_only=False)
+dump = torch.load(os.path.join(d, sys.argv[2] if len(sys.argv) > 2 else "rollout_0.pt"), weights_only=False)
 samples = [Sample.from_dict(s) for s in dump["samples"]]
 tok = AutoTokenizer.from_pretrained(FLINT)
 role_ids = {tok.convert_tokens_to_ids(r) for r in ROLES}
