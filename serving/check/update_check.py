@@ -5,7 +5,8 @@ miles' SGLangApiClient, its NCCL group (protocols/broadcast.py connect/disconnec
 HTTP request, then the NCCL broadcast from rank 0), but the group setup and the broadcast run in a thread, so a
 request the server refuses, or an NCCL setup that never completes, ends this process instead of blocking rank 0. HF-named tensors come
 from flint_hf (S1, c0b0cef) loaded on this process's GPUs, as the FSDP trainer would send them.
-On the first three S1 sequences (2k, 4k, 8k tokens):
+On the first three S1 sequences (2k, 4k, 8k tokens), after a probe (three small tensors sent back unchanged, one
+update each, through the three load paths; the check stops at the first failure or changed logprob):
 (a) every parameter sent back unchanged: the served logprobs stay bit-identical;
 (b) three changes through the three load paths, a plain tensor (layer 10 o_proj x1.25), a shard of the fused qkv
     (layer 3 v_proj x1.25) and every expert's gate_proj of layer 20 in the fused experts (x1.1): the served logprobs
@@ -167,6 +168,16 @@ params = dict(model.named_parameters())
 args = argparse.Namespace(rollout_num_gpus_per_engine=2, update_weight_transfer_mode="broadcast")
 group = in_thread(lambda: connect_rollout_engines_from_distributed(args, GROUP, [client], engine_gpu_counts=[2]))
 res = {"n_params": sum(p.numel() for p in params.values()), "n_tensors": len(params)}
+
+# a probe first: three small tensors, unchanged, one update each, through the three load paths (a plain tensor, a
+# shard of the fused qkv, one expert's shard of the fused gate_up); any failure ends the check before the full update
+for name in ("model.norm.weight", "model.layers.0.self_attn.v_proj.weight", "model.layers.2.mlp.experts.0.gate_proj.weight"):
+    send([(name, params[name])])
+probe = served()
+res["probe"] = {k: float((probe[k] != base[k]).double().sum()) for k in ("lp", "top_v", "top_i")}
+print("probe", res["probe"], flush=True)
+if any(res["probe"].values()):
+    die(f"the probe changed the served logprobs: {res['probe']}")
 
 # (a) + (c): every parameter, unchanged
 t0 = time.time()
