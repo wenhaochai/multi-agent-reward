@@ -1,0 +1,5 @@
+#!/bin/sh
+# `submit` is run by the harness, not by this shell. Send exactly `submit` or `submit <file>` (default solution.cpp)
+# as your whole command, alone: nothing before or after it (no cd, &&, ;, pipes or redirections).
+echo "submit: the harness runs this only as your whole command. Send exactly \`submit\` or \`submit <file>\` (default solution.cpp), alone, with nothing before or after it (no cd, &&, ;, pipes or redirections)." >&2
+exit 2
