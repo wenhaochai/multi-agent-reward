@@ -35,14 +35,19 @@ ray_down() { ray stop --force >/dev/null 2>&1; }   # this PID namespace's Ray on
 SERVE=(--sglang-attention-backend fa3 --sglang-moe-runner-backend triton --sglang-enable-fp32-lm-head
   --sglang-context-length 262144 --sglang-chunked-prefill-size 4096 --sglang-swa-full-tokens-ratio 0.4
   --sglang-mem-fraction-static 0.85 --sglang-grammar-backend flint)
-# the long game as a miles agent on the RL test problem (flint/miles_agent.py), sampling as in the eval
+# the long game as a miles agent on the RL test problem (flint/miles_agent.py), sampling as in the eval; the engines
+# return each token's routed experts (miles sets SGLang's --enable-return-routed-experts with routing replay)
 GAME=(--prompt-data "$OUT/data_p0.jsonl" --input-key prompt --label-key label --metadata-key metadata
   --num-rollout 1 --rollout-batch-size 1 --rollout-temperature 1.0 --rollout-top-p 0.95 --rollout-top-k 20
   --rollout-max-response-len 32768 --max-seq-len 262144
   --custom-generate-function-path miles.rollout.generate_hub.agentic_tool_call.generate
   --custom-agent-function-path flint.miles_agent.run --use-session-server v2 --tito-model default
   --session-message-matcher flint.miles_agent.message_matches
-  --sglang-tool-call-parser flint --sglang-reasoning-parser flint)
+  --sglang-tool-call-parser flint --sglang-reasoning-parser flint
+  --use-rollout-routing-replay --pause-generation-mode in_place)
+# --use-rollout-routing-replay: each token's routed experts, for routing replay in training (R3). Not 'retract' (the
+# default), with which the session server returns every turn's full R3 rows (~1.2 kB per token, the whole context)
+# instead of the new ones; the rollouts here are synchronous, so the pause mode changes nothing else.
 
 rollout() {   # rollout NAME TOKENS SAMPLES LIMIT_S [train.py flags]: one group of SAMPLES episodes, then the check
   local name=$1 tokens=$2 n=$3 limit=$4

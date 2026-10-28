@@ -1,6 +1,7 @@
 """Checks of one miles rollout of the long game (rl/rollout_inner.sh), per episode (one TITO session) against the
 episode's game trace: its samples (one per session-tree leaf) and their tokens, the reward, the loss mask (only Flint's
-completions trained, each once) and the score-centering candidates (miles' own validator). Usage: inspect_rollout.py
+completions trained, each once), the score-centering candidates (miles' own validator) and the routed experts recorded
+for routing replay (rows per token, Flint's 49 layers x top-6; the 2 dense layers route nothing). Usage: inspect_rollout.py
 <run dir> (rollout_0.pt and traces/); prints a table and writes <run dir>/summary.json."""
 import glob
 import json
@@ -52,6 +53,15 @@ for sess, ss in sorted(by.items(), key=lambda kv: str(kv[0])):
         mask = np.asarray(s.loss_mask, dtype=bool)
         trained_roles += int(np.isin(resp[mask], list(role_ids)).sum())
     lp_bad = sum(len(s.rollout_log_probs or []) != s.response_length for s in ss)
+    r3 = [s.rollout_routed_experts for s in ss]
+    have = [x for x in r3 if x is not None]
+    moe = [x[:, 2:, :] for x in have]   # mlp_only_layers = [0, 1]
+    r3_info = {
+        "r3_samples": len(have), "r3_shapes": [list(x.shape) for x in have][:4], "r3_dtype": str(have[0].dtype) if have else None,
+        "r3_rows_minus_tokens": sorted({x.shape[0] - len(s.tokens) for x, s in zip(r3, ss) if x is not None}),
+        "r3_mb": round(sum(x.nbytes for x in have) / 2**20, 1),
+        "r3_moe_out_of_range": int(sum(((m < 0) | (m >= 256)).sum() for m in moe)),
+        "r3_dense_values": sorted({int(v) for x in have for v in np.unique(x[:, :2, :])})[:5]}
     roots = {tuple((s.metadata.get("leaf") or {}).get("path_node_ids", [None]))[:1] for s in ss}
     row = {
         "session": sess, "trace": bool(tr), "aborted": meta.get("flint_aborted"),
@@ -66,7 +76,7 @@ for sess, ss in sorted(by.items(), key=lambda kv: str(kv[0])):
         "trained_role_tokens": trained_roles, "logprob_len_mismatch": lp_bad, "topk": k,
         "topk_errors": topk_errors[:3], "topk_error_count": len(topk_errors),
         "tito_mismatch": sum(bool(s.metadata.get("tito_session_mismatch")) for s in ss),
-        "wall_min": meta.get("fo_lg_wall_min"),
+        "wall_min": meta.get("fo_lg_wall_min"), **r3_info,
     }
     row["expected_leaves"] = 1 + row["trims"] + (row["restarts"] or 0) + row["cut_turns"]
     rows.append(row)
@@ -79,7 +89,12 @@ summary = {
     "generated_tok_per_s": round(gen / (60 * wall), 1) if wall else None,
     "all_rewards_equal_S": all(r["trace"] and r["rewards"] == [r["S"]] for r in rows),
     "trained_role_tokens": sum(r["trained_role_tokens"] for r in rows),
-    "topk_error_count": sum(r["topk_error_count"] for r in rows), "rows": rows}
+    "topk_error_count": sum(r["topk_error_count"] for r in rows),
+    "r3_mb_total": round(sum(r["r3_mb"] for r in rows), 1), "r3_samples": sum(r["r3_samples"] for r in rows),
+    "r3_shapes_first": rows[0]["r3_shapes"] if rows else None, "r3_dtype": rows[0]["r3_dtype"] if rows else None,
+    "r3_rows_minus_tokens": sorted({v for r in rows for v in r["r3_rows_minus_tokens"]}),
+    "r3_moe_out_of_range": sum(r["r3_moe_out_of_range"] for r in rows),
+    "r3_dense_values": sorted({v for r in rows for v in r["r3_dense_values"]}), "rows": rows}
 json.dump(summary, open(os.path.join(d, "summary.json"), "w"), indent=1, default=str)
 print(f"{'session':10} {'S':>6} {'samp':>4} {'exp':>4} {'roots':>5} {'calls':>5} {'cut':>3} {'trim':>4} {'rst':>3} "
       f"{'subs':>4} {'fmt':>3} {'generated':>9} {'trained':>8} {'resp':>8} {'roleTok':>7} {'topkErr':>7} {'wall':>5}")
