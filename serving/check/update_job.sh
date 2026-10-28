@@ -60,8 +60,10 @@ for _ in $(seq 1 80); do
 done
 curl -sf "127.0.0.1:$PORT/health_generate" >/dev/null || { echo "server not ready"; tail -30 "$OUT/server.log"; exit 1; }
 echo "server ready $(date -Is)"
+# NCCL_CUMEM_ENABLE=0 on the trainer, as miles/ray/specs/train.py sets it for its actors: SGLang sets 0 in its own
+# processes, and a communicator whose ranks disagree fails to set up (nccl_diag_job.sh w545: "invalid argument")
 start apptainer exec --nv --home "$TMPDIR" --bind /scratch/gpfs/GROUP --env "CUDA_VISIBLE_DEVICES=${G[2]},${G[3]}" \
-  --env "PYTHONPATH=$HF:$MILES" --env "TMPDIR=$TMPDIR" "$MSIF" \
+  --env "PYTHONPATH=$HF:$MILES" --env "TMPDIR=$TMPDIR" --env NCCL_CUMEM_ENABLE=0 "$MSIF" \
   timeout -s KILL 45m python3 -u $W/serving/check/update_check.py "$SEQS" "http://127.0.0.1:$PORT" "$OUT/update.json" \
   > "$OUT/update.log" 2>&1
 wait "${STARTED[1]}"

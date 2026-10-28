@@ -4,7 +4,10 @@ UUID) and torch / NCCL versions, then sends ONE small tensor (the final norm, re
 session frame through miles' NCCL group (protocols/broadcast.py connect), and checks that a 1000-token prefill is
 bit-identical before and after. The group setup and the broadcast run in a thread, so a server that fails or never
 joins ends this process (exit 2) instead of blocking it; a limit timer ends it after LIMIT_S (exit 3).
-Prints NCCL_DIAG_OK or NCCL_DIAG_FAIL. Usage: nccl_diag.py seqs.json url"""
+Prints NCCL_DIAG_OK or NCCL_DIAG_FAIL. Usage: nccl_diag.py seqs.json url
+Result (w545): the failure is NCCL_CUMEM_ENABLE disagreeing across the ranks of one communicator. SGLang sets 0 in its
+own processes; a trainer left at NCCL's default (1) fails in separate apptainer instances and in one alike, and with 0
+(as miles/ray/specs/train.py sets it for its actors) the update goes through and the prefill stays bit-identical."""
 import argparse
 import json
 import os
