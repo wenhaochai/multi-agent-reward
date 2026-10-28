@@ -2,11 +2,11 @@
 1. attention: Transformer Engine's sink attention (``te``) vs ``eager`` on random packed documents (32/4 heads of 128,
    window 513 and full, Flint's real sinks), forward and gradients of q, k, v and the sinks; then one 65,536-token
    document through ``te`` forward + backward (time, memory);
-2. experts: miles' fused Triton experts (``fused_flint_experts``) vs the per-expert reference on a real layer's
-   weights and router, forward and gradients of the input, the router and two experts;
+2. experts: ``grouped_experts`` (torch._grouped_mm) vs the per-expert reference on a real layer's weights and
+   router, forward and gradients of the input, the router and two experts;
 3. head: ``head_log_probs`` on 65,536 rows at Flint's vocabulary (time, memory) and against log_softmax on 2,048;
 4. model: the whole Flint on a real 8k-token sequence (build_p0.py's output), eager path vs training path (te +
-   fused experts), per-token log-probs of the generated tokens and gradients of a few parameters.
+   grouped experts), per-token log-probs of the generated tokens and gradients of a few parameters.
 Prints one line per comparison: max and mean absolute difference, and the reference's scale.
 Usage: kernel_check.py p0_seqs.json"""
 import json
@@ -17,7 +17,6 @@ import torch
 
 import flint_hf.modeling_flint as M
 from flint_hf import FlintConfig, load_flint
-from miles.backends.fsdp_utils.models.flint import fused_flint_experts
 
 MODEL = "/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint"
 torch.manual_seed(0)
@@ -89,7 +88,7 @@ def check_experts(dev):
     x = (torch.randn(8192, cfg.hidden_size, device=dev) * 0.5).bfloat16()
     gout = torch.randn(8192, cfg.hidden_size, device=dev).bfloat16()
     res = {}
-    for name, fn in (("reference", M.experts_reference), ("fused", fused_flint_experts)):
+    for name, fn in (("reference", M.experts_reference), ("grouped", M.grouped_experts)):
         block.experts_fn = fn
         block.zero_grad(set_to_none=True)
         xi = x.clone().requires_grad_()
@@ -98,7 +97,7 @@ def check_experts(dev):
         e0 = int(block.gate(x)[2][0, 0])
         res[name] = (out.detach(), xi.grad, block.gate.weight.grad.clone(),
                      block.experts[e0].down_proj.weight.grad.clone(), block.experts[e0].gate_proj.weight.grad.clone())
-    for n, a, b in zip(("out", "dx", "drouter", "dexpert.down", "dexpert.gate"), res["fused"], res["reference"]):
+    for n, a, b in zip(("out", "dx", "drouter", "dexpert.down", "dexpert.gate"), res["grouped"], res["reference"]):
         diff(f"experts {n} (layer {layer}, 8192 tokens)", a, b)
 
 
@@ -153,7 +152,7 @@ def check_model(seqs_path, devices):
             if isinstance(m, M.FlintAttention):
                 m.attn_impl = "eager" if path == "eager" else "te"
             if isinstance(m, M.FlintSparseMoeBlock):
-                m.experts_fn = M.experts_reference if path == "eager" else fused_flint_experts
+                m.experts_fn = M.experts_reference if path == "eager" else M.grouped_experts
         for p in probe.values():
             p.grad = None
         for d in devices:

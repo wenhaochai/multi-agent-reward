@@ -18,8 +18,8 @@ follow the kit's validated serving path (FA3 attention, Triton MoE, FlashInfer C
 Two parts are pluggable for the trainer. Attention: ``ATTENTION_FUNCTIONS[FlintAttention.attn_impl]``, called as
 ``fn(q, k, v, sinks, scale, window, cu_seqlens)``; ``"eager"`` is the exact fp32 reference used for parity, ``"te"``
 Transformer Engine's fused attention for training. Experts: ``FlintSparseMoeBlock.experts_fn(experts, x, weights,
-ids)``, separate from the routing in ``FlintTopKRouter``, whose ``select`` is the expert-selection top-k a
-routing-replay hook rebinds.
+ids)``, ``experts_reference`` (one expert at a time) or ``grouped_experts`` (grouped GEMMs, for training), separate
+from the routing in ``FlintTopKRouter``, whose ``select`` is the expert-selection top-k a routing-replay hook rebinds.
 
 The reference computes in fp32, or in the input dtype when that is wider (float64 for gradient checks). A trainer
 that needs only some next-token log-probabilities passes ``head_rows`` and ``head_ids`` to ``FlintForCausalLM``: the
@@ -218,6 +218,23 @@ def experts_reference(experts: nn.ModuleList, x: torch.Tensor, weights: torch.Te
             sel, t = order[start:start + n], tok[start:start + n]
             out.index_add_(0, t, experts[e](x[t]).to(out.dtype) * flat_w[sel, None])
             start += n
+    return out.to(x.dtype)
+
+
+def grouped_experts(experts: nn.ModuleList, x: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor):
+    """The experts for training: the token-expert pairs sorted by expert through two grouped GEMMs
+    (torch._grouped_mm, bf16 with fp32 accumulation, differentiable), weighted and summed in fp32 like
+    ``experts_reference``. The per-expert weights are stacked per call, as the checkpoint keeps one module per expert."""
+    w13 = torch.stack([torch.cat([e.gate_proj.weight, e.up_proj.weight], dim=0) for e in experts])   # [E, 2I, H]
+    w2 = torch.stack([e.down_proj.weight for e in experts])                                          # [E, H, I]
+    flat = ids.flatten()
+    order = torch.argsort(flat, stable=True)
+    tok = order // ids.shape[1]
+    offs = torch.cumsum(torch.bincount(flat, minlength=len(experts)), dim=0).to(torch.int32)
+    gate, up = torch._grouped_mm(x[tok], w13.transpose(1, 2), offs=offs).chunk(2, dim=-1)
+    y = torch._grouped_mm(F.silu(gate) * up, w2.transpose(1, 2), offs=offs)
+    out = torch.zeros(x.shape, dtype=acc_dtype(x.dtype), device=x.device)
+    out.index_add_(0, tok, y.to(out.dtype) * weights.flatten()[order, None])
     return out.to(x.dtype)
 
 

@@ -1,8 +1,8 @@
 """CPU gradient checks of flint_hf in float64: torch.autograd.gradcheck over every parameter of a tiny random Flint
 (a dense layer with a sliding window and RoPE, then an MoE layer with full attention, no RoPE, the sink, the shared
 expert and sigmoid top-k routing), scored through the chunked head (head_rows / head_ids, the trainer's path) on two
-packed documents; and head_log_probs against an explicit log_softmax (values, gradients, entropy, empty slots,
-repeated ids, temperature). In miles-v0.1.3.sif: PYTHONPATH=. python3 tests/test_flint_hf_grad.py"""
+packed documents; head_log_probs against an explicit log_softmax (values, gradients, entropy, empty slots, repeated
+ids, temperature); and grouped_experts against experts_reference. In miles-v0.1.3.sif: PYTHONPATH=. python3 tests/test_flint_hf_grad.py"""
 import torch
 from torch.func import functional_call
 
@@ -85,6 +85,27 @@ def test_head_rows_equal_full_logits():
     others[rows] = False
     assert out[others].abs().max() == 0
     print("head_rows: the scored rows equal the full logits' log_softmax, the other rows are 0")
+
+
+def test_grouped_experts_match_reference():
+    cfg = FlintConfig(hidden_size=64, moe_intermediate_size=32, num_experts=8, num_experts_per_tok=2,
+                      shared_expert_intermediate_size=16, num_hidden_layers=1, layer_types=["full_attention"])
+    torch.manual_seed(2)
+    block = M.FlintSparseMoeBlock(cfg)   # float32: torch._grouped_mm takes no float64
+    for p in block.parameters():
+        p.data.normal_(0, 0.1)
+    x = torch.randn(50, 64, requires_grad=True)
+    res = []
+    for fn in (M.experts_reference, M.grouped_experts):
+        block.experts_fn = fn
+        block.zero_grad(set_to_none=True)
+        x.grad = None
+        out = block(x)
+        out.pow(2).sum().backward()
+        res.append([out.detach(), x.grad.clone()] + [p.grad.clone() for p in block.parameters()])
+    for a, b in zip(*res):
+        assert torch.allclose(a, b, atol=1e-6, rtol=1e-5)
+    print("grouped_experts: output and every gradient equal experts_reference's (float32, 1e-6)")
 
 
 if __name__ == "__main__":
