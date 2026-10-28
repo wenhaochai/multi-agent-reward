@@ -16,9 +16,14 @@ follow the kit's validated serving path (FA3 attention, Triton MoE, FlashInfer C
 4. LM head in fp32.
 
 Two parts are pluggable for the trainer. Attention: ``ATTENTION_FUNCTIONS[FlintAttention.attn_impl]``, called as
-``fn(q, k, v, sinks, scale, window, cu_seqlens)``; ``"eager"`` is the exact fp32 reference used for parity. Experts:
-``FlintSparseMoeBlock.experts_fn(experts, x, weights, ids)``, separate from the routing in ``FlintTopKRouter``, whose
-``select`` is the expert-selection top-k a routing-replay hook rebinds.
+``fn(q, k, v, sinks, scale, window, cu_seqlens)``; ``"eager"`` is the exact fp32 reference used for parity, ``"te"``
+Transformer Engine's fused attention for training. Experts: ``FlintSparseMoeBlock.experts_fn(experts, x, weights,
+ids)``, separate from the routing in ``FlintTopKRouter``, whose ``select`` is the expert-selection top-k a
+routing-replay hook rebinds.
+
+The reference computes in fp32, or in the input dtype when that is wider (float64 for gradient checks). A trainer
+that needs only some next-token log-probabilities passes ``head_rows`` and ``head_ids`` to ``FlintForCausalLM``: the
+fp32 head is then applied chunk by chunk, and no [tokens, vocab] tensor is kept (see ``head_log_probs``).
 
 Inputs are one packed sequence, as miles' FSDP backend (v0.1.3) sends them: ``input_ids`` [1, T], ``position_ids``
 [1, T] restarting at 0 at each document, ``attention_mask`` None, and optionally the document boundaries as HF's
@@ -42,6 +47,12 @@ from .configuration_flint import FlintConfig
 
 SLIDING_ATTENTION = "sliding_attention"
 SCORE_ELEMS = 1 << 28   # fp32 elements in one chunk of attention scores (1 GiB)
+HEAD_CHUNK = 2048       # rows of the fp32 head per chunk in head_log_probs (1.2 GiB of logits at Flint's vocabulary)
+
+
+def acc_dtype(dtype: torch.dtype) -> torch.dtype:
+    """The reference's compute dtype: fp32, or the input's when wider."""
+    return torch.promote_types(dtype, torch.float32)
 
 
 class FlintRMSNorm(nn.Module):
@@ -54,12 +65,13 @@ class FlintRMSNorm(nn.Module):
         self.eps = eps
 
     def _norm(self, s: torch.Tensor, dtype) -> torch.Tensor:
-        return (s * torch.rsqrt(s.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight.float()).to(dtype)
+        return (s * torch.rsqrt(s.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight.to(s.dtype)).to(dtype)
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None):
+        acc = acc_dtype(x.dtype)
         if residual is None:
-            return self._norm(x.float(), x.dtype)
-        s = x.float() + residual.float()
+            return self._norm(x.to(acc), x.dtype)
+        s = x.to(acc) + residual.to(acc)
         return self._norm(s, x.dtype), s.to(x.dtype)
 
 
@@ -71,7 +83,7 @@ def rope_cos_sin(position_ids: torch.Tensor, head_dim: int, theta: float):
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """Neox-style rotation (first half against second half) of [T, H, D], in fp32."""
-    x1, x2 = x.float().chunk(2, dim=-1)
+    x1, x2 = x.to(acc_dtype(x.dtype)).chunk(2, dim=-1)
     c, s = cos[:, None, :], sin[:, None, :]
     return torch.cat([x1 * c - x2 * s, x2 * c + x1 * s], dim=-1).to(x.dtype)
 
@@ -82,10 +94,11 @@ def eager_sink_attention(q, k, v, sinks, scale: float, window: int | None, cu_se
     keys before it (None: every earlier key of its document); cu_seqlens [n + 1]: document boundaries."""
     T, H, D = q.shape
     rep = H // k.shape[1]
-    qf = q.float().transpose(0, 1)                                   # [H, T, D]
-    kf = k.float().repeat_interleave(rep, dim=1).transpose(0, 1)
-    vf = v.float().repeat_interleave(rep, dim=1).transpose(0, 1)
-    sink = sinks.float().view(H, 1, 1)
+    acc = acc_dtype(q.dtype)
+    qf = q.to(acc).transpose(0, 1)                                   # [H, T, D]
+    kf = k.to(acc).repeat_interleave(rep, dim=1).transpose(0, 1)
+    vf = v.to(acc).repeat_interleave(rep, dim=1).transpose(0, 1)
+    sink = sinks.to(acc).view(H, 1, 1)
     out = []
     bounds = cu_seqlens.tolist()
     for a, b in zip(bounds[:-1], bounds[1:]):
@@ -103,7 +116,33 @@ def eager_sink_attention(q, k, v, sinks, scale: float, window: int | None, cu_se
     return torch.cat(out, dim=1).transpose(0, 1).to(q.dtype)
 
 
-ATTENTION_FUNCTIONS = {"eager": eager_sink_attention}
+_TE_ATTENTION: dict = {}
+
+
+def te_sink_attention(q, k, v, sinks, scale: float, window: int | None, cu_seqlens: torch.Tensor):
+    """Transformer Engine's fused attention (cuDNN) on packed documents, for training. Its ``softmax_type="learnable"``
+    puts exp(sinks[h]) in the denominator and carries no value, as Flint's sink; its window (left, 0) attends to the
+    query and the ``left`` keys before it, so Flint's window (which counts the query) is (window - 1, 0). The sinks
+    enter through ``functional_call``, so they stay this model's parameter and get their gradient. q [T, H, D];
+    k, v [T, KV, D] in bf16."""
+    from transformer_engine.pytorch import DotProductAttention
+
+    T, H, D = q.shape
+    key = (H, k.shape[1], D, scale, window, q.device)
+    if key not in _TE_ATTENTION:
+        _TE_ATTENTION[key] = DotProductAttention(
+            H, D, num_gqa_groups=k.shape[1], attention_dropout=0.0, qkv_format="thd",
+            attn_mask_type="padding_causal", window_size=(window - 1, 0) if window else (-1, 0),
+            softmax_scale=scale, softmax_type="learnable").to(q.device)
+    cu = cu_seqlens.to(device=q.device, dtype=torch.int32)
+    longest = int((cu[1:] - cu[:-1]).max())
+    out = torch.func.functional_call(
+        _TE_ATTENTION[key], {"softmax_offset": sinks.float()}, (q, k, v),
+        {"cu_seqlens_q": cu, "cu_seqlens_kv": cu, "max_seqlen_q": longest, "max_seqlen_kv": longest})
+    return out.view(T, H, D)
+
+
+ATTENTION_FUNCTIONS = {"eager": eager_sink_attention, "te": te_sink_attention}
 
 
 class FlintAttention(nn.Module):
@@ -161,7 +200,7 @@ class FlintTopKRouter(nn.Module):
 
     def forward(self, x: torch.Tensor):
         logits = F.linear(x, self.weight)
-        scores = torch.sigmoid(logits.float())
+        scores = torch.sigmoid(logits.to(acc_dtype(logits.dtype)))
         ids = self.select(scores.detach() + self.expert_bias, self.top_k)
         w = scores.gather(1, ids)
         return logits, w / (w.sum(dim=-1, keepdim=True) + 1e-20), ids
@@ -169,7 +208,7 @@ class FlintTopKRouter(nn.Module):
 
 def experts_reference(experts: nn.ModuleList, x: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor):
     """Each expert on its tokens, weighted outputs summed in fp32, cast back to x's dtype."""
-    out = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+    out = torch.zeros(x.shape, dtype=acc_dtype(x.dtype), device=x.device)
     flat_ids, flat_w = ids.flatten(), weights.flatten()
     order = torch.argsort(flat_ids, stable=True)
     tok = order // ids.shape[1]
@@ -177,7 +216,7 @@ def experts_reference(experts: nn.ModuleList, x: torch.Tensor, weights: torch.Te
     for e, n in enumerate(torch.bincount(flat_ids, minlength=len(experts)).tolist()):
         if n:
             sel, t = order[start:start + n], tok[start:start + n]
-            out.index_add_(0, t, experts[e](x[t]).float() * flat_w[sel, None])
+            out.index_add_(0, t, experts[e](x[t]).to(out.dtype) * flat_w[sel, None])
             start += n
     return out.to(x.dtype)
 
@@ -216,6 +255,57 @@ class FlintDecoderLayer(GradientCheckpointingLayer):
         hidden = self.self_attn(hidden, rope, cu_seqlens)
         hidden, residual = self.post_attention_layernorm(hidden, residual)
         return self.mlp(hidden), residual
+
+
+class _HeadLogProbs(torch.autograd.Function):
+    """log_softmax(hidden @ weight.T / temperature) at ``ids``, in fp32 (the kit's fp32 LM head), chunk by chunk:
+    the forward keeps only each row's log-sum-exp and the backward recomputes the chunk's logits, so memory does not
+    grow with rows x vocabulary. hidden [R, H]; weight [V, H]; ids [R, C], -1 for an empty slot (log-prob 0, no
+    gradient). With ``with_entropy`` it also returns each row's entropy, without a gradient."""
+
+    @staticmethod
+    def forward(ctx, hidden, weight, ids, temperature: float, chunk: int, with_entropy: bool):
+        acc = acc_dtype(hidden.dtype)
+        w = weight.to(acc)
+        valid, safe = ids >= 0, ids.clamp(min=0)
+        out = torch.zeros(ids.shape, dtype=acc, device=hidden.device)
+        lse = torch.empty(ids.shape[0], dtype=acc, device=hidden.device)
+        entropy = torch.empty(ids.shape[0] if with_entropy else 0, dtype=acc, device=hidden.device)
+        for s in range(0, ids.shape[0], chunk):
+            z = torch.matmul(hidden[s:s + chunk].to(acc), w.t()) / temperature           # [c, V]
+            lse[s:s + chunk] = torch.logsumexp(z, dim=-1)
+            out[s:s + chunk] = torch.where(valid[s:s + chunk], z.gather(1, safe[s:s + chunk]) - lse[s:s + chunk, None], 0.0)
+            if with_entropy:
+                p = torch.softmax(z, dim=-1)
+                entropy[s:s + chunk] = lse[s:s + chunk] - (p * z).sum(-1)
+        ctx.save_for_backward(hidden, weight, ids, lse)
+        ctx.temperature, ctx.chunk = temperature, chunk
+        ctx.mark_non_differentiable(entropy)
+        return out, entropy
+
+    @staticmethod
+    def backward(ctx, grad, _grad_entropy):
+        hidden, weight, ids, lse = ctx.saved_tensors
+        acc = acc_dtype(hidden.dtype)
+        w = weight.to(acc)
+        grad = grad.to(acc).masked_fill(ids < 0, 0.0)
+        safe = ids.clamp(min=0)
+        grad_hidden = torch.empty_like(hidden)
+        grad_weight = torch.zeros_like(w)
+        for s in range(0, ids.shape[0], ctx.chunk):
+            h = hidden[s:s + ctx.chunk].to(acc)
+            g = grad[s:s + ctx.chunk]
+            dz = torch.exp(torch.matmul(h, w.t()) / ctx.temperature - lse[s:s + ctx.chunk, None])   # softmax
+            dz.mul_(-g.sum(-1, keepdim=True)).scatter_add_(1, safe[s:s + ctx.chunk], g).div_(ctx.temperature)
+            grad_hidden[s:s + ctx.chunk] = torch.matmul(dz, w).to(hidden.dtype)
+            grad_weight.addmm_(dz.t(), h)
+        return grad_hidden, grad_weight.to(weight.dtype), None, None, None, None
+
+
+def head_log_probs(hidden, weight, ids, temperature: float = 1.0, chunk: int = HEAD_CHUNK, with_entropy: bool = False):
+    """Fp32 [R, C] log-probabilities at ``ids`` (and [R] entropies) from final hidden states [R, H]; see
+    ``_HeadLogProbs``."""
+    return _HeadLogProbs.apply(hidden, weight, ids, float(temperature), int(chunk), bool(with_entropy))
 
 
 class FlintPreTrainedModel(PreTrainedModel):
@@ -283,12 +373,25 @@ class FlintForCausalLM(FlintPreTrainedModel):
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:
         """The fp32 LM head (the kit's --enable-fp32-lm-head)."""
         w = self.lm_head.weight
-        return torch.matmul(hidden.to(w.device).float(), w.float().t())
+        acc = acc_dtype(hidden.dtype)
+        return torch.matmul(hidden.to(w.device, acc), w.to(acc).t())
 
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor | None = None,
-                attention_mask: torch.Tensor | None = None, **kwargs) -> CausalLMOutputWithPast:
+                attention_mask: torch.Tensor | None = None, head_rows: torch.Tensor | None = None,
+                head_ids: torch.Tensor | None = None, head_temperature: float = 1.0, head_entropy: bool = False,
+                **kwargs) -> CausalLMOutputWithPast:
+        """Without ``head_rows``: the full fp32 logits [1, T, vocab]. With ``head_rows`` [R] (positions in the packed
+        sequence) and ``head_ids`` [R, C]: ``logits`` is [1, T, C] holding the log-probabilities of ``head_ids`` at
+        those rows (0 elsewhere), plus a last column with each row's entropy when ``head_entropy``. The log-probs run
+        inside this forward, where FSDP has the LM head gathered."""
         hidden = self.model(input_ids, position_ids, attention_mask, **kwargs)
-        return CausalLMOutputWithPast(logits=self.logits(hidden)[None])
+        if head_rows is None:
+            return CausalLMOutputWithPast(logits=self.logits(hidden)[None])
+        lp, entropy = head_log_probs(hidden[head_rows], self.lm_head.weight, head_ids.to(hidden.device),
+                                     head_temperature, with_entropy=head_entropy)
+        rows = torch.cat([lp, entropy[:, None]], dim=1) if head_entropy else lp
+        out = rows.new_zeros(hidden.shape[0], rows.shape[1]).index_copy(0, head_rows.to(hidden.device), rows)
+        return CausalLMOutputWithPast(logits=out[None])
 
     def token_logprobs(self, hidden: torch.Tensor, targets: torch.Tensor, topk: int = 0, chunk: int = 2048):
         """log p(targets[i] | hidden[i]) without the full [T, vocab] logits; with topk, also the top-k head
