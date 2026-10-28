@@ -24,6 +24,7 @@ trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$TMPDIR"' EXIT
 IFS=, read -ra G <<< "${CUDA_VISIBLE_DEVICES:?no GPUs}"
 [ "${#G[@]}" -eq 4 ] || { echo "need 4 GPUs, got ${G[*]}"; exit 1; }
 echo "job $JID host $(hostname) commit $(git -C $W rev-parse HEAD) GPUs ${G[*]} miles sif $MSIF"
+declare -A SRV
 BASEP=$((20000 + ($(echo "$JID" | tr -dc 0-9 | tail -c 6) % 500) * 20))
 serve() {   # $1 name, $2 sif, $3 gpus, $4 port, $5 nccl port, $6 extra PYTHONPATH, $7 triton cache
   APPTAINERENV_CUDA_VISIBLE_DEVICES=$3 APPTAINERENV_MODEL=$MODEL APPTAINERENV_PORT=$4 APPTAINERENV_TMPDIR=$TMPDIR \
@@ -31,9 +32,14 @@ serve() {   # $1 name, $2 sif, $3 gpus, $4 port, $5 nccl port, $6 extra PYTHONPA
     apptainer exec --nv --home "$TMPDIR" --bind /scratch/gpfs/GROUP "$2" \
     bash "$MODEL/sglang/serve_h200.sh" --tp-size 2 --mem-fraction-static 0.85 --nccl-port "$5" --host 127.0.0.1 \
     > "$OUT/server_$1.log" 2>&1 &
+  SRV[$1]=$!
 }
 query() {   # $1 name, $2 port, $3 extra flag
-  for _ in $(seq 1 90); do curl -sf "127.0.0.1:$2/health_generate" >/dev/null 2>&1 && break; sleep 20; done
+  for _ in $(seq 1 90); do
+    curl -sf "127.0.0.1:$2/health_generate" >/dev/null 2>&1 && break
+    kill -0 "${SRV[$1]}" 2>/dev/null || break   # the server exited
+    sleep 20
+  done
   curl -sf "127.0.0.1:$2/health_generate" >/dev/null \
     || { echo "server $1 not ready"; tail -30 "$OUT/server_$1.log"; return 1; }
   echo "server $1 ready $(date -Is)"
@@ -46,8 +52,10 @@ serve A "$FSIF" "${G[0]},${G[1]}" $BASEP $((BASEP + 1)) "" $P/flint-eval/triton_
 serve C "$MSIF" "${G[2]},${G[3]}" $((BASEP + 2)) $((BASEP + 3)) /scratch/gpfs/GROUP/USER/tmp/flint_sglang_miles \
   $TMPDIR/triton_C
 query C $((BASEP + 2)) "" &
+QC=$!
 query A $BASEP --floor
-wait
+wait $QC
+kill "${SRV[@]}" 2>/dev/null
 grep -m3 -E "Traceback|Error" "$OUT/server_C.log"
 [ -f "$OUT/sglang_A.pt" ] || { echo "PARITY_SGLANG_FAIL: no results from A"; exit 1; }
 [ -f "$OUT/sglang_C.pt" ] && echo "C_SERVES: miles SGLang served Flint" || echo "C_FAILS: see $OUT/server_C.log"
