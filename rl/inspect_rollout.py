@@ -47,10 +47,11 @@ for sess, ss in sorted(by.items(), key=lambda kv: str(kv[0])):
                 validate_rollout_topk_logprobs_sample(s, k)
             except ValueError as e:
                 topk_errors.append(str(e))
-    trained_roles = 0
+    trained_roles = 0   # role tokens trained anywhere but at a sample's end (its last turn keeps its stop token)
     for s in ss:
         resp = np.asarray(s.tokens[len(s.tokens) - s.response_length:])
         mask = np.asarray(s.loss_mask, dtype=bool)
+        mask[-1:] = False
         trained_roles += int(np.isin(resp[mask], list(role_ids)).sum())
     lp_bad = sum(len(s.rollout_log_probs or []) != s.response_length for s in ss)
     r3 = [s.rollout_routed_experts for s in ss]
