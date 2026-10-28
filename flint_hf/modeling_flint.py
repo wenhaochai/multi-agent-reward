@@ -344,6 +344,8 @@ class FlintPreTrainedModel(PreTrainedModel):
 
 
 class FlintModel(FlintPreTrainedModel):
+    pipeline = False   # True: the layers sit on several devices (load_flint)
+
     def __init__(self, config: FlintConfig):
         super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -356,8 +358,10 @@ class FlintModel(FlintPreTrainedModel):
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor | None = None,
                 attention_mask: torch.Tensor | None = None, cu_seq_lens_q: torch.Tensor | None = None,
                 **kwargs) -> torch.Tensor:
-        """Final hidden states [T, hidden] of one packed sequence. The decoder layers may sit on several devices (a
-        manual pipeline, see load_flint); the activations follow them."""
+        """Final hidden states [T, hidden] of one packed sequence. In a manual pipeline (``load_flint`` sets
+        ``pipeline``) the decoder layers sit on several devices and the activations follow them; otherwise everything
+        stays on the input's device (FSDP gathers each layer's parameters there, and with CPU offload a layer's
+        parameters report the CPU until its own forward runs)."""
         if attention_mask is not None:
             raise ValueError("Flint takes packed sequences: attention_mask must be None")
         ids = input_ids.reshape(-1)
@@ -371,14 +375,14 @@ class FlintModel(FlintPreTrainedModel):
             cu_seqlens = torch.cat([starts, starts.new_tensor([ids.numel()])])
         hidden, residual, per_device = self.embed_tokens(ids), None, {}
         for layer in self.layers:
-            dev = layer.input_layernorm.weight.device
+            dev = layer.input_layernorm.weight.device if self.pipeline else ids.device
             if dev not in per_device:
                 p = pos.to(dev)
                 per_device[dev] = (rope_cos_sin(p, self.config.head_dim, self.rope_theta), cu_seqlens.to(dev))
             if hidden.device != dev:
                 hidden, residual = hidden.to(dev), (residual.to(dev) if residual is not None else None)
             hidden, residual = layer(hidden, residual, *per_device[dev])
-        dev = self.norm.weight.device
+        dev = self.norm.weight.device if self.pipeline else ids.device
         return self.norm(hidden.to(dev), residual.to(dev))[0]
 
 
@@ -467,4 +471,5 @@ def load_flint(path: str, devices: list[str], dtype=torch.bfloat16) -> FlintForC
     for name, buf in list(model.named_buffers()):
         owner, attr = name.rsplit(".", 1)
         setattr(model.get_submodule(owner), attr, torch.zeros(buf.shape, dtype=buf.dtype, device=device_of(name)))
+    model.model.pipeline = True
     return model
