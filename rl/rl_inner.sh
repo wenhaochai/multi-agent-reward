@@ -2,7 +2,7 @@
 # Inside miles-v0.1.3.sif with a PID namespace of its own (rl/rl_job.sh): a job-private Ray head on job-derived ports,
 # started with the run's environment (Ray's workers, the agent processes among them, take theirs from it), then miles'
 # train.py. miles: our fork (branch flint-grpo of wenhaochai/miles-private, worktree $MILES); the training model is
-# flint_hf from this repository. Usage: rl_inner.sh test2|run20|args; env JID, OUT, PKG (the built Flint plugin),
+# flint_hf from this repository. Usage: rl_inner.sh smoke|test2|run20|args; env JID, OUT, PKG (the built Flint plugin),
 # TMPDIR. Mode args: the argument check alone, off GPU.
 set -uo pipefail
 : "${JID:?}" "${OUT:?}" "${PKG:?}" "${TMPDIR:?}"
@@ -98,6 +98,10 @@ trap 'ray stop --force >/dev/null 2>&1' EXIT   # this PID namespace's Ray only
 
 t0=$SECONDS
 case "$MODE" in
+  smoke)   # the same path, short: 2 steps of 8 episodes x 8k tokens, the context cut to 20k characters (trims happen),
+    # no actor save: rollout, log_rollout (check, probe), training step, weight sync, rollout 2, probe change
+    export MA_LG_TOKENS=8000 MA_LG_CTX_CHARS=20000
+    python3 "$MILES/train.py" "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" --colocate --num-rollout 2 > "$OUT/train.log" 2>&1 ;;
   test2) python3 "$MILES/train.py" "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RL[@]}" --num-rollout 2 > "$OUT/train.log" 2>&1 ;;
   run20) python3 "$MILES/train.py" "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RL[@]}" --num-rollout 20 > "$OUT/train.log" 2>&1 ;;
 esac

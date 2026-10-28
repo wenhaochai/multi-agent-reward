@@ -103,21 +103,54 @@ def drop_failed_groups(args, data) -> None:
                 s.remove_sample = True
 
 
-def _probe(args, ids: list[int]) -> list[float]:
-    """The served log-probs of ``ids`` (each token given the ones before it), from an engine behind miles' router."""
+def _post(args, path: str, body: dict) -> tuple[int, object]:
+    """POST JSON to miles' router (it proxies to an engine): (status, the parsed reply or the error body as text)."""
+    import urllib.error
     import urllib.request
 
-    body = {"input_ids": ids, "sampling_params": {"max_new_tokens": 1, "temperature": 0.0}, "return_logprob": True,
-            "logprob_start_len": 0}
-    req = urllib.request.Request(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate",
+    req = urllib.request.Request(f"http://{args.sglang_router_ip}:{args.sglang_router_port}{path}",
                                  data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=600) as r:
-        out = json.loads(r.read())
-    return [x[0] for x in out["meta_info"]["input_token_logprobs"][1:]]
+    try:
+        with urllib.request.urlopen(req, timeout=600) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(errors="replace")[:2000]
+
+
+def _probe(args, ids: list[int], messages: list) -> dict:
+    """What the engines serve now: the log-probs of ``ids`` (each token given the ones before it, /generate), or, if
+    /generate refuses the request, the top-20 log-probs of the first greedy token after ``messages``
+    (/v1/chat/completions, the agents' endpoint). Both are deterministic for fixed weights."""
+    status, out = _post(args, "/generate", {"input_ids": ids, "sampling_params": {"max_new_tokens": 1, "temperature": 0.0},
+                                            "return_logprob": True, "logprob_start_len": 0})
+    if status == 200:
+        return {"kind": "generate", "lp": [x[0] for x in out["meta_info"]["input_token_logprobs"][1:]]}
+    refused = f"/generate {status}: {out}"
+    status, out = _post(args, "/v1/chat/completions", {"model": "default", "messages": messages, "max_tokens": 1,
+                                                       "temperature": 0.0, "logprobs": True, "top_logprobs": 20})
+    if status != 200:
+        raise RuntimeError(f"probe: {refused}; /v1/chat/completions {status}: {out}")
+    top = out["choices"][0]["logprobs"]["content"][0]["top_logprobs"]
+    return {"kind": "chat", "top": {x["token"]: x["logprob"] for x in top}, "generate_refused": refused}
+
+
+def _probe_diffs(a: dict, b: dict) -> list[float]:
+    if a["kind"] == "generate":
+        return [abs(x - y) for x, y in zip(a["lp"], b["lp"])]
+    return [abs(a["top"][k] - b["top"][k]) for k in a["top"] if k in b["top"]]
 
 
 def log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time) -> bool:
-    """miles' rollout log hook (--custom-rollout-log-function-path flint.miles_agent.log_rollout) for the RL runs
+    """miles' rollout log hook; any failure ends the run as a RuntimeError with a plain message (Ray pickles it to the
+    driver; w606's urllib HTTPError held an open response and could not be pickled)."""
+    try:
+        return _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
+    except Exception as e:
+        raise RuntimeError(f"log_rollout, rollout {rollout_id}: {type(e).__name__}: {e}") from None
+
+
+def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time) -> bool:
+    """The rollout log hook (--custom-rollout-log-function-path flint.miles_agent.log_rollout) for the RL runs
     (rl/rl_inner.sh). After each rollout, in $MA_RL_OUT/r<rollout_id>/, where miles saved the rollout (rollout.pt):
     - the episodes' traces move in from $MA_AG_TRACE_DIR (the agents append there; the next rollout starts it anew);
     - rl/inspect_rollout.py checks the samples against the traces; a failed check raises, which ends the run, as does
@@ -142,15 +175,17 @@ def log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time) 
     if not os.path.exists(ids_path):
         json.dump([int(t) for t in samples[0].tokens[:4096]], open(ids_path, "w"))
     ids = json.load(open(ids_path))
-    probe = [_probe(args, ids), _probe(args, ids)]
+    messages = json.loads(open(os.path.join(out, "data_p0.jsonl")).readline())["prompt"]
+    probe = [_probe(args, ids, messages), _probe(args, ids, messages)]
     json.dump(probe, open(os.path.join(d, "probe.json"), "w"))
-    rec = {"rollout_id": rollout_id, "rollout_s": round(rollout_time, 1),
-           "probe_repeat_max_abs": max(abs(a - b) for a, b in zip(*probe))}
+    rec = {"rollout_id": rollout_id, "rollout_s": round(rollout_time, 1), "probe_kind": probe[0]["kind"],
+           "probe_repeat_max_abs": max(_probe_diffs(*probe), default=None)}
+    if "generate_refused" in probe[0]:
+        rec["probe_generate_refused"] = probe[0]["generate_refused"]
     prev = os.path.join(out, f"r{rollout_id - 1}", "probe.json")
-    if os.path.exists(prev):
-        p0 = json.load(open(prev))[0]
-        diffs = [abs(a - b) for a, b in zip(p0, probe[0])]
-        rec |= {"probe_change_mean_abs": sum(diffs) / len(diffs), "probe_change_max_abs": max(diffs)}
+    if os.path.exists(prev) and json.load(open(prev))[0]["kind"] == probe[0]["kind"]:
+        diffs = _probe_diffs(json.load(open(prev))[0], probe[0])
+        rec |= {"probe_change_mean_abs": sum(diffs) / max(len(diffs), 1), "probe_change_max_abs": max(diffs, default=None)}
 
     first = {}   # one sample per episode: its reward is the episode's S, its metadata the episode's numbers
     for s in samples:
