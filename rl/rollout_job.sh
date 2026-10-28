@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH --job-name=flint-rollout
-#SBATCH --gres=gpu:8
-#SBATCH --mem=480G
+#SBATCH --gres=gpu:4
+#SBATCH --mem=240G
 #SBATCH --time=03:00:00
 #SBATCH --comment=fetchable
 #SBATCH --output=/scratch/gpfs/GROUP/USER/tmp/flint_s5a/logs/%x-%j.out
 #FETCHABLE
-# Long-game rollouts of Flint through miles v0.1.3, rollout only, on 8 GPUs (4 engines at TP2). Usage: rollout_job.sh
-# probe|full (wq --prio 10).
-#   probe  miles' GPU TITO check for Flint, then 2 episodes of 8k tokens on the RL test problem with the context cut to
+# Long-game rollouts of Flint through miles v0.1.3, rollout only, on 4 GPUs (2 engines at TP2, Flint's H100 layout; 8
+# concurrent episodes, 4 per engine). Usage: rollout_job.sh probe|full (wq --prio 10).
+#   probe  miles' GPU TITO check for Flint, then 8 episodes of 8k tokens on the RL test problem with the context cut to
 #          20k characters (trims within the episode): the whole path, short
 #   full   8 episodes of 128k tokens on the RL test problem (val40 problem 0) with the top-32 candidates, then 8 without
 #          them (what recording them costs)
@@ -54,7 +54,7 @@ assert len(rows) == 1
 rows[0]["metadata"]["label"] = rows[0]["label"]
 open(sys.argv[2], "w").write(json.dumps(rows[0]) + "\n")
 PY
-# 20 min: the engines load 80 GB at 0% first, and an engine whose two episodes ended early waits for the group's last
+# 20 min: the engines load 80 GB at 0% first, and an engine whose episodes ended early waits for the group's last
 IDLE_MAX=20 gpu_watchdog $$ &
 WD=$!
 start timeout -s KILL "$LIMIT" apptainer exec --pid --nv --contain --cleanenv --writable-tmpfs \
