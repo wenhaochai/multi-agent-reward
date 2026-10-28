@@ -95,3 +95,76 @@ def drop_failed_groups(args, data) -> None:
         if any((s.metadata or {}).get("flint_failed") for s in group):
             for s in group:
                 s.remove_sample = True
+
+
+def _probe(args, ids: list[int]) -> list[float]:
+    """The served log-probs of ``ids`` (each token given the ones before it), from an engine behind miles' router."""
+    import urllib.request
+
+    body = {"input_ids": ids, "sampling_params": {"max_new_tokens": 1, "temperature": 0.0}, "return_logprob": True,
+            "logprob_start_len": 0}
+    req = urllib.request.Request(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate",
+                                 data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=600) as r:
+        out = json.loads(r.read())
+    return [x[0] for x in out["meta_info"]["input_token_logprobs"][1:]]
+
+
+def log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time) -> bool:
+    """miles' rollout log hook (--custom-rollout-log-function-path flint.miles_agent.log_rollout) for the RL runs
+    (rl/rl_inner.sh). After each rollout, in $MA_RL_OUT/r<rollout_id>/, where miles saved the rollout (rollout.pt):
+    - the episodes' traces move in from $MA_AG_TRACE_DIR (the agents append there; the next rollout starts it anew);
+    - rl/inspect_rollout.py checks the samples against the traces; a failed check raises, which ends the run;
+    - the served log-probs of a fixed sequence (the first 4096 tokens of rollout 0's first sample), twice, show which
+      weights the engines serve: they change after a weight update, and the repeat gives the noise floor;
+    - one line per rollout goes to $MA_RL_OUT/steps.jsonl: the episodes' rewards (S), submissions and failures, and
+      the probe's change since the previous rollout.
+    Returns False: miles' own rollout logging follows."""
+    import statistics
+    import subprocess
+    import sys
+
+    out = os.environ["MA_RL_OUT"]
+    d = os.path.join(out, f"r{rollout_id}")
+    os.makedirs(d, exist_ok=True)
+    live = os.environ.get("MA_AG_TRACE_DIR")
+    if live and os.path.isdir(live):
+        os.rename(live, os.path.join(d, "traces"))
+
+    ids_path = os.path.join(out, "probe_ids.json")
+    if not os.path.exists(ids_path):
+        json.dump([int(t) for t in samples[0].tokens[:4096]], open(ids_path, "w"))
+    ids = json.load(open(ids_path))
+    probe = [_probe(args, ids), _probe(args, ids)]
+    json.dump(probe, open(os.path.join(d, "probe.json"), "w"))
+    rec = {"rollout_id": rollout_id, "rollout_s": round(rollout_time, 1),
+           "probe_repeat_max_abs": max(abs(a - b) for a, b in zip(*probe))}
+    prev = os.path.join(out, f"r{rollout_id - 1}", "probe.json")
+    if os.path.exists(prev):
+        p0 = json.load(open(prev))[0]
+        diffs = [abs(a - b) for a, b in zip(p0, probe[0])]
+        rec |= {"probe_change_mean_abs": sum(diffs) / len(diffs), "probe_change_max_abs": max(diffs)}
+
+    first = {}   # one sample per episode: its reward is the episode's S, its metadata the episode's numbers
+    for s in samples:
+        first.setdefault((s.metadata or {}).get("flint_session"), s)
+    episodes = {k: s.metadata or {} for k, s in first.items()}
+    S = [s.reward for s in first.values()]
+    rec |= {"episodes": len(episodes), "samples": len(samples), "failed": sum(bool(m.get("flint_failed")) for m in episodes.values()),
+            "reward_mean": statistics.fmean(S), "reward_var": statistics.pvariance(S), "S": sorted(S),
+            "submissions": [m.get("fo_lg_submissions") for m in episodes.values()],
+            "restarts": [m.get("fo_lg_restarts") for m in episodes.values()],
+            "wall_min_max": max((m.get("fo_lg_wall_min") or 0) for m in episodes.values()),
+            "tokens": sum(len(s.tokens) for s in samples), "max_sample_tokens": max(len(s.tokens) for s in samples)}
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    r = subprocess.run([sys.executable, os.path.join(repo, "rl", "inspect_rollout.py"), d, "rollout.pt"],
+                       capture_output=True, text=True)
+    open(os.path.join(d, "inspect.txt"), "w").write(r.stdout + r.stderr)
+    rec["inspect"] = (r.stdout.strip().splitlines() or ["no output"])[-1]
+    with open(os.path.join(out, "steps.jsonl"), "a") as f:
+        f.write(json.dumps(rec) + "\n")
+    print(f"[flint rollout {rollout_id}] {json.dumps(rec)}", flush=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"rollout {rollout_id}: the sample check failed ({rec['inspect']}); see {d}/inspect.txt")
+    return False
