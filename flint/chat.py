@@ -31,7 +31,10 @@ IDLE_S = float(os.environ.get("MA_CE_IDLE_S", 1200))
 DWELL_S = 300
 # a turn's command in the game's history: ChatSession writes the tool call into the reply as this block
 ACTION_RE = re.compile(r"```mswea_bash_command\s*\n(.*?)\n```", re.DOTALL)
-BASH_TOOL = {"type": "function", "function": {"name": "bash", "strict": True, "description": "Execute a bash command",
+# "strict" holds the arguments to the schema through the kit's grammar (the eval game). miles records the sampler's
+# candidates for score centering only from unconstrained sampling, so its rollouts set MA_AG_TOOL_STRICT=0.
+STRICT = os.environ.get("MA_AG_TOOL_STRICT", "1") != "0"
+BASH_TOOL = {"type": "function", "function": {"name": "bash", "strict": STRICT, "description": "Execute a bash command",
     "parameters": {"type": "object", "properties": {"command": {"type": "string",
     "description": "The bash command to execute"}}, "required": ["command"]}}}
 
