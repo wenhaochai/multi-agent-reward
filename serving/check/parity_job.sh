@@ -7,7 +7,8 @@
 # The port of flint_sglang to SGLang 0.5.23 against Recursive's kit on SGLang 0.5.16, two TP2 servers side by side
 # with the eval servers' flags (the kit's serve_h200.sh): D = the port in miles-v0.1.3.sif on GPUs 0-1, A = the kit
 # in flint-sglang.sif on GPUs 2-3. Then, on both: (1) logprobs and top-32 heads on S1's 8 long-game sequences
-# (2k-60k tokens; D also in a batch of 8 and decode vs prefill), (2) decode throughput at 1 and 8 requests, (3) four
+# (2k-60k tokens; D also in a batch of 8 and decode vs prefill), (1b) decode vs prefill logprobs of the same sampled
+# tokens on 15 prompts, (2) decode throughput at 1 and 8 requests, (3) four
 # short real long-game episodes (one Flint, 30k tokens) for tool-call and reasoning parsing. Limits: the whole job is
 # killed at 140 min, gpu_watchdog ends it when one of its GPUs stays at 0% for 10 min, and it stops only the process
 # groups it started (procs.sh). Usage: parity_job.sh
@@ -91,6 +92,15 @@ wait $QD
 tail -n1 "$OUT/query_D.log" "$OUT/query_A.log"
 run "$OUT/table.txt" $(py $W/serving/check/compare_servers.py "$SEQS" "$OUT/sglang_A.pt" "$OUT/sglang_D.pt" "$A_S1")
 cat "$OUT/table.txt"
+
+# 1b. what a rollout records against what a prefill scores, on both servers: 15 prompts (the first 4k and 16k tokens
+# of the S1 sequences), 512 sampled tokens each, one request at a time
+run "$OUT/decode_D.log" $(py $W/serving/check/decode_check.py "$SEQS" "http://127.0.0.1:${PORT[D]}" "$OUT/decode_D.pt") &
+DD=$!
+run "$OUT/decode_A.log" $(py $W/serving/check/decode_check.py "$SEQS" "http://127.0.0.1:${PORT[A]}" "$OUT/decode_A.pt")
+wait $DD
+run "$OUT/decode.txt" $(py $W/serving/check/compare_decode.py "port=$OUT/decode_D.pt" "kit=$OUT/decode_A.pt")
+cat "$OUT/decode.txt"
 
 # 2. decode throughput, both servers at once (separate GPU pairs)
 run "$OUT/bench_D.log" $(py $W/serving/check/bench.py "$SEQS" "http://127.0.0.1:${PORT[D]}" "$OUT/bench_D.json") &
