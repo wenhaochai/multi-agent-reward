@@ -137,6 +137,7 @@ threading.Thread(target=srv.serve_forever, daemon=True).start()
 args = SimpleNamespace(sglang_router_ip="127.0.0.1", sglang_router_port=srv.server_port)
 out_dir = tempfile.mkdtemp()
 os.environ["MA_RL_OUT"] = out_dir
+os.environ["MA_AG_TURN"] = "90"   # the turn cap the hook counts hits of
 os.environ["MA_AG_TRACE_DIR"] = os.path.join(out_dir, "traces_live")
 smp = [SimpleNamespace(tokens=list(range(5000)), reward=0.5, metadata={"flint_session": "a", "fo_lg_submissions": 2}),
        SimpleNamespace(tokens=list(range(10)), reward=0.5, metadata={"flint_session": "a", "fo_lg_submissions": 2}),
@@ -146,7 +147,10 @@ real_run = subprocess.run
 subprocess.run = lambda cmd, **kw: runs.append(cmd) or SimpleNamespace(returncode=0, stdout="INSPECT_OK\n", stderr="")
 for rid in (0, 1):
     os.makedirs(os.environ["MA_AG_TRACE_DIR"])
-    open(os.path.join(os.environ["MA_AG_TRACE_DIR"], "agent_1.jsonl"), "w").write("{}\n")
+    open(os.path.join(os.environ["MA_AG_TRACE_DIR"], "agent_1.jsonl"), "w").write(json.dumps(
+        {"S": 0.5, "submissions": [{}, {}], "agents": [{"restarts": 1, "turns": [
+            {"cut": False, "dropped": 0, "prompt_tokens": 10}, {"cut": True, "dropped": 0, "prompt_tokens": 30, "completion_tokens": 90},
+            {"cut": False, "dropped": 4, "prompt_tokens": 20}]}]}) + "\n")
     MA.log_rollout(rid, args, smp, {}, 12.0)
     shift[0] = 0.01
 lines = [json.loads(x) for x in open(os.path.join(out_dir, "steps.jsonl"))]
@@ -155,6 +159,8 @@ check("log: the probe is rollout 0's first 4096 tokens, twice per rollout",
       len(probes) == 4 and all(b["input_ids"] == list(range(4096)) for b in probes), len(probes))
 check("log: one line per rollout, episodes' S and submissions",
       [(x["episodes"], x["samples"], x["S"], x["submissions"]) for x in lines] == [(2, 3, [0.1, 0.5], [2, 1])] * 2, lines)
+check("log: per-episode trace numbers", lines[0]["trace_episodes"] == [{"S": 0.5, "cut_turns": 1, "turn_cap_hits": 1, "turns": 3, "trims": 1,
+      "submissions": 2, "restarts": 1, "max_prompt_tokens": 30}] and lines[0]["cut_turns"] == 1, lines[0])
 check("log: the probe change after the update", "probe_change_mean_abs" not in lines[0]
       and abs(lines[1]["probe_change_mean_abs"] - 0.01) < 1e-9 and lines[1]["probe_repeat_max_abs"] == 0.0, lines[1])
 check("log: the sample check runs on the rollout's dump", runs[0][-2:] == [os.path.join(out_dir, "r0"), "rollout.pt"], runs[0])

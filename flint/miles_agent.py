@@ -158,6 +158,25 @@ def log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time) 
             "wall_min_max": max((m.get("fo_lg_wall_min") or 0) for m in episodes.values()),
             "tokens": sum(len(s.tokens) for s in samples), "max_sample_tokens": max(len(s.tokens) for s in samples)}
 
+    # from the episodes' traces, per episode: cut turns (no command; the last one usually at the token budget's end),
+    # those cut at the turn cap (MA_AG_TURN), trims, submissions
+    eps = []
+    for f in sorted(os.listdir(os.path.join(d, "traces"))) if os.path.isdir(os.path.join(d, "traces")) else []:
+        for line in open(os.path.join(d, "traces", f)):
+            t = json.loads(line)
+            if not t.get("agents"):
+                continue
+            turns = t["agents"][0].get("turns", [])
+            dropped = [x.get("dropped", 0) for x in turns]
+            cap = int(os.environ.get("MA_AG_TURN", "32768"))
+            eps.append({"S": t.get("S"), "cut_turns": sum(1 for x in turns if x.get("cut")),
+                        "turn_cap_hits": sum(1 for x in turns if x.get("cut") and (x.get("completion_tokens") or 0) >= cap),
+                        "turns": len(turns), "trims": sum(1 for x, y in zip(dropped, dropped[1:]) if y > x),
+                        "submissions": len(t.get("submissions", [])), "restarts": t["agents"][0].get("restarts"),
+                        "max_prompt_tokens": max((x.get("prompt_tokens") or 0 for x in turns), default=0)})
+    rec |= {"trace_episodes": eps, "cut_turns": sum(e["cut_turns"] for e in eps),
+            "turn_cap_hits": sum(e["turn_cap_hits"] for e in eps), "turns": sum(e["turns"] for e in eps)}
+
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     r = subprocess.run([sys.executable, os.path.join(repo, "rl", "inspect_rollout.py"), d, "rollout.pt"],
                        capture_output=True, text=True)
