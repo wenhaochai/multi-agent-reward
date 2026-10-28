@@ -32,7 +32,8 @@ echo "[s2] $(date -u +%FT%TZ) node=$(hostname) job=$JID gpus=$CUDA_VISIBLE_DEVIC
 # only this job's GPUs: on a shared host the others belong to another guest
 nvidia-smi -i "$CUDA_VISIBLE_DEVICES" --query-gpu=timestamp,index,memory.used --format=csv,noheader -l 2 > "$OUT/gpu_mem.csv" 2>/dev/null &
 ( while true; do echo "$(date +%s) $(free -m | awk '/Mem:/{print $3}')"; sleep 2; done ) > "$OUT/host_mem.txt" &
-apptainer exec --nv --contain --cleanenv --writable-tmpfs \
+# in its own process group, with a hard limit and an idle-GPU watchdog (safe_run.sh)
+$P/mas-rl-flintrl/flint_hf/train_check/safe_run.sh 3000 15 apptainer exec --nv --contain --cleanenv --writable-tmpfs \
   --bind /scratch/gpfs/GROUP/USER --bind "$JOBTMP":/tmp --bind "$TMPDIR" --bind /dev/shm \
   --env PYTHONNOUSERSITE=1 --env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" --env JID="$JID" --env TMPDIR="$TMPDIR" \
   "$SIF" bash $P/mas-rl-flintrl/flint_hf/train_check/step_inner.sh "$DATA" "$OUT" "$@"
