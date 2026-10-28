@@ -114,7 +114,8 @@ def log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time) 
     """miles' rollout log hook (--custom-rollout-log-function-path flint.miles_agent.log_rollout) for the RL runs
     (rl/rl_inner.sh). After each rollout, in $MA_RL_OUT/r<rollout_id>/, where miles saved the rollout (rollout.pt):
     - the episodes' traces move in from $MA_AG_TRACE_DIR (the agents append there; the next rollout starts it anew);
-    - rl/inspect_rollout.py checks the samples against the traces; a failed check raises, which ends the run;
+    - rl/inspect_rollout.py checks the samples against the traces; a failed check raises, which ends the run, as does
+      a sample over $MA_RL_MAX_SAMPLE_TOKENS (the actor's memory bound), before any training on it;
     - the served log-probs of a fixed sequence (the first 4096 tokens of rollout 0's first sample), twice, show which
       weights the engines serve: they change after a weight update, and the repeat gives the noise floor;
     - one line per rollout goes to $MA_RL_OUT/steps.jsonl: the episodes' rewards (S), submissions and failures, and
@@ -167,4 +168,7 @@ def log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time) 
     print(f"[flint rollout {rollout_id}] {json.dumps(rec)}", flush=True)
     if r.returncode != 0:
         raise RuntimeError(f"rollout {rollout_id}: the sample check failed ({rec['inspect']}); see {d}/inspect.txt")
+    cap = int(os.environ.get("MA_RL_MAX_SAMPLE_TOKENS", "0"))
+    if cap and rec["max_sample_tokens"] > cap:
+        raise RuntimeError(f"rollout {rollout_id}: a sample of {rec['max_sample_tokens']} tokens is over {cap}")
     return False

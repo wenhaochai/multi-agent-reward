@@ -10,9 +10,8 @@
 # RL of Flint on the long game through miles v0.1.3 (our fork), on one 8-GPU block: GRPO without std normalization,
 # score centering over the sampler's top-32 candidates, routing replay (R3), one optimizer step per rollout (problem 0,
 # 8 episodes of 128k tokens), the rollout engines (4 x TP2) and the FSDP actor (CPU-offloaded parameters and Adam)
-# colocated. Usage: rl_job.sh memprobe|test2|run20 (wq --prio 10; run20's own --time).
-#   memprobe  2 training steps alone (no engines) on w562's rollout with synthetic rewards (22 samples up to 145,930
-#             tokens): GPU and host memory, R3 replay of real routed experts, the mismatch counts
+# colocated. Usage: rl_job.sh test2|run20 (wq --prio 10; run20's own --time). The game runs with RL's context cap
+# (rl/rl_inner.sh: 110k characters, 16k-token turns) so that a training sample stays near 64k tokens.
 #   test2     2 colocated RL steps, the actor saved at the end
 #   run20     20 colocated RL steps, the actor saved at the end
 # The first failure ends the job: nothing is retried. Results: tmp/flint_s5/runs/<job>/. One container with a PID
@@ -20,7 +19,7 @@
 # watch (rl/gpu_watch.sh) and cleanup of only the process groups this job started (serving/check/procs.sh).
 set -uo pipefail
 MODE=${1:-}
-case "$MODE" in memprobe) LIMIT=2700;; test2) LIMIT=9600;; run20) LIMIT=81000;; *) echo "usage: rl_job.sh memprobe|test2|run20"; exit 1;; esac
+case "$MODE" in test2) LIMIT=9600;; run20) LIMIT=81000;; *) echo "usage: rl_job.sh test2|run20"; exit 1;; esac
 JID=${FETCHED_JOB_ID:-$SLURM_JOB_ID}
 [ -n "$JID" ] || { echo "no job id"; exit 1; }
 REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-rollout
