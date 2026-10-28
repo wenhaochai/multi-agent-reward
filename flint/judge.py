@@ -174,9 +174,19 @@ def load_problem(pdir: Path) -> dict:
             "checker": cfg.get("checker", "chk.cc"), "interactor": cfg.get("interactor", "interactor.cc")}
 
 
+# Our fixes to official checkers, by problem directory name: flint/checkers/<problem>/<checker file> replaces the
+# official source (a checker bug lets a fake output score 100; audit 2026-10-28, problem 112). Each fix is filed upstream.
+CHECKER_FIXES = Path(__file__).resolve().parent / "checkers"
+
+
+def _helper_source(pdir: Path, src_name: str) -> Path:
+    fixed = CHECKER_FIXES / pdir.name / src_name
+    return fixed if fixed.is_file() else pdir / src_name
+
+
 def _compile_helper(pdir: Path, src_name: str) -> Path:
     """Compile a problem's checker or interactor once per machine (file lock; keyed by source hash)."""
-    src = pdir / src_name
+    src = _helper_source(pdir, src_name)
     h = hashlib.sha1(src.read_bytes()).hexdigest()[:16]
     CACHE.mkdir(parents=True, exist_ok=True)
     exe = CACHE / f"{pdir.name}_{Path(src_name).stem}_{h}"
