@@ -32,6 +32,7 @@ t test_cmd_escape FCS_CASE_PROC=0
 t test_git_nproc X=1
 t test_judge_paths X=1
 t test_judge_verdict X=1
+t test_judge_ratio X=1
 rm -rf "$TMPDIR"
 echo "${#fail[@]} failed${fail:+: ${fail[*]}}"
 [ ${#fail[@]} -eq 0 ]
