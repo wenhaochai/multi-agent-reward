@@ -2,7 +2,7 @@
 #SBATCH --job-name=flint-smoke-wq
 #SBATCH --gres=gpu:4
 #SBATCH --mem=240G
-#SBATCH --time=02:30:00
+#SBATCH --time=02:45:00
 #SBATCH --output=/scratch/gpfs/GROUP/USER/project/flint-eval/logs/%x-%j.out
 #FETCHABLE
 # mas-rl: step 1 of arm.sh as its own 4-GPU wq job (one TP4 server; a 2-GPU job strands half a block), so the arms
