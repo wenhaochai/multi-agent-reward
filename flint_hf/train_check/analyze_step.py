@@ -11,7 +11,7 @@ import torch
 out = sys.argv[1]
 rows = {}
 for f in sorted(glob.glob(f"{out}/train_*_*.pt")):
-    d = torch.load(f, weights_only=False)
+    d = torch.load(f, weights_only=False, map_location="cpu")
     rd, rid = d["rollout_data"], d["rollout_id"]
     for i in range(len(rd["log_probs"])):
         key = (d["rank"], i)
