@@ -65,7 +65,8 @@ for sess, ss in sorted(by.items(), key=lambda kv: str(kv[0])):
         "r3_dense_values": sorted({int(v) for x in have for v in np.unique(x[:, :2, :])})[:5]}
     roots = {tuple((s.metadata.get("leaf") or {}).get("path_node_ids", [None]))[:1] for s in ss}
     row = {
-        "session": sess, "trace": bool(tr), "aborted": meta.get("flint_aborted"),
+        "session": sess, "trace": bool(tr), "failed": meta.get("flint_failed"),
+        "judge_infra_submissions": sum(bool(x.get("infra")) for x in tr.get("submissions", [])) if tr else None,
         "S": tr.get("S") if tr else None, "rewards": sorted({s.reward for s in ss}),
         "samples": len(ss), "roots": len(roots), "status": sorted({str(s.status) for s in ss}),
         "model_calls": sum(1 for t in turns if t.get("completion_tokens") is not None),
@@ -105,8 +106,17 @@ for r in rows:
           f"{r['restarts']!s:>3} {r['submissions']!s:>4} {r['format_errors']:>3} {r['generated']!s:>9} "
           f"{r['trained_tokens']:>8} {r['response_tokens']:>8} {r['trained_role_tokens']:>7} {r['topk_error_count']:>7} "
           f"{r['wall_min'] if r['wall_min'] is None else round(r['wall_min'], 1)!s:>5}"
-          + (f" ABORTED {r['aborted'][:80]}" if r["aborted"] else ""))
+          + (f" FAILED {r['failed'][:80]}" if r["failed"] else ""))
 print(json.dumps({k: v for k, v in summary.items() if k != "rows"}))
 for r in rows:
     if r["topk_errors"]:
         print("topk errors", r["session"], r["topk_errors"])
+# the run fails on anything that would make its samples wrong to train on
+problems = {"failed episodes": sum(bool(r["failed"]) for r in rows),
+            "judge infra submissions": sum(r["judge_infra_submissions"] or 0 for r in rows),
+            "rewards not S": 0 if summary["all_rewards_equal_S"] else 1,
+            "trained != generated": int(summary["trained_tokens"] != summary["generated_tokens"]),
+            "top-k errors": summary["topk_error_count"], "R3 ids out of range": summary["r3_moe_out_of_range"]}
+bad = {k: v for k, v in problems.items() if v}
+print("INSPECT_FAIL", bad if bad else "") if bad else print("INSPECT_OK")
+sys.exit(1 if bad else 0)
