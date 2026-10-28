@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 
 import torch
@@ -45,7 +46,18 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from .configuration_flint import FlintConfig
 
+
+def _register_expert_conversion() -> None:
+    """Flint checkpoints store experts like qwen2_moe's: merge them into FlintExperts on load, split on save."""
+    from transformers.conversion_mapping import get_checkpoint_conversion_mapping, register_checkpoint_conversion_mapping
+
+    register_checkpoint_conversion_mapping("flint", get_checkpoint_conversion_mapping("qwen2_moe"), overwrite=True)
+
+
+_register_expert_conversion()
+
 SLIDING_ATTENTION = "sliding_attention"
+EXPERT_TENSOR = re.compile(r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.weight")
 SCORE_ELEMS = 1 << 28   # fp32 elements in one chunk of attention scores (1 GiB)
 HEAD_CHUNK = 2048       # rows of the fp32 head per chunk in head_log_probs (1.2 GiB of logits at Flint's vocabulary)
 
@@ -206,36 +218,54 @@ class FlintTopKRouter(nn.Module):
         return logits, w / (w.sum(dim=-1, keepdim=True) + 1e-20), ids
 
 
-def experts_reference(experts: nn.ModuleList, x: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor):
-    """Each expert on its tokens, weighted outputs summed in fp32, cast back to x's dtype."""
+class FlintExperts(nn.Module):
+    """The routed experts of one MoE layer as two stacked parameters (a few hundred tensors for the whole model
+    instead of 36,734, which per-tensor work in the optimizer and FSDP would otherwise pay for): ``gate_up_proj``
+    [E, 2I, H] (each expert's gate_proj rows, then its up_proj rows) and ``down_proj`` [E, H, I]. The checkpoint keeps
+    one module per expert (``experts.{e}.gate_proj.weight``...); transformers' qwen2_moe conversion, registered for
+    ``flint`` below, merges them on load and splits them again on save and for weight sync."""
+
+    def __init__(self, config: FlintConfig):
+        super().__init__()
+        e, h, i = config.num_experts, config.hidden_size, config.moe_intermediate_size
+        self.gate_up_proj = nn.Parameter(torch.empty(e, 2 * i, h))
+        self.down_proj = nn.Parameter(torch.empty(e, h, i))
+
+    def __len__(self) -> int:
+        return self.gate_up_proj.shape[0]
+
+
+def experts_reference(experts: FlintExperts, x: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor):
+    """Each expert on its tokens (gate and up as two matmuls, as the per-expert modules computed them), weighted
+    outputs summed in fp32, cast back to x's dtype."""
     out = torch.zeros(x.shape, dtype=acc_dtype(x.dtype), device=x.device)
     flat_ids, flat_w = ids.flatten(), weights.flatten()
     order = torch.argsort(flat_ids, stable=True)
     tok = order // ids.shape[1]
+    inter = experts.down_proj.shape[2]
     start = 0
     for e, n in enumerate(torch.bincount(flat_ids, minlength=len(experts)).tolist()):
         if n:
             sel, t = order[start:start + n], tok[start:start + n]
-            out.index_add_(0, t, experts[e](x[t]).to(out.dtype) * flat_w[sel, None])
+            w13 = experts.gate_up_proj[e]
+            h = F.silu(F.linear(x[t], w13[:inter])) * F.linear(x[t], w13[inter:])
+            out.index_add_(0, t, F.linear(h, experts.down_proj[e]).to(out.dtype) * flat_w[sel, None])
             start += n
     return out.to(x.dtype)
 
 
-def grouped_experts(experts: nn.ModuleList, x: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor):
+def grouped_experts(experts: FlintExperts, x: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor):
     """The experts for training: the token-expert pairs sorted by expert through two grouped GEMMs
     (torch._grouped_mm, bf16 with fp32 accumulation, differentiable), weighted and summed in fp32 like
     ``experts_reference``. Deterministic: the pairs move by permutations and each token's k outputs are summed in a
-    fixed order (no atomic index_add_). The per-expert weights are stacked per call, as the checkpoint keeps one
-    module per expert."""
+    fixed order (no atomic index_add_)."""
     n, k = ids.shape
-    w13 = torch.stack([torch.cat([e.gate_proj.weight, e.up_proj.weight], dim=0) for e in experts])   # [E, 2I, H]
-    w2 = torch.stack([e.down_proj.weight for e in experts])                                          # [E, H, I]
     flat = ids.flatten()
     order = torch.argsort(flat, stable=True)
     offs = torch.cumsum(torch.bincount(flat, minlength=len(experts)), dim=0).to(torch.int32)
     xs = x.unsqueeze(1).expand(n, k, x.shape[1]).reshape(n * k, -1)[order]                     # pairs by expert
-    gate, up = torch._grouped_mm(xs, w13.transpose(1, 2), offs=offs).chunk(2, dim=-1)
-    y = torch._grouped_mm(F.silu(gate) * up, w2.transpose(1, 2), offs=offs)
+    gate, up = torch._grouped_mm(xs, experts.gate_up_proj.transpose(1, 2), offs=offs).chunk(2, dim=-1)
+    y = torch._grouped_mm(F.silu(gate) * up, experts.down_proj.transpose(1, 2), offs=offs)
     y = y[torch.argsort(order)].view(n, k, -1).to(acc_dtype(x.dtype))                         # back to token order
     return (y * weights.to(y.dtype).unsqueeze(-1)).sum(dim=1).to(x.dtype)
 
@@ -246,8 +276,7 @@ class FlintSparseMoeBlock(nn.Module):
     def __init__(self, config: FlintConfig):
         super().__init__()
         self.gate = FlintTopKRouter(config)
-        self.experts = nn.ModuleList(
-            [FlintMLP(config.hidden_size, config.moe_intermediate_size) for _ in range(config.num_experts)])
+        self.experts = FlintExperts(config)
         self.shared_expert = (FlintMLP(config.hidden_size, config.shared_expert_intermediate_size)
                               if config.shared_expert_intermediate_size > 0 else None)
 
@@ -341,6 +370,9 @@ class FlintPreTrainedModel(PreTrainedModel):
             init.zeros_(module.expert_bias)
         elif isinstance(module, FlintAttention):
             init.zeros_(module.softmax_offset)
+        elif isinstance(module, FlintExperts):
+            init.normal_(module.gate_up_proj, mean=0.0, std=self.config.initializer_range)
+            init.normal_(module.down_proj, mean=0.0, std=self.config.initializer_range)
 
 
 class FlintModel(FlintPreTrainedModel):
@@ -449,14 +481,30 @@ def load_flint(path: str, devices: list[str], dtype=torch.bfloat16) -> FlintForC
         return devices[0] if name.startswith("model.embed_tokens") else devices[-1]
 
     params = dict(model.named_parameters())
+    for name, p in params.items():   # the stacked experts are filled slice by slice below
+        if name.endswith((".experts.gate_up_proj", ".experts.down_proj")):
+            owner, attr = name.rsplit(".", 1)
+            setattr(model.get_submodule(owner), attr, nn.Parameter(torch.empty(p.shape, dtype=dtype, device=device_of(name))))
+    params = dict(model.named_parameters())
     index = json.load(open(path / "model.safetensors.index.json"))["weight_map"]
     by_file: dict[str, list[str]] = {}
     for name, f in index.items():
         by_file.setdefault(f, []).append(name)
-    filled = set()
+    filled, slices = set(), set()
     for f, names in sorted(by_file.items()):
         with safe_open(str(path / f), "pt") as fh:
             for name in names:
+                m = EXPERT_TENSOR.fullmatch(name)
+                if m:   # model.layers.L.mlp.experts.E.{gate,up,down}_proj.weight -> a slice of the stacked tensor
+                    layer, e, kind = m.group(1), int(m.group(2)), m.group(3)
+                    target = f"model.layers.{layer}.mlp.experts." + ("down_proj" if kind == "down" else "gate_up_proj")
+                    t, p = fh.get_tensor(name), params[target]
+                    inter = p.shape[1] // 2
+                    rows = slice(None) if kind == "down" else (slice(0, inter) if kind == "gate" else slice(inter, None))
+                    with torch.no_grad():
+                        p[e, rows].copy_(t)
+                    slices.add((target, e, kind))
+                    continue
                 if name not in params:
                     raise RuntimeError(f"checkpoint tensor {name} fills no parameter")
                 t = fh.get_tensor(name)
@@ -465,6 +513,11 @@ def load_flint(path: str, devices: list[str], dtype=torch.bfloat16) -> FlintForC
                 owner, attr = name.rsplit(".", 1)
                 setattr(model.get_submodule(owner), attr, nn.Parameter(t.to(device_of(name), dtype)))
                 filled.add(name)
+    for name, p in params.items():   # a stacked tensor counts as filled when every expert slice was
+        kinds = ("down",) if name.endswith(".experts.down_proj") else ("gate", "up")
+        if name.endswith((".experts.gate_up_proj", ".experts.down_proj")) and \
+                all((name, e, k) in slices for e in range(p.shape[0]) for k in kinds):
+            filled.add(name)
     if filled != set(params):
         missing = sorted(set(params) - filled)
         raise RuntimeError(f"{len(missing)} parameters not in the checkpoint, e.g. {missing[:5]}")

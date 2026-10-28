@@ -81,7 +81,7 @@ if __name__ == "__main__":
     probe = {"sinks.L2": model.model.layers[2].self_attn.softmax_offset,
              "q_proj.L10": model.model.layers[10].self_attn.q_proj.weight,
              "router.L10": model.model.layers[10].mlp.gate.weight,
-             "expert0.down.L10": model.model.layers[10].mlp.experts[0].down_proj.weight,
+             "experts.down.L10": model.model.layers[10].mlp.experts.down_proj,
              "lm_head": model.lm_head.weight}
     for p in model.parameters():
         p.requires_grad_(False)

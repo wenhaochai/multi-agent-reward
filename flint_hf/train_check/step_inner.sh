@@ -13,6 +13,8 @@ mkdir -p "$HOME"
 export PYTHONPATH=/root/Megatron-LM:$W:$F PYTHONUNBUFFERED=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export RAY_USAGE_STATS_ENABLED=0 no_proxy=127.0.0.1,localhost MASTER_ADDR=127.0.0.1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Ray starts workers single-threaded; the CPU-offloaded Adam step needs the job's cores (96 / 8 ranks)
+export OMP_NUM_THREADS=11 MKL_NUM_THREADS=11
 echo "[s2] miles $(git -C "$W" rev-parse --short HEAD) dirty=$(git -C "$W" status --porcelain | wc -l); flint_hf $(git -C "$F" rev-parse --short HEAD) dirty=$(git -C "$F" status --porcelain | wc -l)"
 NG=$(awk -F, '{print NF}' <<< "$CUDA_VISIBLE_DEVICES")
 JNUM=${JID//[!0-9]/}

@@ -83,7 +83,11 @@ def test_moe_block_matches_per_token_reference():
     s = torch.sigmoid(x @ blk.gate.weight.t())
     ids = s.topk(2, -1).indices
     w = s.gather(1, ids); w = w / w.sum(-1, keepdim=True)
-    ref = torch.stack([sum(w[i, j] * blk.experts[ids[i, j]](x[i:i + 1])[0] for j in range(2)) for i in range(23)])
+    def expert(e, v):   # one expert from the stacked weights: down(silu(gate v) * up v)
+        g, u = (v @ blk.experts.gate_up_proj[e].t()).chunk(2, dim=-1)
+        return (torch.nn.functional.silu(g) * u) @ blk.experts.down_proj[e].t()
+
+    ref = torch.stack([sum(w[i, j] * expert(ids[i, j], x[i:i + 1])[0] for j in range(2)) for i in range(23)])
     assert torch.allclose(blk(x), ref + blk.shared_expert(x), atol=1e-5)
 
 

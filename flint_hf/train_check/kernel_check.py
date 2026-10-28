@@ -126,8 +126,13 @@ def check_experts(dev):
     cfg = FlintConfig.from_pretrained(MODEL)
     block = M.FlintSparseMoeBlock(cfg)
     layer = 10
-    state = {n: real_tensor(f"model.layers.{layer}.mlp.{n}") for n, _ in block.named_parameters()}
-    block.load_state_dict(state, strict=False)
+    pre = f"model.layers.{layer}.mlp."
+    state = {n: real_tensor(pre + n) for n, _ in block.named_parameters() if not n.startswith("experts.")}
+    state["experts.gate_up_proj"] = torch.stack([torch.cat([real_tensor(f"{pre}experts.{e}.{k}_proj.weight")
+                                                            for k in ("gate", "up")]) for e in range(cfg.num_experts)])
+    state["experts.down_proj"] = torch.stack([real_tensor(f"{pre}experts.{e}.down_proj.weight")
+                                              for e in range(cfg.num_experts)])
+    block.load_state_dict(state, strict=True)
     block = block.to(dev, torch.bfloat16)
     block.gate.expert_bias = torch.zeros(cfg.num_experts, device=dev)
     x = (torch.randn(8192, cfg.hidden_size, device=dev) * 0.5).bfloat16()
@@ -141,7 +146,7 @@ def check_experts(dev):
         out.backward(gout)
         e0 = int(block.gate(x)[2][0, 0])
         res[name] = (out.detach(), xi.grad, block.gate.weight.grad.clone(),
-                     block.experts[e0].down_proj.weight.grad.clone(), block.experts[e0].gate_proj.weight.grad.clone())
+                     block.experts.down_proj.grad[e0].clone(), block.experts.gate_up_proj.grad[e0].clone())
     for n, a, b in zip(("out", "dx", "drouter", "dexpert.down", "dexpert.gate"), res["grouped"], res["reference"]):
         diff(f"experts {n} (layer {layer}, 8192 tokens)", a, b)
     block.experts_fn = M.grouped_experts   # deterministic: a second run is bitwise identical
@@ -195,7 +200,7 @@ def check_model(seqs_path, devices):
     probe = {"sinks.L2": model.model.layers[2].self_attn.softmax_offset,
              "q_proj.L10": model.model.layers[10].self_attn.q_proj.weight,
              "router.L10": model.model.layers[10].mlp.gate.weight,
-             "expert0.down.L10": model.model.layers[10].mlp.experts[0].down_proj.weight,
+             "experts.down.L10": model.model.layers[10].mlp.experts.down_proj,
              "lm_head": model.lm_head.weight}
     for p in model.parameters():
         p.requires_grad_(False)
