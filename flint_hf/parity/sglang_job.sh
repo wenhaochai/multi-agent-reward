@@ -34,7 +34,8 @@ serve() {   # $1 name, $2 sif, $3 gpus, $4 port, $5 nccl port, $6 extra PYTHONPA
 }
 query() {   # $1 name, $2 port, $3 extra flag
   for _ in $(seq 1 90); do curl -sf "127.0.0.1:$2/health_generate" >/dev/null 2>&1 && break; sleep 20; done
-  curl -sf "127.0.0.1:$2/health_generate" >/dev/null || { echo "server $1 not ready"; tail -30 "$OUT/server_$1.log"; return 1; }
+  curl -sf "127.0.0.1:$2/health_generate" >/dev/null \
+    || { echo "server $1 not ready"; tail -30 "$OUT/server_$1.log"; return 1; }
   echo "server $1 ready $(date -Is)"
   apptainer exec --home "$TMPDIR" --bind /scratch/gpfs/GROUP "$FSIF" \
     python3 $W/flint_hf/parity/query_sglang.py "$SEQS" "http://127.0.0.1:$2" "$OUT/sglang_$1.pt.tmp" $3 \

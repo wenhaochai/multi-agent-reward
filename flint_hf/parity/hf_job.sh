@@ -21,7 +21,8 @@ trap 'rm -rf "$TMPDIR"' EXIT
 echo "job $JID host $(hostname) commit $(git -C $W rev-parse HEAD) GPUs $CUDA_VISIBLE_DEVICES"
 run() { APPTAINERENV_PYTHONPATH=$W APPTAINERENV_TMPDIR=$TMPDIR apptainer exec --nv --home "$TMPDIR" \
           --bind /scratch/gpfs/GROUP "$FSIF" python3 "$@"; }
-run $W/flint_hf/parity/hf_score.py "$SEQS" "$OUT/sglang_A.pt" "$OUT/hf.pt" 2>&1 | grep -v "model of type" | tee "$OUT/hf.log"
+run $W/flint_hf/parity/hf_score.py "$SEQS" "$OUT/sglang_A.pt" "$OUT/hf.pt" 2>&1 | grep -v "model of type" \
+  | tee "$OUT/hf.log"
 [ -f "$OUT/hf.pt" ] || { echo "PARITY_HF_FAIL"; exit 1; }
 C=$OUT/sglang_C.pt; [ -f "$C" ] || { C=$OUT/sglang_A.pt; echo "no C results: the C row repeats A"; }
 run $W/flint_hf/parity/compare.py "$SEQS" "$OUT/sglang_A.pt" "$C" "$OUT/hf.pt" | tee "$OUT/table.txt"

@@ -30,7 +30,8 @@ def score(ids, head_ids):
     for s in range(0, h.shape[0], 2048):
         lps = torch.log_softmax(model.logits(h[s:s + 2048]), -1)
         at.append(lps.gather(1, head_ids[s:s + 2048].to(lps.device)))
-    return {"lp": lp.double().cpu(), "top_v": tv.double().cpu(), "top_i": ti.cpu(), "at_head": torch.cat(at).double().cpu()}
+    return {"lp": lp.double().cpu(), "top_v": tv.double().cpu(), "top_i": ti.cpu(),
+            "at_head": torch.cat(at).double().cpu()}
 
 
 res = {"seqs": [], "samples": []}
