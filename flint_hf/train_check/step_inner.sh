@@ -27,7 +27,7 @@ trap 'ray stop --force >/dev/null 2>&1; pkill -9 -u "$(id -u)" -f -- "$RAY_TMP" 
 cd "$W"
 python3 "$W/train.py" \
   --train-backend fsdp --hf-checkpoint "$MODEL" --attn-implementation eager \
-  --load-debug-rollout-data "$DATA/rollout_{rollout_id}.pt" --save-debug-train-data "$OUT/train_{rollout_id}.pt" \
+  --load-debug-rollout-data "$DATA/rollout_{rollout_id}.pt" --save-debug-train-data "$OUT/train_{rollout_id}_{rank}.pt" \
   --num-rollout 2 --rollout-batch-size 1 --n-samples-per-prompt 8 --global-batch-size 8 \
   --rollout-temperature 1 --rollout-top-logprobs-num 32 \
   --advantage-estimator grpo --disable-grpo-std-normalization --kl-coef 0 --entropy-coef 0 \
