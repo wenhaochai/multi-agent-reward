@@ -73,6 +73,8 @@ def test_packed_documents_stay_apart():
     pos = torch.cat([torch.arange(23), torch.arange(31)])
     packed = m.model(torch.cat([a, b])[None], pos[None])
     assert torch.allclose(packed[:23], m.model(a), atol=1e-5) and torch.allclose(packed[23:], m.model(b), atol=1e-5)
+    cu = torch.tensor([0, 23, 54], dtype=torch.int32)   # miles v0.1.3 passes the boundaries as HF's cu_seq_lens_q
+    assert torch.equal(m(torch.cat([a, b])[None], pos[None], None, cu_seq_lens_q=cu).logits[0], m.logits(packed))
 
 
 def test_moe_block_matches_per_token_reference():

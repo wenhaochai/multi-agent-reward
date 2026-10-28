@@ -20,8 +20,9 @@ Two parts are pluggable for the trainer. Attention: ``ATTENTION_FUNCTIONS[FlintA
 ``FlintSparseMoeBlock.experts_fn(experts, x, weights, ids)``, separate from the routing in ``FlintTopKRouter``, whose
 ``select`` is the expert-selection top-k a routing-replay hook rebinds.
 
-Inputs are one packed sequence, as miles' FSDP backend sends them: ``input_ids`` [1, T] and ``position_ids`` [1, T]
-restarting at 0 at each document; ``attention_mask`` must be None.
+Inputs are one packed sequence, as miles' FSDP backend (v0.1.3) sends them: ``input_ids`` [1, T], ``position_ids``
+[1, T] restarting at 0 at each document, ``attention_mask`` None, and optionally the document boundaries as HF's
+packing kwarg ``cu_seq_lens_q`` (derived from ``position_ids`` when absent).
 """
 from __future__ import annotations
 
@@ -245,17 +246,21 @@ class FlintModel(FlintPreTrainedModel):
         self.post_init()
 
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor | None = None,
-                attention_mask: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
+                attention_mask: torch.Tensor | None = None, cu_seq_lens_q: torch.Tensor | None = None,
+                **kwargs) -> torch.Tensor:
         """Final hidden states [T, hidden] of one packed sequence. The decoder layers may sit on several devices (a
         manual pipeline, see load_flint); the activations follow them."""
         if attention_mask is not None:
-            raise ValueError("Flint takes packed sequences: attention_mask must be None, documents from position_ids")
+            raise ValueError("Flint takes packed sequences: attention_mask must be None")
         ids = input_ids.reshape(-1)
         pos = torch.arange(ids.numel(), device=ids.device) if position_ids is None else position_ids.reshape(-1)
-        starts = torch.nonzero(pos == 0).flatten()
-        if starts.numel() == 0 or starts[0] != 0:
-            raise ValueError("position_ids must start each document at 0")
-        cu_seqlens = torch.cat([starts, starts.new_tensor([ids.numel()])])
+        if cu_seq_lens_q is not None:
+            cu_seqlens = cu_seq_lens_q.to(torch.long)
+        else:
+            starts = torch.nonzero(pos == 0).flatten()
+            if starts.numel() == 0 or starts[0] != 0:
+                raise ValueError("position_ids must start each document at 0")
+            cu_seqlens = torch.cat([starts, starts.new_tensor([ids.numel()])])
         hidden, residual, per_device = self.embed_tokens(ids), None, {}
         for layer in self.layers:
             dev = layer.input_layernorm.weight.device
@@ -283,7 +288,8 @@ class FlintForCausalLM(FlintPreTrainedModel):
 
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor | None = None,
                 attention_mask: torch.Tensor | None = None, **kwargs) -> CausalLMOutputWithPast:
-        return CausalLMOutputWithPast(logits=self.logits(self.model(input_ids, position_ids, attention_mask))[None])
+        hidden = self.model(input_ids, position_ids, attention_mask, **kwargs)
+        return CausalLMOutputWithPast(logits=self.logits(hidden)[None])
 
     def token_logprobs(self, hidden: torch.Tensor, targets: torch.Tensor, topk: int = 0, chunk: int = 2048):
         """log p(targets[i] | hidden[i]) without the full [T, vocab] logits; with topk, also the top-k head
