@@ -21,7 +21,7 @@
 # writes only to job directories bound in (its own writable layer is 64 MB): /tmp and /root/datasets.
 set -uo pipefail
 MODE=${1:-}
-case "$MODE" in tito) LIMIT=1800;; probe) LIMIT=2400;; full) LIMIT=9000;; *) echo "usage: rollout_job.sh tito|probe|full"; exit 1;; esac
+case "$MODE" in tito) LIMIT=1680;; probe) LIMIT=2400;; full) LIMIT=9000;; *) echo "usage: rollout_job.sh tito|probe|full"; exit 1;; esac
 JID=${FETCHED_JOB_ID:-$SLURM_JOB_ID}
 [ -n "$JID" ] || { echo "no job id"; exit 1; }
 REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-rollout
