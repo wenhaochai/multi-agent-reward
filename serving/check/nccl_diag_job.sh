@@ -10,8 +10,9 @@
 #   two     server and trainer in separate apptainer exec instances (as w541), default NCCL settings;
 #   one     server and trainer in ONE apptainer exec (as miles runs them), default NCCL settings;
 #   cumem0  separate instances with NCCL_CUMEM_ENABLE=0 on both sides.
-# The whole job is killed at 600 s; each trainer at 90 s; afterwards anything of mine left on this job's GPUs is
-# killed. Usage: nccl_diag_job.sh. Results: /scratch/gpfs/GROUP/USER/tmp/flint_s3/nccl_<job>/
+# Limits: the whole job is killed at 600 s, each trainer at 90 s (it ends itself at 75 s). The job stops only the
+# process groups it started (procs.sh), never by GPU or by user: the pilot host runs other jobs of the same user.
+# Usage: nccl_diag_job.sh. Results: /scratch/gpfs/GROUP/USER/tmp/flint_s3/nccl_<job>/
 set -uo pipefail
 P=/scratch/gpfs/GROUP/USER/project
 W=$P/mas-rl-sglang023
@@ -22,18 +23,14 @@ SEQS=/scratch/gpfs/GROUP/USER/tmp/flint_parity_seqs.json
 JID=${FETCHED_JOB_ID:-$SLURM_JOB_ID}
 OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s3/nccl_$JID
 JOBTMP=/scratch/gpfs/GROUP/USER/tmp/job/$JID
-ME=$(id -un)
-reap() {   # kill whatever of mine still holds one of this job's GPUs
-  local pid
-  for pid in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader -i "$CUDA_VISIBLE_DEVICES" 2>/dev/null); do
-    [ "$(stat -c %U /proc/$pid 2>/dev/null)" = "$ME" ] && kill -KILL "$pid" 2>/dev/null
-  done
-}
+source $W/serving/check/procs.sh
+export STARTED_FILE=$OUT/started
 if [ -z "${DIAG_INNER:-}" ]; then
   mkdir -p "$OUT"
+  : > "$STARTED_FILE"
   DIAG_INNER=1 timeout -s KILL 600 bash "$0" "$@"
   rc=$?
-  reap; sleep 3; reap
+  stop $(cat "$STARTED_FILE")
   rm -rf "$JOBTMP"
   echo "nccl diag exit $rc (137 = the 600 s limit)"
   exit $rc
@@ -46,8 +43,8 @@ mkdir -p "$TMPDIR"
 IFS=, read -ra G <<< "${CUDA_VISIBLE_DEVICES:?no GPUs}"
 [ "${#G[@]}" -eq 4 ] || { echo "need 4 GPUs, got ${G[*]}"; exit 1; }
 echo "job $JID host $(hostname) commit $(git -C $W rev-parse HEAD) GPUs ${G[*]}"
+echo "nvidia-smi -L for this job's GPUs 0-2 (by CUDA_VISIBLE_DEVICES index):"
 nvidia-smi -L | sed -n "$((G[0] + 1))p;$((G[1] + 1))p;$((G[2] + 1))p"
-nvidia-smi topo -m | head -12
 bash $W/serving/build_flint_sglang.sh "$TMPDIR/flint_pkg" || exit 1
 PORT=$((20000 + ($(echo "$JID" | tr -dc 0-9 | tail -c 6) % 500) * 20))
 SERVE="bash $MODEL/sglang/serve_h200.sh --tp-size 2 --mem-fraction-static 0.85 --nccl-port $((PORT + 1)) --host 127.0.0.1 --disable-cuda-graph"
@@ -63,23 +60,24 @@ ready() {   # $1 server pid
   return 1
 }
 trial() {   # $1 name, $2 mode (two|one), then NCCL settings as K=V
-  local name=$1 mode=$2 srv kv
+  local name=$1 mode=$2 kv
   shift 2
   local envs=(--env NCCL_DEBUG=INFO)
   for kv in "$@"; do envs+=(--env "$kv"); done
+  STARTED=()
   echo "== $name ($mode instances; $*) $(date -Is)"
   if [ "$mode" = two ]; then
-    apptainer exec "${COMMON[@]}" "${envs[@]}" --env "CUDA_VISIBLE_DEVICES=${G[0]},${G[1]}" \
-      --env "PYTHONPATH=$TMPDIR/flint_pkg" "$MSIF" $SERVE > "$OUT/server_$name.log" 2>&1 &
-    srv=$!
-    if ready $srv; then
-      apptainer exec "${COMMON[@]}" "${envs[@]}" --env "CUDA_VISIBLE_DEVICES=${G[2]}" --env "PYTHONPATH=$MILES" \
+    start apptainer exec "${COMMON[@]}" "${envs[@]}" --env "CUDA_VISIBLE_DEVICES=${G[0]},${G[1]}" \
+      --env "PYTHONPATH=$TMPDIR/flint_pkg" "$MSIF" $SERVE > "$OUT/server_$name.log" 2>&1
+    if ready "${STARTED[0]}"; then
+      start apptainer exec "${COMMON[@]}" "${envs[@]}" --env "CUDA_VISIBLE_DEVICES=${G[2]}" --env "PYTHONPATH=$MILES" \
         "$MSIF" $TRAIN > "$OUT/trainer_$name.log" 2>&1
+      wait "${STARTED[1]}"
     else
       echo "server not ready"; tail -5 "$OUT/server_$name.log"
     fi
   else
-    apptainer exec "${COMMON[@]}" "${envs[@]}" "$MSIF" bash -c "
+    start apptainer exec "${COMMON[@]}" "${envs[@]}" "$MSIF" bash -c "
       CUDA_VISIBLE_DEVICES=${G[0]},${G[1]} PYTHONPATH=$TMPDIR/flint_pkg $SERVE > $OUT/server_$name.log 2>&1 &
       S=\$!
       for _ in \$(seq 1 40); do
@@ -88,16 +86,13 @@ trial() {   # $1 name, $2 mode (two|one), then NCCL settings as K=V
         sleep 5
       done
       CUDA_VISIBLE_DEVICES=${G[2]} PYTHONPATH=$MILES $TRAIN > $OUT/trainer_$name.log 2>&1
-      kill \$S" &
-    srv=$!
-    wait $srv
+      kill \$S"
+    wait "${STARTED[0]}"
   fi
   grep -h -E "NCCL_DIAG|trainer CUDA|group connected" "$OUT/trainer_$name.log"
   grep -h -m6 -E "Failed to receive|WARN|failure|Cuda failure" "$OUT/server_$name.log" "$OUT/trainer_$name.log"
-  kill $srv 2>/dev/null
+  stop "${STARTED[@]}"
   sleep 5
-  reap
-  sleep 2
 }
 trial two two
 trial one one
