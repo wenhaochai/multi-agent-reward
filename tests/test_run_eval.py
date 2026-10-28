@@ -1,8 +1,7 @@
 """run_eval.py's run outcome without a server (game.episode stubbed): an exception in one episode becomes its aborted
 row and the others finish; rows still missing give exit 99 and the rerun resumes only those; an episode is given up
 after --max-episode-tries rows that are not clean; a run whose episodes all crash exits 1; a judge-infra row reruns;
-checkpoints pause at the job's end and resume; a tail stop exits 3; a driver on a directory another process holds
-stops at once. With fake HTTP: (c) after a run whose episodes moved, every server's count is 0; (e) a dead server
+checkpoints pause at the job's end and resume; a driver on a directory another process holds stops at once. With fake HTTP: (c) after a run whose episodes moved, every server's count is 0; (e) a dead server
 (failed retries and /health_generate) gets no new episodes, its episode goes on elsewhere, and the run exits 99; the
 rerun resumes and exits 0. A 400 or a reply without choices aborts one episode instead of the run."""
 import asyncio
@@ -141,15 +140,6 @@ check("rerun resumes every episode from its save, exit 0, states removed", c == 
       and all(starts[k][-1] > 0 for k in saved) and not list((TMP / "c1/state").iterdir())
       and all("minutes" in x for x in r), (c, starts, r))
 starts.clear()
-ROUNDS = {3: 100000}
-args.tail_exit_min = 0.002   # 0.12 s
-c = run("c2")
-args.tail_exit_min = 0
-r = rows("c2")
-check("tail exit: a server without episodes stops the run, exit 3, the long one keeps its state", c == 3
-      and sorted(x["pid"] for x in r) == [0, 1, 2] and (TMP / "c2/state/3_e0.pkl").exists(), (c, r))
-ROUNDS = {3: starts[(3, 0)][-1] + 2}
-check("tail: the rerun resumes it", run("c2") == 0 and starts[(3, 0)][-1] > 0 and len(rows("c2")) == 4)
 args.no_ckpt = True
 ROUNDS = {i: 100000 for i in range(4)}
 os.environ["SLURM_JOB_END_TIME"] = str(int(time.time()) + RE.STOP_MARGIN_S + 1)

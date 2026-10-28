@@ -445,77 +445,12 @@ def _case_interactive(prob, sol: Path, inter: Path, case, work: Path) -> float:
             (work / f"{case[0]}{suffix}").unlink(missing_ok=True)
 
 
-_V_RUN = re.compile(r"run: code=(\S+) cpu=([\d.]+)/([\d.]+) killed=(\w+)")
-_V_CHK = re.compile(r"chk=(-?\d+) ")
-_V_INT = re.compile(r"sol code=(\S+) cpu=([\d.]+)/([\d.]+) rss=(-?\d+)MiB/(\d+) killed=(\w+); inter code=(\S+) "
-                    r"killed=(\w+)")
-
-
-def verdict(info: str) -> str:
-    """A case's verdict from the case_info line this judge wrote: OK (a valid output, scored by the checker or
-    interactor, 0 points included), WA, TLE, MLE (interactive only: a classic program over its address space crashes,
-    so RE), RE, OLE, INFRA, or JUDGE (the checker / interactor failed, or the line is not one of ours). Only the fixed
-    prefix is read, never the checker's message, which can quote the expected output."""
-    if info.startswith("INFRA"):
-        return "INFRA"
-    code = lambda s: None if s == "None" else int(s)
-    m = _V_RUN.match(info)
-    if m:
-        c, cpu, tl, killed = code(m[1]), float(m[2]), float(m[3]), m[4] == "True"
-        if killed or cpu > tl or c == -signal.SIGXCPU:
-            return "TLE"
-        if c == -signal.SIGXFSZ:   # a write past STDOUT_MAX (RLIMIT_FSIZE)
-            return "OLE"
-        if c not in (0, None):
-            return "RE"
-        return "TLE" if cpu >= tl else "OLE"   # exit 0 under the limit: the output passed STDOUT_MAX
-    m = _V_CHK.match(info)
-    if m:
-        r = int(m[1])
-        return "OK" if r in (OK_EXIT, POINTS_EXIT) else "WA" if r in (1, 2) else "JUDGE"
-    m = _V_INT.match(info)
-    if m:
-        c, cpu, tl, rss, ml, killed = code(m[1]), float(m[2]), float(m[3]), int(m[4]), int(m[5]), m[6] == "True"
-        i, ikilled = code(m[7]), m[8] == "True"
-        if killed or cpu > tl or c == -signal.SIGXCPU:
-            return "TLE"
-        if rss > ml:
-            return "MLE"
-        if c == -signal.SIGPIPE and not ikilled and i in (1, 2):   # the interactor rejected and closed its pipe
-            return "WA"
-        if c != 0:
-            return "RE"
-        if ikilled:
-            return "JUDGE"
-        if i == -signal.SIGPIPE:   # the program ended (closing its pipe) before the interaction did
-            return "WA"
-        return "OK" if i in (OK_EXIT, POINTS_EXIT) else "WA" if i in (1, 2) else "JUDGE"
-    return "JUDGE"
-
-
-# FCS_CASE_POOL=1: one process-wide pool of FCS_CASE_SLOTS threads (default: the job's cores - 8) runs every compile
-# and every test case of every judge call, first come first served. The CPU stays bounded as before, a busy judge keeps
-# its throughput, and a program judged alone gets all slots for its cases. With a fixed FCS_CASE_WORKERS per program
-# and one case at a time, the last program of an eval ran its 100 cases one by one for ~50 min while every GPU idled,
-# and the CSES 90-min rule cancelled job 14952941 (2026-10-06).
-CASE_POOL = os.environ.get("FCS_CASE_POOL", "0") == "1"
-_POOL = None
-
-
-def _case_pool() -> ThreadPoolExecutor:
-    global _POOL
-    if _POOL is None:
-        slots = int(os.environ.get("FCS_CASE_SLOTS", "0")) or max(1, job_cpus() - 8)
-        _POOL = ThreadPoolExecutor(max_workers=slots, thread_name_prefix="fcs-slot")
-    return _POOL
-
-
 # FCS_CASE_PROC=1 (the default): every compile and test case runs in a small worker process, not in the caller. A Popen
 # with a preexec_fn forks its caller, and fork copies the caller's page tables while it holds the caller's mmap lock. In
 # the rollout process (13.5 GB resident, 319 threads) 40-88 of the 88 case threads sat in lock_mm_and_find_vma, page
 # faults waiting for that lock, so interactors waited seconds for their program and the team_bonus eval 15523392 judged
-# 98 of 680 episodes in 13 h with one request per engine. The thread slots above still decide what runs and in what
-# order; a worker only runs one call at a time. Workers are plain `python3 -c` children (started with vfork, as they need
+# 98 of 680 episodes in 13 h with one request per engine. The case threads of judge() still decide what runs and in
+# what order; a worker only runs one call at a time. Workers are plain `python3 -c` children (started with vfork, as they need
 # no preexec_fn) that read pickled calls on stdin: multiprocessing would import the caller's __main__ (Ray's worker
 # script) in each of them. At most FCS_CASE_PROCS workers (default: the job's cores); a worker that dies is replaced
 # and its call retried once.
@@ -626,8 +561,7 @@ def _compile(work: Path, sol: Path):
                                              nproc=_nproc_limit()))
 
 
-def judge(problem_dir, source: str, case_workers: int = CASE_WORKERS, pool: ThreadPoolExecutor | None = None) -> dict:
-    """pool: run the compile and every case in this executor instead of the shared case pool."""
+def judge(problem_dir, source: str, case_workers: int = CASE_WORKERS) -> dict:
     prob = load_problem(Path(problem_dir))
     if not prob["cases"]:
         return {"score": 0.0, "status": "no cases", "cases": []}
@@ -635,20 +569,15 @@ def judge(problem_dir, source: str, case_workers: int = CASE_WORKERS, pool: Thre
     try:
         (work / "sol.cpp").write_text(source)
         sol = work / "sol"
-        slots = pool or (_case_pool() if CASE_POOL else None)
-        r = slots.submit(_in_proc, _compile, work, sol).result() if slots else _in_proc(_compile, work, sol)
+        r = _in_proc(_compile, work, sol)
         if r.returncode != 0:
             infra = r.returncode < 0 or any(m in r.stderr for m in _INFRA_MARKERS)
             return {"score": 0.0, "status": "infra error" if infra else "compile error", "cases": [],
                     "msg": r.stderr[:1 << 21], "infra": infra}  # whole compiler output (up to 2 MiB)
         helper = _compile_helper(prob["dir"], prob["interactor"] if prob["interactive"] else prob["checker"])
         fn = _case_interactive if prob["interactive"] else _case_classic
-        if slots:   # leaf tasks only (no slot waits on another), so the pool cannot deadlock
-            futs = [slots.submit(_case, fn, prob, sol, helper, c, work) for c in prob["cases"]]
-            res = [f.result() for f in futs]
-        else:
-            with ThreadPoolExecutor(max_workers=max(1, case_workers)) as ex:
-                res = list(ex.map(lambda c: _case(fn, prob, sol, helper, c, work), prob["cases"]))
+        with ThreadPoolExecutor(max_workers=max(1, case_workers)) as ex:
+            res = list(ex.map(lambda c: _case(fn, prob, sol, helper, c, work), prob["cases"]))
         ratios = [r for r, _ in res]
         infos = [i for _, i in res]
         return {"score": 100.0 * sum(ratios) / len(ratios), "status": "done", "cases": ratios, "case_info": infos,
@@ -665,7 +594,7 @@ def _safe(fn, *a):
 
 
 def _case(fn, *a):
-    """One case in a worker process; a pool that failed twice is an infrastructure failure too."""
+    """One case in a worker process; a worker that died twice is an infrastructure failure too."""
     try:
         return _in_proc(_safe, fn, *a)
     except Exception as e:
@@ -700,19 +629,17 @@ def _thread(fn, *a):
 def judge_full(problem_dir: str, code: str) -> dict:
     """Judge a program: {"score": [0, 1], "cases": per-case ratios (zeros when nothing ran), "status": ...,
     "infra_error": bool, "msg": the compiler output of a compile error, "case_info": the judge's per-case lines, cut to
-    160 chars ([] when nothing ran), "verdicts": one per case (verdict(): OK, WA, TLE, ...; CE for a compile error, -
-    when nothing ran)}. Infrastructure failures are logged and flagged, never a silent 0. case_info can quote the
-    checker, which may print expected output: keep it out of what an agent sees (verdicts are safe to show)."""
+    160 chars ([] when nothing ran)}. Infrastructure failures are logged and flagged, never a silent 0. case_info can
+    quote the checker, which may print expected output: keep it out of what an agent sees."""
     n = len(load_problem(Path(problem_dir))["cases"])
     if not code:
-        return {"score": 0.0, "cases": [0.0] * n, "status": "no code", "infra_error": False, "msg": "",
-                "case_info": [], "verdicts": ["-"] * n}
+        return {"score": 0.0, "cases": [0.0] * n, "status": "no code", "infra_error": False, "msg": "", "case_info": []}
     try:
         r = judge(problem_dir, code)
     except Exception as e:
         print(f"[fcs_rm] JUDGE-ERROR {problem_dir}: {e}"[:500], file=sys.stderr, flush=True)
         return {"score": 0.0, "cases": [0.0] * n, "status": "judge error", "infra_error": True, "msg": "",
-                "case_info": [], "verdicts": ["-"] * n}
+                "case_info": []}
     cases = r.get("cases") or [0.0] * n
     infra = bool(r.get("infra")) or r.get("status") == "infra error"
     if infra:
@@ -720,9 +647,7 @@ def judge_full(problem_dir: str, code: str) -> dict:
               file=sys.stderr, flush=True)
     return {"score": r["score"] / 100.0, "cases": [float(c) for c in cases], "status": r["status"],
             "infra_error": infra, "msg": r.get("msg", "") if r["status"] == "compile error" else "",
-            "case_info": [str(i)[:160] for i in (r.get("case_info") or [])],
-            "verdicts": ([verdict(str(i)) for i in r.get("case_info") or []] if r["status"] == "done" else
-                         ["CE"] * n if r["status"] == "compile error" else ["-"] * n)}
+            "case_info": [str(i)[:160] for i in (r.get("case_info") or [])]}
 
 
 async def judge_code(problem_dir: str, code: str) -> dict:

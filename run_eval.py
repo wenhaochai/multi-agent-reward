@@ -13,13 +13,12 @@ Checkpoints (default on, --no-ckpt off): each episode saves its state to <out>/s
 at the end of a round every MA_LG_CKPT_S seconds (300) and after every round with a submission (game.Checkpoint), and
 the next run resumes it there. A transport abort keeps the state; a crash or a finished row removes it. The run stops
 early, pausing every episode at the end of its round (up to STOP_GRACE_S, then cancelled at its last save), 10 min
-before SLURM_JOB_END_TIME, when a server is down (its GPUs idle; the requeue starts fresh ones), or with
---tail-exit-min M when every episode has started and a server has had none for M minutes.
+before SLURM_JOB_END_TIME, or when a server is down (its GPUs idle; the requeue starts fresh ones).
 
 Exit status (wq requeues a --partial job on 99): 0 when every episode has a clean score or has failed
 --max-episode-tries times; 99 when some episode can still be retried or resumed, so the next run takes only those;
-3 after a --tail-exit-min stop; 1 when every episode this run started crashed (a bug: fail fast instead of looping) or
-the run wrote no row and saved no checkpoint. An exception in one episode (a 400 reply, a bad JSON reply, a bug)
+1 when every episode this run started crashed (a bug: fail fast instead of looping), the run wrote no row and saved no
+checkpoint, or another driver holds --out. An exception in one episode (a 400 reply, a bad JSON reply, a bug)
 becomes that episode's aborted row and does not stop the others."""
 import argparse
 import asyncio
@@ -127,7 +126,7 @@ async def main(args, client: Client | None = None) -> int:
     lock = lock_out(out_dir)   # noqa: F841 (held until main returns)
     os.environ.setdefault("MA_AG_TRACE_DIR", str(out_dir / "traces"))
     client = client or make_client(args)
-    stop: list = [None]   # why the run stops early: "time", "down" or "tail"
+    stop: list = [None]   # why the run stops early: "time" or "down"
     rows = [json.loads(line) for line in open(args.data) if line.strip()]
     if args.limit:
         rows = rows[: args.limit]
@@ -163,14 +162,13 @@ async def main(args, client: Client | None = None) -> int:
         print(f"{n_res} of them resume from a checkpoint", flush=True)
     sem = asyncio.Semaphore(args.concurrency)
     await client.open()
-    ran, cks, running, started, paused = [], [], {}, [0], [0]   # this run's rows and checkpoints; episodes in flight
+    ran, cks, running, paused = [], [], {}, [0]   # this run's rows and checkpoints; episodes in flight
 
     def new_session(inp, name):
         return ChatSession(client, inp, name, G.MAX_LEN)
 
     async def one(i, e, r):
         async with sem:
-            started[0] += 1
             if client.down or stop[0]:   # a server died or the run stops: the requeue (exit 99) runs it on fresh servers
                 return
             t0 = time.time()
@@ -219,19 +217,13 @@ async def main(args, client: Client | None = None) -> int:
     tasks = [asyncio.create_task(one(i, e, r)) for i, e, r in todo]
 
     async def watch():
-        zero = {u: None for u in client.urls}   # since when a live server has had no episode
         while True:
             await asyncio.sleep(WATCH_S)
-            now, end = time.time(), os.environ.get("SLURM_JOB_END_TIME", "")
-            for u in client.urls:
-                zero[u] = (zero[u] or now) if client.active[u] == 0 and u not in client.down else None
-            if end.isdigit() and now > int(end) - STOP_MARGIN_S:
+            end = os.environ.get("SLURM_JOB_END_TIME", "")
+            if end.isdigit() and time.time() > int(end) - STOP_MARGIN_S:
                 stop[0] = "time"
             elif client.down:
                 stop[0] = "down"
-            elif args.tail_exit_min > 0 and started[0] >= len(todo) and running and \
-                    any(z is not None and now - z >= 60 * args.tail_exit_min for z in zero.values()):
-                stop[0] = "tail"
             if stop[0]:
                 break
         print(f"stopping ({stop[0]}): {len(running)} episodes in flight pause at the end of their round", flush=True)
@@ -263,13 +255,11 @@ async def main(args, client: Client | None = None) -> int:
         print(f"servers down: {sorted(client.down)}", flush=True)
     if stop[0] or paused[0] or n_cut:
         print(f"stopped ({stop[0]}): {paused[0]} episodes paused at a checkpoint, {n_cut} cancelled", flush=True)
-    if code and stop[0] == "tail":
-        code = 3
-    elif code == 99 and not ran and not sum(ck.saves for ck in cks):   # no row, no checkpoint: a rerun would repeat
+    if code == 99 and not ran and not sum(ck.saves for ck in cks):   # no row, no checkpoint: a rerun would repeat
         print("no progress in this run", flush=True)
         code = 1
     if code:
-        print(f"exit {code}" + (": rerun the same command to resume" if code in (3, 99) else ""), flush=True)
+        print(f"exit {code}" + (": rerun the same command to resume" if code == 99 else ""), flush=True)
     return code
 
 
@@ -290,8 +280,6 @@ def parse(argv=None):
                     help="an episode whose rows are all aborted or judge-infra after this many runs is given up")
     ap.add_argument("--no-route", action="store_true", help="episodes stay on their first server unless it is down")
     ap.add_argument("--no-ckpt", action="store_true", help="no episode checkpoints: a stopped run restarts its episodes")
-    ap.add_argument("--tail-exit-min", type=float, default=0,
-                    help="stop (exit 3) once every episode has started and a server has had none for this many minutes")
     return ap.parse_args(argv)
 
 

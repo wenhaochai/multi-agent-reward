@@ -183,7 +183,8 @@ watchdog() {
     now=$(date +%s)
     [ $((now - t0)) -ge $((IDLE_MIN * 60)) ] || continue
     for ((r = 0; r < NS; r++)); do
-      last=$(tac "${LOGS[$r]}" | grep -m1 -oE '^\[[0-9-]+ [0-9:]+ TP0\] (Prefill|Decode) batch' | cut -c2-20)
+      # tac's stderr: grep -m1 closes the pipe at its first match ("tac: write error: Broken pipe" every minute)
+      last=$(tac "${LOGS[$r]}" 2>/dev/null | grep -m1 -oE '^\[[0-9-]+ [0-9:]+ TP0\] (Prefill|Decode) batch' | cut -c2-20)
       ts=$t0; [ -n "$last" ] && ts=$(date -d "$last" +%s); [ "$ts" -ge "$t0" ] || ts=$t0
       [ $((now - ts)) -ge $((IDLE_MIN * 60)) ] || continue
       rem=$(remaining)
@@ -217,7 +218,7 @@ if [ "$REM" -eq 0 ]; then echo EVAL_DONE; exit 0; fi
 if [ ! -s "$STOPF" ]; then
   case "$rc" in
     0) echo "EVAL_DONE_GIVEN_UP $REM: the driver gave these up after their tries"; exit 0;;
-    3|99) echo "EVAL_PARTIAL $REM: the driver can resume them (exit $rc): requeue (exit 99)"; exit 99;;
+    99) echo "EVAL_PARTIAL $REM: the driver can resume them (exit $rc): requeue (exit 99)"; exit 99;;
   esac
 fi
 if [ -s "$STOPF" ] && ls "$OUT"/state/*.pkl >/dev/null 2>&1; then
