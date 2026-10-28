@@ -4,7 +4,7 @@
 #SBATCH --mem=240G
 #SBATCH --time=01:30:00
 #SBATCH --output=/scratch/gpfs/GROUP/USER/project/flint-eval/logs/%x-%j.out
-# S2 gate 1b/1c: routing_check.py on 4 GPUs in miles-v0.1.3.sif (TE 2.17, miles' fused experts).
+# S2: routing_check.py on 4 GPUs in miles-v0.1.3.sif: whole-model gradients with own vs fixed expert routing.
 # Usage: routing_job.sh SEQS_JSON OUT_LOG
 set -uo pipefail
 P=/scratch/gpfs/GROUP/USER/project
