@@ -1,10 +1,9 @@
-"""HF side of the parity check, on every GPU in CUDA_VISIBLE_DEVICES (load_flint's manual pipeline). Loads the model,
-waits for SGLang's results, then for every sequence (and each sampled continuation) the log-probability of each next
-token, the HF top-32 head, and the HF logprobs of SGLang's head ids. Then one forward+backward on 8k tokens with
+"""HF side of the parity check, on every GPU in CUDA_VISIBLE_DEVICES (load_flint's manual pipeline). For every sequence
+(and each sampled continuation) the log-probability of each next token, the HF top-32 head, and the HF logprobs of
+SGLang's head ids. Then one forward+backward on 8k tokens with
 gradient checkpointing: finite gradients, peak memory. Then the transformers loading path that miles' FSDP backend
 uses (from_pretrained on CPU) against load_flint. Usage: hf_score.py seqs.json sglang.pt out.pt"""
 import json
-import os
 import sys
 import time
 
@@ -19,9 +18,6 @@ devs = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
 t0 = time.time()
 model = load_flint(MODEL, devs).eval()
 print(f"loaded on {devs} in {time.time() - t0:.0f}s", flush=True)
-while not os.path.exists(SG):
-    time.sleep(20)
-time.sleep(5)
 sg = torch.load(SG)
 
 
