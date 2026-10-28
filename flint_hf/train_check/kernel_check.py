@@ -181,7 +181,8 @@ def check_model(seqs_path, devices):
         gen[a:min(b, cut)] = True
     rows = torch.nonzero(gen[1:]).flatten()   # row r predicts token r + 1
     model = load_flint(MODEL, devices)
-    model.gradient_checkpointing_enable()   # the eager reference keeps fp32 attention probabilities otherwise
+    # the eager reference keeps fp32 attention probabilities otherwise; non-reentrant, as most parameters are frozen
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.train()
     probe = {"sinks.L2": model.model.layers[2].self_attn.softmax_offset,
              "q_proj.L10": model.model.layers[10].self_attn.q_proj.weight,
