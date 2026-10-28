@@ -2,7 +2,7 @@
 #SBATCH --job-name=flint-smoke
 #SBATCH --gres=gpu:4
 #SBATCH --mem=240G
-#SBATCH --time=02:30:00
+#SBATCH --time=02:45:00
 #SBATCH --output=/scratch/gpfs/GROUP/USER/project/flint-eval/logs/%x-%j.out
 #FETCHABLE
 # mas-rl: a smoke of the long game on one server (TP = the job's GPUs: 2, 4 or 8). Usage: smoke.sh [key=value ...]
@@ -13,6 +13,8 @@
 # Gate (exit 0): every episode ended clean, and in a team every owed post was paid (after each submission the agent's
 # next command that ran was a post with a message; refused commands between are fine). How many posts were owed is
 # printed: a short smoke may have no submission, and then the post rule is untested.
+# Wall time 2:45 = up to 30 min of server start + 120 min of driver + 15 min to spare (the post smoke w522 of
+# 2026-10-28, 2 episodes x 4 agents x 150k at TP4: driver 91 min); smoke_wq.sh runs this script under the same limit.
 set -euo pipefail
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY   # see eval.sh
 export no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
@@ -69,7 +71,7 @@ cd "$REPO"
 set +e
 APPTAINERENV_PYTHONPATH=$REPO APPTAINERENV_MA_LG_N=$AGENTS APPTAINERENV_MA_LG_TOKENS=$TOKENS \
 APPTAINERENV_FCS_RM_CONCURRENCY=8 APPTAINERENV_FCS_JUDGE_TMP=$TMPDIR APPTAINERENV_FCS_JUDGE_CACHE=$TMPDIR/fcs_judge_cache \
-  timeout 140m apptainer exec --home "$TMPDIR" --bind /scratch/gpfs/GROUP "$PYSIF" \
+  timeout 120m apptainer exec --home "$TMPDIR" --bind /scratch/gpfs/GROUP "$PYSIF" \
   python3 run_eval.py --base-url "http://127.0.0.1:$PORT" --model flint --data "$DATA" --out "$OUT" \
   --limit "$N" --concurrency "$N" 2>&1 | tee -a "$OUT/driver.log"
 rc=${PIPESTATUS[0]}
