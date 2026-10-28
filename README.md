@@ -44,6 +44,9 @@ Two rules make the game work for Flint. Both come from test runs:
 | `flint/judge.py` | The local Frontier-CS judge |
 | `run_eval.py` | The driver: runs the episodes of a data file against served Flint, resumable |
 | `jobs/` | wq jobs on Della: `arm.sh`, `eval.sh`, `smoke.sh`, `smoke_wq.sh` |
+| `flint/miles_agent.py` | One episode as a miles agent against a TITO session (RL rollouts), and its session message matcher |
+| `serving/` | The Flint SGLang plugin ported to miles' SGLang 0.5.23, and its checks |
+| `rl/` | Rollouts through miles v0.1.3 (rollout only for now), miles' GPU TITO check, the samples' checks |
 | `tests/` | The tests: `bash tests/run_all.sh` |
 
 ## Run
@@ -63,6 +66,11 @@ before the arms, so the arms skip theirs:
     wq submit --prio 10 --project flint-eval jobs/smoke_wq.sh team w<arm> [w<arm> ...]
 
 `jobs/eval.sh SPLIT TOKENS EPISODES agents=N` runs any other eval.
+
+Rollouts through miles (one Flint per episode on the RL test problem, 4 H100s, two engines at TP2; miles from our fork
+worktree `miles-rollout`, branch flint-grpo of wenhaochai/miles-private):
+
+    wq submit --prio 10 --time 3:00:00 --project flint-eval rl/rollout_job.sh full   # 8 x 128k with and without top-32
 
 ## Tests
 
