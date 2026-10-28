@@ -34,6 +34,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PreTrainedModel
+from transformers import initialization as init
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -224,15 +225,13 @@ class FlintPreTrainedModel(PreTrainedModel):
     _no_split_modules = ["FlintDecoderLayer"]
 
     def _init_weights(self, module):
-        std = self.config.initializer_range
-        if isinstance(module, (nn.Linear, nn.Embedding, FlintTopKRouter)):
-            module.weight.data.normal_(0.0, std)
-        if isinstance(module, nn.Linear) and module.bias is not None:
-            module.bias.data.zero_()
-        elif isinstance(module, FlintRMSNorm):
-            module.weight.data.fill_(1.0)
+        """transformers' init functions skip what from_pretrained loaded. Linear, Embedding, RMSNorm: the base's."""
+        super()._init_weights(module)
+        if isinstance(module, FlintTopKRouter):
+            init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+            init.zeros_(module.expert_bias)
         elif isinstance(module, FlintAttention):
-            module.softmax_offset.data.zero_()
+            init.zeros_(module.softmax_offset)
 
 
 class FlintModel(FlintPreTrainedModel):

@@ -1,67 +1,81 @@
-"""Parity table from the saved results. Per pair of scorers, over every predicted position: mean, p99 and max of
-|delta logprob| of the actual next token; top-1 agreement; and the head KL, sum over the reference's top-32 ids v of
-q_v (log q_v - log p_v) plus the tail term (1 - sum q) log((1 - sum q) / (1 - sum p)), q the reference (SGLang server A
-alone) and p the other scorer; for an SGLang scorer only positions whose 32 ids it also returned count (n_kl).
-Usage: compare.py seqs.json sglang_A.pt sglang_C.pt hf.pt (sglang_C.pt = sglang_A.pt when C did not run)"""
+"""Parity table from the saved results in OUTDIR. Per pair of scorers, over every predicted position: mean, p99 and
+max of |delta logprob| of the actual next token; top-1 agreement; and the head KL, sum over the reference's top-32 ids
+v of q_v (log q_v - log p_v) plus the tail term (1 - sum q) log((1 - sum q) / (1 - sum p)), q the reference and p the
+other scorer; for an SGLang scorer only positions whose 32 reference ids it also returned count (n_kl). Positions are
+split by the role of the predicted token: assistant text (what RL trains on) or user text (prompt and command output,
+which the loss masks). Reference A = the kit's SGLang 0.5.16 at TP2, chunked prefill 4096 (the eval servers).
+Usage: compare.py seqs.json OUTDIR"""
 import json
 import sys
+from pathlib import Path
 
 import torch
 
+USER, ASSISTANT = 150003, 150004   # <|user|>, <|assistant|>
 seqs = json.load(open(sys.argv[1]))
-A, C, HF = (torch.load(p) for p in sys.argv[2:5])
+out = Path(sys.argv[2])
+A = torch.load(out / "sglang_A.pt")
+HF = torch.load(out / "hf.pt")
+others = {n: torch.load(out / f"sglang_{n}.pt") for n in ("B", "B2", "C") if (out / f"sglang_{n}.pt").exists()}
+KEYS = ("lp", "top_v", "top_i")
 
 
-def head_kl(qv, qi, pv_at):
-    """qv, qi: reference head [N, 32]; pv_at: the other scorer's logprobs at qi (nan where unknown)."""
-    ok = ~torch.isnan(pv_at).any(1)
-    q, p = qv[ok].exp(), pv_at[ok].exp()
-    tq, tp = (1 - q.sum(1)).clamp(min=1e-12), (1 - p.sum(1)).clamp(min=1e-12)
-    kl = (q * (qv[ok] - pv_at[ok])).sum(1) + tq * (tq.log() - tp.log())
-    return kl, int(ok.sum())
+def pool(rs, keys=KEYS):
+    return {k: torch.cat([r[k] for r in rs]) for k in keys}
 
 
 def at_ids(other, ids):
-    """The other SGLang scorer's logprobs at the reference ids, from its own top-32 (nan if absent)."""
+    """Another SGLang scorer's logprobs at the reference ids, from its own top-32 (nan where absent)."""
     out = torch.full(ids.shape, float("nan"), dtype=torch.float64)
-    match = other["top_i"][:, None, :] == ids[:, :, None]          # [N, 32 ref, 32 other]
+    match = other["top_i"][:, None, :] == ids[:, :, None]
     hit = match.any(-1)
     out[hit] = (match.double() * other["top_v"][:, None, :]).sum(-1)[hit]
     return out
 
 
 def row(name, ref, oth, at, mask=None):
-    d = (oth["lp"] - ref["lp"]).abs()
-    top1 = (oth["top_i"][:, 0] == ref["top_i"][:, 0]).double()
-    kl, n = head_kl(ref["top_v"], ref["top_i"], at)
-    if mask is not None:
-        d, top1 = d[mask], top1[mask]
-    return (f"{name:<42} {d.numel():>8} {d.mean():.2e} {d.quantile(0.99):.2e} {d.max():.2e} {top1.mean():.4f} "
-            f"{kl.mean():.2e} {n:>8}")
+    keep = torch.ones(len(ref["lp"]), dtype=torch.bool) if mask is None else mask
+    d = (oth["lp"] - ref["lp"]).abs()[keep]
+    top1 = (oth["top_i"][:, 0] == ref["top_i"][:, 0])[keep].double()
+    ok = keep & ~torch.isnan(at).any(1)
+    q, p = ref["top_v"][ok].exp(), at[ok].exp()
+    tq, tp = (1 - q.sum(1)).clamp(min=1e-12), (1 - p.sum(1)).clamp(min=1e-12)
+    kl = (q * (ref["top_v"][ok] - at[ok])).sum(1) + tq * (tq.log() - tp.log())
+    return (f"{name:<40} {d.numel():>7} {d.mean():.2e} {d.quantile(0.99):.2e} {d.max():.2e} {top1.mean():.4f} "
+            f"{kl.mean():.2e} {int(ok.sum()):>7}")
 
 
-def cat(rs, key):
-    return torch.cat([r[key] for r in rs])
+def roles(ids):
+    """For each predicted position p (token p + 1): True when the token is in an assistant message."""
+    r, cur = [], False
+    for t in ids[1:]:
+        r.append(cur)
+        cur = True if t == ASSISTANT else False if t == USER else cur
+    return torch.tensor(r)
 
 
-print(f"{'pair (reference A = SGLang 0.5.16 TP2, alone)':<42} {'n':>8} {'mean|d|':>8} {'p99|d|':>8} {'max|d|':>8} "
-      f"{'top1':>6} {'headKL':>8} {'n_kl':>8}")
-pool = lambda rs: {k: cat(rs, k) for k in ("lp", "top_v", "top_i")}
-refA, batchA, solC = pool(A["solo"]), pool(A["batch"]), pool(C["solo"])
-hf = {k: cat(HF["seqs"], k) for k in ("lp", "top_v", "top_i", "at_head")}
-print(row("floor: A in a batch of 8 vs A alone", refA, batchA, at_ids(batchA, refA["top_i"])))
-if sys.argv[3] != sys.argv[2]:   # C, when its server ran
-    print(row("C: miles' SGLang vs A", refA, solC, at_ids(solC, refA["top_i"])))
-print(row("HF eager fp32 vs A", refA, hf, hf["at_head"]))
+refA = pool(A["solo"])
+hf = pool(HF["seqs"], KEYS + ("at_head",))
+asst = torch.cat([roles(s["ids"]) for s in seqs])
 pos = torch.cat([torch.arange(len(s["ids"]) - 1) for s in seqs])
-print(row("  HF vs A, positions < 513 (window not full)", refA, hf, hf["at_head"], pos < 513))
-print(row("  HF vs A, positions >= 513", refA, hf, hf["at_head"], pos >= 513))
-print(row("  HF vs A, positions >= 32768", refA, hf, hf["at_head"], pos >= 32768))
-print(row("  floor, positions >= 32768", refA, batchA, at_ids(batchA, refA["top_i"]), pos >= 32768))
-for s, a, h in zip(seqs, A["solo"], HF["seqs"]):
-    print(row(f"  HF vs A, {len(s['ids'])}-token sequence", a, h, h["at_head"]))
-dec = pool(A["samples"])   # decode-time logprobs of the sampled tokens
-pre = pool([{k: x["prefill"][k][-len(x["ids"]):] for k in ("lp", "top_v", "top_i")} for x in A["samples"]])
-hfs = {k: cat(HF["samples"], k) for k in ("lp", "top_v", "top_i", "at_head")}
-print(row("sampled tokens: A prefill vs A decode", dec, pre, at_ids(pre, dec["top_i"])))
-print(row("sampled tokens: HF vs A decode", dec, hfs, hfs["at_head"]))
+print(f"{'pair (reference first)':<40} {'n':>7} {'mean|d|':>8} {'p99|d|':>8} {'max|d|':>8} {'top1':>6} {'headKL':>8} "
+      f"{'n_kl':>7}")
+for label, mask in (("all positions", None), ("assistant tokens", asst), ("user tokens", ~asst)):
+    print(f"-- {label}")
+    print(row("A alone vs A in a batch of 8", refA, pool(A["batch"]), at_ids(pool(A["batch"]), refA["top_i"]), mask))
+    for n, o in others.items():
+        s = pool(o["solo"])
+        print(row(f"A vs {n}", refA, s, at_ids(s, refA["top_i"]), mask))
+    if "B" in others and "B2" in others:
+        b, b2 = pool(others["B"]["solo"]), pool(others["B2"]["solo"])
+        print(row("B vs B2", b, b2, at_ids(b2, b["top_i"]), mask))
+    print(row("A vs HF", refA, hf, hf["at_head"], mask))
+print("-- HF vs A by position (assistant tokens)")
+for lo, hi in ((0, 513), (513, 8192), (8192, 32768), (32768, 60000)):
+    print(row(f"positions {lo}-{hi - 1}", refA, hf, hf["at_head"], asst & (pos >= lo) & (pos < hi)))
+print("-- 1024 tokens sampled by A (temperature 1) after 4k, 16k and 48k tokens")
+dec = pool(A["samples"])
+pre = pool([{k: x["prefill"][k][-len(x["ids"]):] for k in KEYS} for x in A["samples"]])
+hfs = pool(HF["samples"], KEYS + ("at_head",))
+print(row("A decode vs A prefill", dec, pre, at_ids(pre, dec["top_i"])))
+print(row("A decode vs HF", dec, hfs, hfs["at_head"]))

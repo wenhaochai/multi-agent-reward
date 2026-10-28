@@ -1,15 +1,14 @@
 """HF side of the parity check, on every GPU in CUDA_VISIBLE_DEVICES (load_flint's manual pipeline). For every sequence
 (and each sampled continuation) the log-probability of each next token, the HF top-32 head, and the HF logprobs of
 SGLang's head ids. Then one forward+backward on 8k tokens with
-gradient checkpointing: finite gradients, peak memory. Then the transformers loading path that miles' FSDP backend
-uses (from_pretrained on CPU) against load_flint. Usage: hf_score.py seqs.json sglang.pt out.pt"""
+gradient checkpointing: finite gradients, peak memory. Usage: hf_score.py seqs.json sglang.pt out.pt"""
 import json
 import sys
 import time
 
 import torch
 
-from flint_hf import FlintForCausalLM, load_flint
+from flint_hf import load_flint
 
 MODEL = "/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint"
 SEQS, SG, OUT = sys.argv[1:4]
@@ -66,15 +65,3 @@ for name, p in model.named_parameters():
 peak = [round(torch.cuda.max_memory_allocated(d) / 2**30, 1) for d in devs]
 print(f"BACKWARD {x.numel() - 1} tokens in {time.time() - t0:.0f}s: {counts}; loss {(-lp.mean()).item():.4f}; "
       f"peak GiB per GPU {peak}", flush=True)
-ref = {n: p.detach() for n, p in model.named_parameters()}
-del model
-torch.cuda.empty_cache()
-
-t0 = time.time()
-hf = FlintForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, device_map="cpu")
-names = ["model.embed_tokens.weight", "model.layers.0.self_attn.softmax_offset", "model.layers.7.mlp.gate.weight",
-         "model.layers.7.mlp.experts.200.down_proj.weight", "model.layers.48.mlp.shared_expert.up_proj.weight",
-         "lm_head.weight"]
-same = all(torch.equal(dict(hf.named_parameters())[n], ref[n].cpu()) for n in names)
-print(f"FROM_PRETRAINED in {time.time() - t0:.0f}s: {sum(1 for _ in hf.parameters())} parameters, sampled tensors "
-      f"equal load_flint's: {same}", flush=True)

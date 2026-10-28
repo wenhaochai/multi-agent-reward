@@ -101,6 +101,17 @@ def test_backward_finite_with_checkpointing():
     assert torch.allclose(m.token_logprobs(m.model(ids[:-1]), ids[1:]), lp[:, 0], atol=1e-5)
 
 
+def test_save_and_from_pretrained_round_trip():
+    import tempfile
+    m = tiny()
+    with tempfile.TemporaryDirectory() as d:
+        m.save_pretrained(d)
+        m2 = FlintForCausalLM.from_pretrained(d, dtype=torch.float32)
+    p2 = dict(m2.named_parameters())
+    assert all(torch.equal(p, p2[n]) for n, p in m.named_parameters()), "from_pretrained re-initialized weights"
+    assert all(float(b.abs().sum()) == 0 for n, b in m2.named_buffers() if n.endswith("expert_bias"))
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
