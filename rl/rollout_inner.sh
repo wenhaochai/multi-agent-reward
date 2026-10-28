@@ -20,6 +20,7 @@ export RAY_USAGE_STATS_ENABLED=0 no_proxy=127.0.0.1,localhost MASTER_ADDR=127.0.
 export SGLANG_EXTERNAL_MODEL_PACKAGE=flint_sglang FLASHINFER_USE_CUDA_NORM=1 SGLANG_RETURN_ORIGINAL_LOGPROB=0
 # the game: one Flint (budget end with forced restart, its defaults); the bash tool without strict (see flint/chat.py)
 export MA_LG_N=1 MA_AG_TOOL_STRICT=0
+export FCS_PROC=/host/proc   # the judge counts the user's tasks on the node (rl/rollout_job.sh binds it)
 ulimit -n "$(ulimit -Hn)"   # 64 sessions of the TITO check, each agent a process, ran out of 1024 files (w558)
 NG=$(awk -F, '{print NF}' <<< "$CUDA_VISIBLE_DEVICES")
 JNUM=${JID//[!0-9]/}
@@ -49,7 +50,8 @@ GAME=(--prompt-data "$OUT/data_p0.jsonl" --input-key prompt --label-key label --
   --custom-agent-function-path flint.miles_agent.run --use-session-server v2 --tito-model flint
   --session-message-matcher flint.miles_agent.message_matches
   --sglang-tool-call-parser flint --sglang-reasoning-parser flint
-  --use-rollout-routing-replay --pause-generation-mode in_place)
+  --use-rollout-routing-replay --pause-generation-mode in_place
+  --rollout-sample-filter-path flint.miles_agent.drop_failed_groups)
 # --use-rollout-routing-replay: each token's routed experts, for routing replay in training (R3). Not 'retract' (the
 # default), with which the session server returns every turn's full R3 rows (~1.2 kB per token, the whole context)
 # instead of the new ones; the rollouts here are synchronous, so the pause mode changes nothing else.
@@ -69,8 +71,9 @@ rollout() {   # rollout NAME TOKENS SAMPLES LIMIT_S [train.py flags]: one group 
   local rc=$?
   echo "[s5a] $(date -u +%FT%TZ) $name: train.py exit $rc after $((SECONDS - t0)) s"
   ray_down
-  [ -e "$d/rollout_0.pt" ] && python3 "$REPO/rl/inspect_rollout.py" "$d" 2>&1 | tee "$d/inspect.txt"
-  return $rc
+  [ $rc -eq 0 ] || return $rc
+  python3 "$REPO/rl/inspect_rollout.py" "$d" 2>&1 | tee "$d/inspect.txt"
+  return "${PIPESTATUS[0]}"   # the samples' checks fail the run
 }
 
 tito_check() {   # miles' GPU TITO check for Flint (scripts/tools/verify_session_tito_tokenizer.py), its own Ray head
@@ -78,7 +81,8 @@ tito_check() {   # miles' GPU TITO check for Flint (scripts/tools/verify_session
   ray_up || return 1
   timeout -s KILL 1500 python3 "$REPO/rl/tito_verify.py" --hf-checkpoint "$FLINT" --tito-model flint \
     --sglang-reasoning-parser flint --sglang-tool-call-parser flint --rollout-num-gpus-per-engine 2 \
-    --actor-num-gpus-per-node "$NG" --n-samples-per-prompt 4 -- "${SERVE[@]}" > "$OUT/tito_verify.log" 2>&1
+    --actor-num-gpus-per-node "$NG" --n-samples-per-prompt 1 --global-batch-size 16 -- "${SERVE[@]}" \
+    > "$OUT/tito_verify.log" 2>&1   # 16 sessions: 64 agent processes ran out of the container's 5120 files (w562)
   local v=$?
   ray_down
   grep -E "Verdict|Template append roles" "$OUT/tito_verify.log"
@@ -87,25 +91,18 @@ tito_check() {   # miles' GPU TITO check for Flint (scripts/tools/verify_session
   return $v
 }
 
+# --rollout-sample-filter-path: an episode the judge could not score, or that could not go on, takes its group out of
+# the loss (flint/miles_agent.py); inspect_rollout.py fails the run on it, so the job stops.
 case "$MODE" in
-  probe)
+  tito)
     tito_check
-    v=$?
-    # the path end to end, short: 8 episodes of 8k tokens, the context cut to 20k characters so trims happen
+    ;;
+  probe)   # the path end to end, short: 8 episodes of 8k tokens, the context cut to 20k characters so trims happen
     export MA_LG_CTX_CHARS=20000
     rollout probe 8000 8 1800 --rollout-top-logprobs-num 32
-    r=$?
-    unset MA_LG_CTX_CHARS
-    [ $v -eq 0 ] && [ $r -eq 0 ]
     ;;
   full)
-    # the RL test's group first: a TITO check that fails must not cost it
-    rollout topk32 128000 8 4200 --rollout-top-logprobs-num 32
-    a=$?
-    tito_check
-    v=$?
+    rollout topk32 128000 8 4200 --rollout-top-logprobs-num 32 || exit 1
     rollout notopk 128000 8 4200
-    b=$?
-    [ $a -eq 0 ] && [ $b -eq 0 ] && [ $v -eq 0 ]
     ;;
 esac

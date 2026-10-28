@@ -2,7 +2,7 @@
 (its own tool-call ids, the text around the call stripped) and nothing else; (b) one episode against a fake session
 endpoint: every request extends the previous request and its reply under message_matches (one sample), except after
 a turn cut at its token limit, which the game replays as "(cut off)" (a branch at the cut turn's parent); the
-returned reward is the episode's S. Runs in miles-v0.1.3.sif (miles' strict matcher): tests/run_all.sh."""
+returned reward is the episode's S; drop_failed_groups takes a failed episode's group out of the loss. Runs in miles-v0.1.3.sif (miles' strict matcher): tests/run_all.sh."""
 import asyncio
 import json
 
@@ -73,7 +73,17 @@ async def main():
 
 out = asyncio.run(main())
 check("episode: reward is S", out.get("reward") == 0.0 and out.get("fo_lg_submissions") == 0, out)
-check("episode: no abort", "flint_aborted" not in out, out)
+check("episode: not failed", "flint_failed" not in out, out)
+
+# drop_failed_groups: a group with a failed episode leaves the loss whole, the others stay
+from types import SimpleNamespace  # noqa: E402
+
+groups = [[SimpleNamespace(metadata={"flint_failed": "judge infra error"}, remove_sample=False),
+           SimpleNamespace(metadata={}, remove_sample=False)],
+          [SimpleNamespace(metadata={}, remove_sample=False), SimpleNamespace(metadata=None, remove_sample=False)]]
+MA.drop_failed_groups(None, groups)
+check("filter: a failed episode's group leaves the loss, others stay",
+      [[x.remove_sample for x in g] for g in groups] == [[True, True], [False, False]])
 check("requests: sampling settings as given, tool not strict",
       all(b["temperature"] == 1.0 and b["top_p"] == 0.95 and b["top_k"] == 20 and not b["tools"][0]["function"]["strict"]
           for b in seen))

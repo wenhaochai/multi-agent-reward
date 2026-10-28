@@ -18,7 +18,11 @@ Each leaf becomes one Sample; a completion shared by several leaves trains once 
 message_matches (--session-message-matcher flint.miles_agent.message_matches): the game replays an assistant turn
 with tool-call ids of its own and with the text around the tool call stripped. Flint's chat template renders neither,
 so that is the recorded turn: the matcher accepts these two differences and otherwise applies miles' strict matcher.
-On a match the recorded tokens stay authoritative, so a sample holds exactly the tokens Flint generated."""
+On a match the recorded tokens stay authoritative, so a sample holds exactly the tokens Flint generated.
+
+drop_failed_groups (--rollout-sample-filter-path flint.miles_agent.drop_failed_groups): an episode whose score cannot be
+trusted (a submission the judge could not judge after its retries, or an episode that could not go on) has no reward;
+its whole group leaves the loss, so it biases no group mean either."""
 import json
 import os
 import random
@@ -56,9 +60,10 @@ def message_matches(stored: dict, new: dict) -> bool:
 
 async def run(base_url: str, prompt, request_kwargs: dict, metadata: dict, **kwargs) -> dict:
     """Play one episode on metadata["label"] (the problem directory; metadata["messages"] holds the problem prompt)
-    against the session; returns the reward (S) and the episode's numbers. An episode that cannot go on (flint.Aborted:
-    no answer from the server after the retries) returns reward 0 with "flint_aborted", so the run never sees a sample
-    without a reward; a training run drops such groups."""
+    against the session; returns the reward (S) and the episode's numbers. An episode whose score cannot be trusted
+    (flint.Aborted: no answer from the server after the retries; or a submission still a judge infra error after its
+    retries) carries "flint_failed" (reward 0 as a placeholder only), and drop_failed_groups takes its group out of the
+    loss."""
     from flint import Aborted
     from flint import game as G
     from flint.chat import ChatSession, Client
@@ -75,7 +80,18 @@ async def run(base_url: str, prompt, request_kwargs: dict, metadata: dict, **kwa
         _, S, info = await G.episode(inp, metadata["messages"], metadata["label"],
                                      lambda i, name: ChatSession(client, i, name, G.MAX_LEN))
     except Aborted as e:
-        return {**out, "reward": 0.0, "flint_aborted": str(e)[:500]}
+        return {**out, "reward": 0.0, "flint_failed": f"aborted: {e}"[:500]}
     finally:
         await client.close()
-    return {**out, "reward": S, **{k: info[k] for k in INFO_KEYS}}
+    out = {**out, "reward": S, **{k: info[k] for k in INFO_KEYS}}
+    if info["fo_judge_infra_error"]:
+        out["flint_failed"] = "judge infra error"
+    return out
+
+
+def drop_failed_groups(args, data) -> None:
+    """miles' sample filter: every sample of a group with a failed episode leaves the loss."""
+    for group in data:
+        if any((s.metadata or {}).get("flint_failed") for s in group):
+            for s in group:
+                s.remove_sample = True

@@ -7,20 +7,21 @@
 #SBATCH --output=/scratch/gpfs/GROUP/USER/tmp/flint_s5a/logs/%x-%j.out
 #FETCHABLE
 # Long-game rollouts of Flint through miles v0.1.3, rollout only, on 4 GPUs (2 engines at TP2, Flint's H100 layout; 8
-# concurrent episodes, 4 per engine). Usage: rollout_job.sh probe|full (wq --prio 10).
-#   probe  miles' GPU TITO check for Flint, then 8 episodes of 8k tokens on the RL test problem with the context cut to
-#          20k characters (trims within the episode): the whole path, short
-#   full   8 episodes of 128k tokens on the RL test problem (val40 problem 0) with the top-32 candidates, miles' GPU
-#          TITO check, then 8 episodes without the candidates (what recording them costs)
-# Results: tmp/flint_s5a/runs/<job>/. Everything runs in one container with a PID namespace of its own (--pid), so
-# miles' and Ray's cleanup sees only this job and the container's process group holds all of it. Bounds: timeout -s
-# KILL around the container, a GPU-idle watchdog (10 min at 0%), and cleanup of only the process groups this job
-# started (serving/check/procs.sh). The container writes only to job directories bound in (its own writable layer is
-# 64 MB): /tmp and /root/datasets (miles' TITO verifier writes its prompt there).
-mkdir -p /scratch/gpfs/GROUP/USER/tmp/flint_s5a/logs
+# concurrent episodes, 4 per engine). Usage: rollout_job.sh tito|probe|full; wq --prio 10 for probe and full, and the
+# TITO check in a short pli-low allocation (srun -p pli -q pli-low -A group --gres=gpu:4 -t 30).
+#   tito   miles' GPU TITO check for Flint (16 sessions)
+#   probe  8 episodes of 8k tokens on the RL test problem with the context cut to 20k characters (trims happen)
+#   full   8 episodes of 128k tokens on the RL test problem (val40 problem 0) with the top-32 candidates, then 8 without
+#          them (what recording them costs)
+# The first failure ends the job: nothing is retried. Results: tmp/flint_s5a/runs/<job>/. Everything runs in one
+# container with a PID namespace of its own (--pid), so miles' and Ray's cleanup sees only this job and the container's
+# process group holds all of it; the node's /proc is bound at /host/proc, where the judge counts the user's tasks
+# (RLIMIT_NPROC counts all of them; flint/judge.py, FCS_PROC). Bounds: timeout -s KILL around the container, a GPU watch
+# (rl/gpu_watch.sh), and cleanup of only the process groups this job started (serving/check/procs.sh). The container
+# writes only to job directories bound in (its own writable layer is 64 MB): /tmp and /root/datasets.
 set -uo pipefail
 MODE=${1:-}
-case "$MODE" in probe) LIMIT=3300;; full) LIMIT=10500;; *) echo "usage: rollout_job.sh probe|full"; exit 1;; esac
+case "$MODE" in tito) LIMIT=1800;; probe) LIMIT=2400;; full) LIMIT=9000;; *) echo "usage: rollout_job.sh tito|probe|full"; exit 1;; esac
 JID=${FETCHED_JOB_ID:-$SLURM_JOB_ID}
 [ -n "$JID" ] || { echo "no job id"; exit 1; }
 REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-rollout
@@ -31,7 +32,7 @@ export TMPDIR=/scratch/gpfs/GROUP/USER/tmp/job/$JID
 mkdir -p "$OUT" "$TMPDIR/tmp" "$TMPDIR/datasets"
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 source "$REPO/serving/check/procs.sh"
-source "$REPO/serving/check/gpu_watchdog.sh"
+source "$REPO/rl/gpu_watch.sh"
 WD=
 trap 'stop "${STARTED[@]}"; [ -z "$WD" ] || kill "$WD" 2>/dev/null; rm -rf -- "/scratch/gpfs/GROUP/USER/tmp/job/$JID"' EXIT
 trap 'exit 143' TERM INT
@@ -56,11 +57,10 @@ assert len(rows) == 1
 rows[0]["metadata"]["label"] = rows[0]["label"]
 open(sys.argv[2], "w").write(json.dumps(rows[0]) + "\n")
 PY
-# 20 min: the engines load 80 GB at 0% first, and an engine whose episodes ended early waits for the group's last
-IDLE_MAX=20 gpu_watchdog $$ &
+gpu_watch $$ "$OUT/gpu.log" &   # one line per GPU and minute; stops the job when a GPU idles (rl/gpu_watch.sh)
 WD=$!
 start timeout -s KILL "$LIMIT" apptainer exec --pid --nv --contain --cleanenv --writable-tmpfs \
-  --bind /scratch/gpfs/GROUP --bind "$TMPDIR/tmp":/tmp --bind "$TMPDIR/datasets":/root/datasets \
+  --bind /scratch/gpfs/GROUP --bind "$TMPDIR/tmp":/tmp --bind "$TMPDIR/datasets":/root/datasets --bind /proc:/host/proc \
   --env PYTHONNOUSERSITE=1 --env PYTHONDONTWRITEBYTECODE=1 --env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" --env JID="$JID" --env OUT="$OUT" \
   --env PKG="$PKG" --env TMPDIR="$TMPDIR" "$SIF" bash "$REPO/rl/rollout_inner.sh" "$MODE"
 wait "${STARTED[0]}"

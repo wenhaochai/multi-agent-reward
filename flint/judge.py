@@ -313,6 +313,9 @@ def _compile_sandbox(work: Path):
 
 _CLEAN_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C"}
 NPROC_MARGIN = 128  # the official engine's procLimit
+# where to count the user's tasks: RLIMIT_NPROC counts every task of the user on the node, which a PID namespace's
+# own /proc does not show (a container run with --pid binds the node's /proc and sets FCS_PROC to it)
+PROC = os.environ.get("FCS_PROC", "/proc")
 _ucount = [0.0, 0]
 _ulock = threading.Lock()
 
@@ -326,11 +329,11 @@ def _nproc_limit() -> int:
         try:
             if time.monotonic() - _ucount[0] > 5:
                 uid, n = os.getuid(), 0
-                for p in os.listdir("/proc"):
+                for p in os.listdir(PROC):
                     if p.isdigit():
                         try:
-                            if os.stat(f"/proc/{p}").st_uid == uid:
-                                n += len(os.listdir(f"/proc/{p}/task"))
+                            if os.stat(f"{PROC}/{p}").st_uid == uid:
+                                n += len(os.listdir(f"{PROC}/{p}/task"))
                         except OSError:
                             pass
                 _ucount[1], _ucount[0] = n, time.monotonic()
