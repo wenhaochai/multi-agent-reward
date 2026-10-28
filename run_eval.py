@@ -6,6 +6,9 @@ the judge run here; only the model calls go to the OpenAI-compatible chat endpoi
 Game settings come from the environment (flint.game: MA_LG_N, MA_LG_TOKENS, ...; MA_AG_TRACE_DIR defaults to
 <out>/traces). Output: <out>/results.jsonl, one line per finished episode (resumable).
 
+One driver per --out: the driver holds a POSIX lock on <out>/.lock while it runs, and a second driver on the same
+directory exits 1 at once.
+
 Checkpoints (default on, --no-ckpt off): each episode saves its state to <out>/state/<pid>_e<episode>.{pkl,r<round>.tgz}
 at the end of a round every MA_LG_CKPT_S seconds (300) and after every round with a submission (game.Checkpoint), and
 the next run resumes it there. A transport abort keeps the state; a crash or a finished row removes it. The run stops
@@ -20,6 +23,7 @@ the run wrote no row and saved no checkpoint. An exception in one episode (a 400
 becomes that episode's aborted row and does not stop the others."""
 import argparse
 import asyncio
+import fcntl
 import json
 import os
 import sys
@@ -104,9 +108,23 @@ def make_client(args) -> Client:
                   args.top_p, args.top_k, route=not args.no_route, request_timeout=args.request_timeout)
 
 
+def lock_out(out_dir: Path):
+    """The lock that keeps a second driver off this results directory, also on another node: GPFS applies fcntl locks
+    on every node and flock locks only on one (tested on della-vis1 and della-vis2, 2026-10-28). Held while the returned
+    file stays open."""
+    f = open(out_dir / ".lock", "a")
+    try:
+        fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        raise SystemExit(f"another driver holds {out_dir} (lock {out_dir / '.lock'}): refusing")
+    return f
+
+
 async def main(args, client: Client | None = None) -> int:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    lock = lock_out(out_dir)   # noqa: F841 (held until main returns)
     os.environ.setdefault("MA_AG_TRACE_DIR", str(out_dir / "traces"))
     client = client or make_client(args)
     stop: list = [None]   # why the run stops early: "time", "down" or "tail"

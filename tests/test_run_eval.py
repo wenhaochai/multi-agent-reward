@@ -1,13 +1,15 @@
 """run_eval.py's run outcome without a server (game.episode stubbed): an exception in one episode becomes its aborted
 row and the others finish; rows still missing give exit 99 and the rerun resumes only those; an episode is given up
 after --max-episode-tries rows that are not clean; a run whose episodes all crash exits 1; a judge-infra row reruns;
-checkpoints pause at the job's end and resume; a tail stop exits 3. With fake HTTP: (c) after a run whose episodes
-moved, every server's count is 0; (e) a dead server (failed retries and /health_generate) gets no new episodes, its
-episode goes on elsewhere, and the run exits 99; the rerun resumes and exits 0. A 400 or a reply without choices
-aborts one episode instead of the run."""
+checkpoints pause at the job's end and resume; a tail stop exits 3; a driver on a directory another process holds
+stops at once. With fake HTTP: (c) after a run whose episodes moved, every server's count is 0; (e) a dead server
+(failed retries and /health_generate) gets no new episodes, its episode goes on elsewhere, and the run exits 99; the
+rerun resumes and exits 0. A 400 or a reply without choices aborts one episode instead of the run."""
 import asyncio
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -181,6 +183,20 @@ c = run("c6")
 check("every episode crashes after its saves: exit 1", c == 1 and len(rows("c6")) == 4
       and not list((TMP / "c6/state").iterdir()), (c, rows("c6")))
 mode = {}
+# one driver per directory: a process that holds <out>/.lock (a driver on this node or another) stops this one at once
+(TMP / "lk").mkdir()
+holder = subprocess.Popen([sys.executable, "-c", "import fcntl, sys, time; f = open(sys.argv[1], 'a'); "
+                           "fcntl.lockf(f, fcntl.LOCK_EX); print('held', flush=True); time.sleep(120)",
+                           str(TMP / "lk/.lock")], stdout=subprocess.PIPE, text=True)
+holder.stdout.readline()
+try:
+    err = run("lk")
+except SystemExit as ex:
+    err = str(ex)
+holder.kill()
+holder.wait()
+check("a held directory: the driver refuses", "another driver holds" in str(err) and not rows("lk"), err)
+check("the directory freed: the driver runs", run("lk") == 0 and len(rows("lk")) == 4, rows("lk"))
 
 
 # fake HTTP: servers that answer, refuse connections, or reply with errors
