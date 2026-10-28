@@ -1,20 +1,29 @@
-"""Weight updates into the ported Flint server through miles' own non-colocated transfer path: NCCL broadcast from
-one trainer rank (miles/backends/training_utils/weight_update/protocols/broadcast.py) in buckets packed by
-hf_weight_iterator.bucketing, HF-named tensors from flint_hf (S1, c0b0cef) loaded on this process's GPUs, as the FSDP
-trainer would send them. On the first three S1 sequences (2k, 4k, 8k tokens):
+"""Weight updates into the ported Flint server through miles' own non-colocated transfer path, in miles' session frame
+(training_utils/weight_update/session.py: pause, flush, begin_weight_update, buckets, end_weight_update, resume), with
+miles' SGLangApiClient, its NCCL group (protocols/broadcast.py connect/disconnect) and its bucketing
+(hf_weight_iterator.bucketing, 512 MiB). Each bucket is sent as broadcast.update_weights_from_distributed sends it (the
+HTTP request, then the NCCL broadcast from rank 0), but the broadcast is polled, so a request the server refuses
+stops this process at once instead of leaving rank 0 waiting for receivers that never join. HF-named tensors come
+from flint_hf (S1, c0b0cef) loaded on this process's GPUs, as the FSDP trainer would send them.
+On the first three S1 sequences (2k, 4k, 8k tokens):
 (a) every parameter sent back unchanged: the served logprobs stay bit-identical;
-(b) three updates through the three load paths, a plain tensor (layer 10 o_proj x1.25), a shard of the fused qkv
+(b) three changes through the three load paths, a plain tensor (layer 10 o_proj x1.25), a shard of the fused qkv
     (layer 3 v_proj x1.25) and every expert's gate_proj of layer 20 in the fused experts (x1.1): the served logprobs
     move as flint_hf's move under the same change; sending the saved originals then restores them bit for bit;
 (c) the wall time of a full update (all 39.8B parameters).
+Every server call that fails prints the server's reply and ends the process; so does a run past LIMIT_S.
 Usage: update_check.py seqs.json url out.json"""
 import argparse
 import json
+import os
 import sys
+import threading
 import time
+import traceback
 
 import requests
 import torch
+import torch.distributed as dist
 
 from flint_hf import load_flint
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
@@ -22,7 +31,6 @@ from miles.backends.training_utils.weight_update.hf_weight_iterator.bucketing im
 from miles.backends.training_utils.weight_update.protocols.broadcast import (
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
-    update_weights_from_distributed,
 )
 from miles.utils import async_utils
 
@@ -30,9 +38,32 @@ MODEL = "/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint"
 USER, ASSISTANT = 150003, 150004
 BUCKET = 512 * 1024**2   # miles' --update-weight-buffer-size default
 GROUP = "miles-s3"
+BUCKET_LIMIT_S = 300     # one bucket: request, broadcast and reply
+LIMIT_S = 40 * 60        # the whole check
 seqs = json.load(open(sys.argv[1]))[:3]
 URL, OUT = sys.argv[2], sys.argv[3]
 client = SGLangApiClient(server_url=URL)
+
+
+def die(msg, exc=None):
+    print("UPDATE_CHECK_ABORT", msg, flush=True)
+    if exc is not None:
+        print("".join(traceback.format_exception(exc)), flush=True)   # includes the server's reply (an exception note)
+    os._exit(1)
+
+
+threading.Timer(LIMIT_S, die, args=(f"past {LIMIT_S} s",)).start()
+
+
+def rpc(name, **kw):
+    """One SGLangApiClient call; a failed call or a reply with success false ends the process."""
+    try:
+        r = async_utils.wait_futures([async_utils.submit(getattr(client, name)(**kw))])[0]
+    except Exception as e:   # noqa: BLE001
+        die(f"{name} failed", e)
+    if isinstance(r, dict) and r.get("success") is False:
+        die(f"{name} refused: {r}")
+    return r
 
 
 def served():
@@ -68,13 +99,36 @@ def assistant_mask():
     return torch.tensor(out)
 
 
+def send_bucket(bucket):
+    tensors = [t for _, t in bucket]
+    fut = async_utils.submit(client.update_weights_from_distributed(
+        names=[n for n, _ in bucket], dtypes=[t.dtype for t in tensors], shapes=[t.shape for t in tensors],
+        group_name=GROUP, selector="all"))
+    handles = [dist.broadcast(t, 0, group=group, async_op=True) for t in tensors]
+    deadline = time.time() + BUCKET_LIMIT_S
+    while not (all(h.is_completed() for h in handles) and fut.done()):
+        if fut.done() and (fut.exception() is not None or not fut.result().get("success")):
+            die("the server refused a bucket", fut.exception() or RuntimeError(str(fut.result())))
+        if time.time() > deadline:
+            die(f"a bucket took over {BUCKET_LIMIT_S} s (request done: {fut.done()})")
+        time.sleep(0.02)
+    for h in handles:
+        h.wait()
+    if fut.exception() is not None or not fut.result().get("success"):
+        die("the server refused a bucket", fut.exception() or RuntimeError(str(fut.result())))
+
+
 def send(named):
-    """One update: buckets of HF-named tensors broadcast from this rank, then the server's radix cache flushed."""
+    """One weight update in miles' session frame; the radix cache is flushed after it."""
+    rpc("pause_generation", mode="retract")
+    rpc("flush_cache")
+    rpc("begin_weight_update", selector="all", sync_base=True)
     units = ([(n, t.detach().to("cuda:0").contiguous())] for n, t in named)
     for bucket in pack_units_by_size(units, BUCKET):
-        for r in async_utils.wait_futures(update_weights_from_distributed(GROUP, group, [client], bucket)):
-            assert r["success"], r
-    async_utils.wait_futures([async_utils.submit(client.flush_cache())])
+        send_bucket(bucket)
+    rpc("end_weight_update")
+    rpc("continue_generation")
+    rpc("flush_cache")
 
 
 torch.cuda.set_device(0)
@@ -95,6 +149,7 @@ send(params.items())
 res["full_update_s"] = round(time.time() - t0, 1)
 ident = served()
 res["identity"] = {k: float((ident[k] != base[k]).double().sum()) for k in ("lp", "top_v", "top_i")}
+print("identity", res["identity"], "full update", res["full_update_s"], "s", flush=True)
 
 # (b): three load paths, then the originals back
 changes = {"model.layers.10.self_attn.o_proj.weight": 1.25, "model.layers.3.self_attn.v_proj.weight": 1.25,
@@ -126,3 +181,4 @@ res["perturb_assistant"] = {
     "n": int(asst.sum())}
 json.dump(res, open(OUT, "w"), indent=1)
 print("UPDATE_CHECK", json.dumps(res), flush=True)
+os._exit(0)   # the limit timer is a non-daemon thread
