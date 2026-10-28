@@ -1,7 +1,8 @@
 """Is the HF-vs-SGLang gap on user tokens a bug or Flint's sensitivity there? Re-scores sequences with numerical
 variants of flint_hf that are all correct implementations (each mimics one rounding step of the SGLang kernels) and
 compares every variant with the base HF and with SGLang A, split by the role of the predicted token. Also reports the
-norm of the final residual stream by role. Usage: hf_variants.py seqs.json OUTDIR (reads OUTDIR/sglang_A.pt)"""
+norm of the final hidden state by role. Usage: hf_variants.py seqs.json OUTDIR [i,j,...] (sequence indices, default
+1,3,5: 4k, 16k and 32k tokens; reads OUTDIR/sglang_A.pt)"""
 import json
 import sys
 from pathlib import Path
@@ -91,7 +92,7 @@ def roles(ids):
     return torch.tensor(r)
 
 
-pick = [1, 3, 5]   # 4k, 16k and 32k tokens
+pick = [int(i) for i in (sys.argv[3] if len(sys.argv) > 3 else "1,3,5").split(",")]
 res = {}
 for name, v in VARIANTS.items():
     M.ATTENTION_FUNCTIONS["eager"] = v.get("attn", base_attn)
@@ -100,6 +101,7 @@ for name, v in VARIANTS.items():
     res[name] = [score(seqs[j]["ids"]) for j in pick]
     print("scored", name, flush=True)
 asst = torch.cat([roles(seqs[j]["ids"]) for j in pick])
+pos = torch.cat([torch.arange(len(seqs[j]["ids"]) - 1) for j in pick])
 a_lp = torch.cat([A["solo"][j]["lp"] for j in pick])
 a_top = torch.cat([A["solo"][j]["top_i"][:, 0] for j in pick])
 base_lp = torch.cat([r[0] for r in res["base"]])
@@ -108,7 +110,9 @@ print(f"{'variant':<20} {'role':<10} {'vs base mean|d|':>16} {'top1':>6} {'vs A 
 for name in VARIANTS:
     lp = torch.cat([r[0] for r in res[name]])
     top = torch.cat([r[1] for r in res[name]])
-    for role, m in (("assistant", asst), ("user", ~asst)):
+    for role, m in (("assistant", asst), ("user", ~asst), ("asst >=32k", asst & (pos >= 32768))):
+        if not m.any():
+            continue
         d_base, d_a = (lp - base_lp).abs()[m].mean(), (lp - a_lp).abs()[m].mean()
         t_base, t_a = (top == base_top)[m].double().mean(), (top == a_top)[m].double().mean()
         print(f"{name:<20} {role:<10} {d_base:16.3e} {t_base:6.4f} {d_a:13.3e} {t_a:6.4f}")
