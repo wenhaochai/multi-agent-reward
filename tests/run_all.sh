@@ -34,6 +34,8 @@ t test_judge_paths X=1
 t test_judge_runs X=1
 t test_judge_ratio X=1
 t test_checker_fixes X=1
+# miles' session matcher lives in miles v0.1.3: this test runs in its container
+SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif t test_miles_agent X=1
 rm -rf "$TMPDIR"
 echo "${#fail[@]} failed${fail:+: ${fail[*]}}"
 [ ${#fail[@]} -eq 0 ]
