@@ -74,6 +74,7 @@ MEMPROBE=(--prompt-data "$OUT/data_p0.jsonl" --input-key prompt --label-key labe
   --rollout-top-k 20)
 if [ "$MODE" = args ]; then   # off-GPU: miles parses and checks each mode's arguments (rl/args_check.py)
   python3 "$REPO/rl/args_check.py" "${TRAIN[@]}" "${MEMPROBE[@]}" || exit 1
+  python3 "$REPO/rl/schedule_check.py" "$MEMPROBE_DATA/rollout_0.pt" "${TRAIN[@]}" "${MEMPROBE[@]}" || exit 1
   python3 "$REPO/rl/args_check.py" "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RL[@]}" --num-rollout 2
   exit
 fi
