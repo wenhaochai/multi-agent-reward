@@ -17,9 +17,10 @@ branches `archive/eval2-2026-10-28` (this code before the cleanup) and `archive/
    answer is the submission with the best provisional score. Its final score on the other half of the tests, which no
    agent sees, is the result (0 to 100). The judge (`flint/judge.py`) scores like the official Frontier-CS v1.1
    engine (`algorithmic/judge/src/judge_engine.js`): a test's ratio is the first `Ratio:` value in the checker's
-   message, not clamped, and a problem's score is 100 x the mean ratio. `tests/test_judge_ratio.py` checks the rule
-   against the engine's own code. Where the judge runs programs differently (a file sandbox, memory limits), the
-   header of `flint/judge.py` says so.
+   message, not clamped, and a problem's score is 100 x the mean ratio. One deviation: a `Ratio:` label whose value
+   the engine cannot read (a negative, nan, inf) gives 0, where the engine gives 1 to a checker that accepted. No v1.1
+   checker prints such a value today. `tests/test_judge_ratio.py` checks the rule against the engine's own code. Where
+   the judge runs programs differently (a file sandbox, memory limits), the header of `flint/judge.py` says so.
 5. A team is 4 agents in lockstep rounds. Each agent works in a git repository of its own and can read its teammates'
    branches (`team/agent1` to `team/agent4`). `post <message>` sends a message to the others.
 
