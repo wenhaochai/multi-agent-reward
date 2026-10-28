@@ -2,7 +2,7 @@
 |delta logprob| of the actual next token; top-1 agreement; and the head KL, sum over the reference's top-32 ids v of
 q_v (log q_v - log p_v) plus the tail term (1 - sum q) log((1 - sum q) / (1 - sum p)), q the reference (SGLang server A
 alone) and p the other scorer; for an SGLang scorer only positions whose 32 ids it also returned count (n_kl).
-Usage: compare.py seqs.json sglang_A.pt sglang_C.pt hf.pt"""
+Usage: compare.py seqs.json sglang_A.pt sglang_C.pt hf.pt (sglang_C.pt = sglang_A.pt when C did not run)"""
 import json
 import sys
 
@@ -50,7 +50,8 @@ pool = lambda rs: {k: cat(rs, k) for k in ("lp", "top_v", "top_i")}
 refA, batchA, solC = pool(A["solo"]), pool(A["batch"]), pool(C["solo"])
 hf = {k: cat(HF["seqs"], k) for k in ("lp", "top_v", "top_i", "at_head")}
 print(row("floor: A in a batch of 8 vs A alone", refA, batchA, at_ids(batchA, refA["top_i"])))
-print(row("SGLang 0.5.21 (miles.sif) vs A", refA, solC, at_ids(solC, refA["top_i"])))
+if sys.argv[3] != sys.argv[2]:   # C, when its server ran
+    print(row("C: miles' SGLang vs A", refA, solC, at_ids(solC, refA["top_i"])))
 print(row("HF eager fp32 vs A", refA, hf, hf["at_head"]))
 pos = torch.cat([torch.arange(len(s["ids"]) - 1) for s in seqs])
 print(row("  HF vs A, positions < 513 (window not full)", refA, hf, hf["at_head"], pos < 513))
