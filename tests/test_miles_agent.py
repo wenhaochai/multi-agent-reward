@@ -121,16 +121,28 @@ import threading  # noqa: E402
 from http.server import BaseHTTPRequestHandler, HTTPServer  # noqa: E402
 
 shift = [0.0]
-probes = []
+probes, chats = [], []
+
+
+refuse = [False]
 
 
 class Router(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        probes.append(body)
-        lps = [[None, body["input_ids"][0], None]] + [[-1.0 - shift[0], t, None] for t in body["input_ids"][1:]]
-        data = json.dumps({"meta_info": {"input_token_logprobs": lps}}).encode()
-        self.send_response(200)
+        code = 200
+        if self.path == "/generate" and refuse[0]:
+            code, reply = 400, {"error": "no input log-probs here"}
+        elif self.path == "/generate":
+            probes.append(body)
+            lps = [[None, body["input_ids"][0], None]] + [[-1.0 - shift[0], t, None] for t in body["input_ids"][1:]]
+            reply = {"meta_info": {"input_token_logprobs": lps}}
+        else:
+            chats.append(body)
+            reply = {"choices": [{"logprobs": {"content": [{"top_logprobs": [
+                {"token": "a", "logprob": -0.1 - shift[0]}, {"token": "b", "logprob": -2.5}]}]}}]}
+        data = json.dumps(reply).encode()
+        self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(data)
@@ -145,6 +157,7 @@ args = SimpleNamespace(sglang_router_ip="127.0.0.1", sglang_router_port=srv.serv
 out_dir = tempfile.mkdtemp()
 os.environ["MA_RL_OUT"] = out_dir
 os.environ["MA_AG_TURN"] = "90"   # the turn cap the hook counts hits of
+open(os.path.join(out_dir, "data_p0.jsonl"), "w").write(json.dumps({"prompt": MSG}) + "\n")
 os.environ["MA_AG_TRACE_DIR"] = os.path.join(out_dir, "traces_live")
 smp = [SimpleNamespace(tokens=list(range(5000)), reward=0.5, metadata={"flint_session": "a", "fo_lg_submissions": 2}),
        SimpleNamespace(tokens=list(range(10)), reward=0.5, metadata={"flint_session": "a", "fo_lg_submissions": 2}),
@@ -171,13 +184,24 @@ check("log: per-episode trace numbers", lines[0]["trace_episodes"] == [{"S": 0.5
 check("log: the probe change after the update", "probe_change_mean_abs" not in lines[0]
       and abs(lines[1]["probe_change_mean_abs"] - 0.01) < 1e-9 and lines[1]["probe_repeat_max_abs"] == 0.0, lines[1])
 check("log: the sample check runs on the rollout's dump", runs[0][-2:] == [os.path.join(out_dir, "r0"), "rollout.pt"], runs[0])
+# /generate refused (w606: 400): the probe falls back to the first token's top log-probs from the chat endpoint
+refuse[0] = True
+for rid in (2, 3):
+    os.makedirs(os.environ["MA_AG_TRACE_DIR"])
+    MA.log_rollout(rid, args, smp, {}, 12.0)
+    shift[0] = 0.05
+lines = [json.loads(x) for x in open(os.path.join(out_dir, "steps.jsonl"))]
+check("log: /generate refused -> chat probe, the 400 body kept, the change measured",
+      lines[3]["probe_kind"] == "chat" and "no input log-probs" in lines[3]["probe_generate_refused"]
+      and abs(lines[3]["probe_change_max_abs"] - 0.04) < 1e-9 and len(chats) == 4 and chats[0]["messages"] == MSG, lines[3])
+import pickle  # noqa: E402
 subprocess.run = lambda cmd, **kw: SimpleNamespace(returncode=1, stdout="INSPECT_FAIL {}\n", stderr="")
 try:
-    MA.log_rollout(2, args, smp, {}, 12.0)
+    MA.log_rollout(4, args, smp, {}, 12.0)
     raised = False
-except RuntimeError:
-    raised = True
+except RuntimeError as e:
+    raised = type(pickle.loads(pickle.dumps(e))) is RuntimeError
 subprocess.run = real_run
 srv.shutdown()
-check("log: a failed sample check ends the run", raised)
+check("log: a failed sample check ends the run, with an exception Ray can pickle", raised)
 done()
