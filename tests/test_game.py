@@ -5,6 +5,7 @@ import os
 
 from helpers import check, done, env
 
+os.environ.pop("MA_LG_CTX_LOW", None)   # the defaults below are the code's own
 env()
 from flint import game as G  # noqa: E402
 from flint import prompts as P  # noqa: E402
@@ -52,7 +53,7 @@ check("trim with hysteresis: over keep_chars again, one more cut and one note",
       sum(len(m["content"]) for m in c7[2:]) <= 600 and d7 > d4 and c7[1]["content"].count("[Note:") == 1)
 check("trim counts the reasoning", G.trim_chat(chat[:2] + [{"role": "assistant", "content": "a", "reasoning_content":
       "r" * 2000}, {"role": "user", "content": "o"}] * 2, 1000, 0)[1] == 1)
-check("CTX_LOW default 0.75", G.CTX_LOW == float(os.environ.get("MA_LG_CTX_LOW", "0.75")))
+check("CTX_LOW default 0.75", G.CTX_LOW == 0.75, G.CTX_LOW)
 m = G.SUBMIT_RE.fullmatch("submit")
 check("submit: alone, optional file", m and m.group(1) is None and G.SUBMIT_RE.fullmatch(" submit sol2.cpp ").group(1)
       == "sol2.cpp" and not G.SUBMIT_RE.fullmatch("g++ a.cpp && submit"))

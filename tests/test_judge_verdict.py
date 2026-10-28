@@ -62,12 +62,11 @@ r = judge_full(P + "10", "int main(){}\n")
 check("interactive empty program: the interactor's verdict", r["status"] == "done"
       and set(r["verdicts"]) <= {"WA", "OK"}, (r["verdicts"], r["case_info"][:2]))
 
+check("w93 trace present (a required fixture)", os.path.exists(W93), W93)
 if os.path.exists(W93):   # the w93 smoke's pid6 best: provisional (even) cases OK, OK, WA, OK, WA
     best = [json.loads(l)["best"] for l in open(W93) if json.loads(l)["label"].endswith("/6")][0]
     r = judge_full(P + "6", best["code"])
     check("w93 pid6 best: provisional verdicts", r["verdicts"][0::2] == ["OK", "OK", "WA", "OK", "WA"]
           and abs(sum(r["cases"][0::2]) / 5 - best["prov"]) < 1e-9, (r["verdicts"], r["cases"], best["prov"]))
-else:
-    print("SKIP w93 pid6 (no trace)")
 print("ALL OK" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)
