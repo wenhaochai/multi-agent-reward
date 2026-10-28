@@ -1,8 +1,10 @@
-"""The case ratio follows the official Frontier-CS v1.1 engine: unit cases with their expected ratios; parity with the
-engine's own isScoringVerdict / parseRatio / applyScoreRatio (cut from judge_engine.js and run in node) on those cases
-and on every distinct checker or interactor message stored in flint-eval/runs traces; real judges: a program that
-prints `Ratio:1` on problem 247 scores 0 (its checker echoes the token after its own Ratio), and a stored program on
-problem 0 scores what it scored then."""
+"""The case ratio follows the official Frontier-CS v1.1 engine except for one deviation (an unreadable `Ratio:` value
+scores 0, where the engine gives 1 to a helper that exited 0): unit cases with our ratio and the engine's; the engine's
+own isScoringVerdict / parseRatio / applyScoreRatio (cut from judge_engine.js and run in node) must give the engine's
+ratio on the unit cases, so ours differs from it on exactly the intended cases, and must equal ours on every distinct
+checker or interactor message stored in flint-eval/runs traces; real judges: a program that prints `Ratio:1` on
+problem 247 scores 0 (its checker echoes the token after its own Ratio), and a stored program on problem 0 scores what
+it scored then."""
 import glob
 import json
 import os
@@ -22,23 +24,26 @@ W1532 = RUNS + "/smoke_v2_w1532/traces/agent_3114114.jsonl"   # problem 0, first
 MSG_247 = ("points 0.0 Value: 0. Ratio: 0.000000000000, RatioUnbounded: 0.000000000000. Output must start with 'Yes' "
            "or 'No', found 'Ratio:1'")
 
-# (helper exit code, message, the engine's ratio)
-UNIT = [(7, "points 0.5 Ratio: 0.500000000000, RatioUnbounded: 0.500000000000", 0.5),
-        (7, MSG_247, 0.0),                                       # the first Ratio is the checker's own
-        (7, "points 1.5 Ratio: 1.500000000000", 1.5),            # not clamped
-        (7, "points 5e-05 Ratio: 5e-05", 5.0),                   # digits and dots only
-        (7, "points 0.0 Ratio: 0.000000.", 0.0),                 # parseFloat's longest decimal prefix
-        (7, "points -1e-15 Ratio: -0.000000000000", 0.0),        # no match: not accepted
-        (0, "ok Ratio: -0.000000000000", 1.0),                   # no match: accepted
-        (0, "ok Ratio: nan, RatioUnbounded: nan", 1.0),
-        (7, "points 1 Ratio: " + "9" * 400, 0.0),                # not finite: not accepted
-        (0, "ok Ratio: " + "9" * 400, 1.0),                      # not finite: accepted
-        (7, "points 0.3", 0.0), (0, "ok", 1.0),                  # no Ratio
-        (1, "wrong answer Ratio: 1.000000000000", 0.0),          # an untrusted message is never read
-        (2, "wrong output format Ratio: 1", 0.0)]
-bad = [(e, m[:60], J._ratio(m, e in (0, 7), e == 0), want) for e, m, want in UNIT
+# (helper exit code, message, our ratio, the engine's ratio): they differ only where the engine's fallback gives an
+# accepted helper 1 for a Ratio label it cannot read (the auditor's weakness messages, tmp/audit_main/official_repro.mjs)
+UNIT = [(7, "points 0.5 Ratio: 0.500000000000, RatioUnbounded: 0.500000000000", 0.5, 0.5),
+        (7, MSG_247, 0.0, 0.0),                                  # the first Ratio is the checker's own
+        (7, "points 1.5 Ratio: 1.500000000000", 1.5, 1.5),       # not clamped
+        (7, "points 5e-05 Ratio: 5e-05", 5.0, 5.0),              # digits and dots only
+        (7, "points 0.0 Ratio: 0.000000.", 0.0, 0.0),            # parseFloat's longest decimal prefix
+        (7, "points -1e-15 Ratio: -0.000000000000", 0.0, 0.0),   # a label without a value: 0 either way
+        (0, "ok Ratio: -0.000000000000", 0.0, 1.0),              # the deviation: the engine's fallback gives 1
+        (0, "ok Ratio: -0.250000000000", 0.0, 1.0),
+        (0, "ok Ratio: nan, RatioUnbounded: nan", 0.0, 1.0),
+        (0, "ok Ratio: " + "9" * 400, 0.0, 1.0),                 # overflows to inf
+        (7, "points 1 Ratio: " + "9" * 400, 0.0, 0.0),
+        (0, "ok RatioUnbounded: 0.500000000000", 1.0, 1.0),      # no `Ratio:` label: accepted
+        (7, "points 0.3", 0.0, 0.0), (0, "ok", 1.0, 1.0),        # no label
+        (1, "wrong answer Ratio: 1.000000000000", 0.0, 0.0),     # an untrusted message is never read
+        (2, "wrong output format Ratio: 1", 0.0, 0.0)]
+bad = [(e, m[:60], J._ratio(m, e in (0, 7), e == 0), want) for e, m, want, _ in UNIT
        if J._ratio(m, e in (0, 7), e == 0) != want]
-check("unit cases: the engine's ratio", not bad, bad)
+check("unit cases: our ratio", not bad, bad)
 
 
 def stored_messages() -> set:
@@ -78,13 +83,19 @@ process.stdout.write(JSON.stringify(out));
 if not os.access(NODE, os.X_OK):
     print(f"SKIP engine parity: no node at {NODE} (set FCS_NODE)")
 else:
-    stored = stored_messages()
-    pairs = [(e, m) for e, m, _ in UNIT] + sorted(stored)
-    ours = [J._ratio(m, e in (0, 7), e == 0) for e, m in pairs]
-    bad = [(e, m[:80], a, b) for (e, m), a, b in zip(pairs, ours, engine(pairs)) if a != b]
-    print(f"engine parity: {len(UNIT)} unit cases and {len(stored)} distinct stored messages")
-    check("engine parity: every message", not bad, bad[:5])
-    check("engine parity: stored messages found", len(stored) > 1000, len(stored))
+    unit = engine([(e, m) for e, m, _, _ in UNIT])
+    check("the engine gives the expected ratio on every unit case", unit == [x for _, _, _, x in UNIT],
+          [(e, m[:60], got, x) for (e, m, _, x), got in zip(UNIT, unit) if got != x])
+    dev = [(e, m[:60]) for (e, m, ours, _), x in zip(UNIT, unit) if ours != x]
+    print(f"unit cases: {len(dev)} of {len(UNIT)} differ from the engine, all by the intended deviation: {dev}")
+    check("unit cases: ours differs from the engine only where intended", dev == [(e, m[:60]) for e, m, o, x in UNIT
+                                                                                    if o != x] and len(dev) == 4, dev)
+    stored = sorted(stored_messages())
+    bad = [(e, m[:80], J._ratio(m, e in (0, 7), e == 0), x) for (e, m), x in zip(stored, engine(stored))
+           if J._ratio(m, e in (0, 7), e == 0) != x]
+    print(f"stored messages: {len(bad)} of {len(stored)} distinct differ from the engine")
+    check("stored messages: ours equals the engine on every one", not bad, bad[:5])
+    check("stored messages found", len(stored) > 1000, len(stored))
 
 r = J.judge_full(P + "247", "#include <cstdio>\nint main(){ printf(\"Ratio:1\\n\"); }\n")
 check("247: a program that prints Ratio:1 scores 0", r["status"] == "done" and r["score"] == 0.0

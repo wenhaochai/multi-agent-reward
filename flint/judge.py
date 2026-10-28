@@ -12,11 +12,16 @@ Rules copied from the official engine:
     `interactor in.txt tout.txt ans.txt` (4x time and memory) joined by two pipes, scored from the interactor's stderr;
   * a checker / interactor message is trusted only when it exits 0 (testlib _ok) or 7 (testlib points); the case ratio
     is the engine's applyScoreRatio: the first match of /Ratio: ([\\d.]+)/ in a trusted message, read like JS parseFloat
-    and not clamped; with no match, or one that is not a finite number, 1 when the helper exited 0 and 0 otherwise
-    (owner 2026-10-28: "用v1.1的 以后都用v1.1"; the first match is the helper's own: no v1.1 helper prints contestant
-    text before its Ratio, while 247 and 243 print a contestant token after it, audit 2026-10-28);
+    and not clamped; with no `Ratio:` label, 1 when the helper exited 0 and 0 otherwise (owner 2026-10-28: "用v1.1的
+    以后都用v1.1"; the first match is the helper's own: no v1.1 helper prints contestant text before its Ratio, while
+    247 and 243 print a contestant token after it, audit 2026-10-28);
   * problem score = 100 x mean case ratio.
-Deviations, all from the 2026-10-04 audit:
+Deviations (owner 2026-10-28: "如果v1.1错了那我们就应该修改啊": where the engine is wrong, this judge is not):
+  * a trusted message with a `Ratio:` label whose value the engine cannot read (a negative such as %.12f of -1e-15,
+    nan, a value that overflows to inf) scores the case 0; the engine falls back to 1 when the helper exited 0, so a
+    checker's -0.000000000000 would be a full score. No v1.1 helper prints such a value today (audit 2026-10-28), and
+    contestant text can only lower its own score this way, never raise it.
+From the 2026-10-04 audit:
   * checkers and interactors get a 2 GiB address space (official: none; 256 MiB broke val 23's checker);
   * interactive programs: the official engine sets no address-space limit, only a memory limit, so the program gets a
     max(4 x ML, 1 GiB) address-space cap (node safety) and an MLE when its peak RSS exceeds ML;
@@ -105,12 +110,17 @@ SANDBOX = os.environ.get("FCS_SANDBOX", "1") == "1"
 def _ratio(msg: str, trusted: bool, ok: bool) -> float:
     """A case's ratio from a checker / interactor message (trusted = it exited 0 or 7; ok = it exited 0), as the
     engine's parseRatio and applyScoreRatio give it: JS parseFloat of the first [\\d.]+ capture, i.e. its longest decimal
-    prefix ("0.000000." of val 154's interactor is 0: audit 2026-10-07), kept only when finite (300 digits overflow
-    to inf); otherwise the fallback, accepted or not."""
+    prefix ("0.000000." of val 154's interactor is 0: audit 2026-10-07), kept when finite. A trusted message whose
+    `Ratio:` label gives no such value (a negative, nan, 300 digits that overflow) scores 0, not the engine's fallback
+    (the header's deviation); without the label, the fallback: accepted or not."""
     m = _RATIO.search(msg) if trusted else None
     v = _JS_FLOAT.match(m.group(1)) if m else None
     x = float(v.group(0)) if v else None
-    return x if x is not None and math.isfinite(x) else (1.0 if ok else 0.0)
+    if x is not None and math.isfinite(x):
+        return x
+    if trusted and "Ratio:" in msg:
+        return 0.0
+    return 1.0 if ok else 0.0
 
 
 def to_seconds(s) -> float:
