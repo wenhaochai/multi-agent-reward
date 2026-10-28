@@ -1,8 +1,8 @@
 """miles' GPU TITO check (scripts/tools/verify_session_tito_tokenizer.py in miles v0.1.3) for Flint, on the Ray head
-this job started: the verifier's own arguments, agent and assertions, with two changes. train.py runs here (through
-rl/miles_train.py, which loads SGLang's plugins) instead of through miles' launcher, which kills every sglang and
-ray process it can see; and Flint's serving flags, which the verifier does not pass on, follow the "--".
-Usage: tito_verify.py <verifier flags> -- <extra train.py flags>. MILES_TITO_MODEL and
+this job started: the verifier's own arguments, agent and assertions, with two changes. train.py runs here instead of
+through miles' launcher, which kills every sglang and ray process it can see; and Flint's serving flags, which the
+verifier does not pass on, follow the "--". SGLang's plugins load through rl/site/sitecustomize.py, as in every process
+of the rollout container. Usage: tito_verify.py <verifier flags> -- <extra train.py flags>. MILES_TITO_MODEL and
 MILES_SESSION_VERIFY_METRICS_PATH must be set before the Ray head starts: its rollout workers write the metrics."""
 import os
 import runpy
@@ -10,13 +10,9 @@ import shlex
 import subprocess
 import sys
 
-from sglang.srt.plugins import load_plugins
-
-load_plugins()   # the Flint plugin: model type, parsers and grammar backend, which miles' arguments refer to
-
-from miles.utils.arguments import parse_args  # noqa: E402
-from miles.utils.chat_template_utils import resolve_reasoning_and_tool_call_parser  # noqa: E402
-from miles.utils.test_utils import session_verify_runner as R  # noqa: E402
+from miles.utils.arguments import parse_args
+from miles.utils.chat_template_utils import resolve_reasoning_and_tool_call_parser
+from miles.utils.test_utils import session_verify_runner as R
 
 VERIFY = runpy.run_path("/root/miles/scripts/tools/verify_session_tito_tokenizer.py")   # its functions, not its main
 cut = sys.argv.index("--") if "--" in sys.argv else len(sys.argv)
@@ -29,8 +25,7 @@ VERIFY["_print_action_table"](list(VERIFY["fixed_template_append_roles"](args.ti
 R._ensure_prompt_data()
 metrics = os.environ["MILES_SESSION_VERIFY_METRICS_PATH"]
 assert os.environ.get("MILES_TITO_MODEL") == args.tito_model, "MILES_TITO_MODEL must match --tito-model"
-cmd = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "miles_train.py"),
-       *shlex.split(R.namespace_to_train_args(args)), *extra]
+cmd = [sys.executable, "/root/miles/train.py", *shlex.split(R.namespace_to_train_args(args)), *extra]
 print("train.py", " ".join(cmd[2:]), flush=True)
 rc = subprocess.call(cmd)
 if rc:
