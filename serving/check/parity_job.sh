@@ -7,8 +7,9 @@
 # The port of flint_sglang to SGLang 0.5.23 against Recursive's kit on SGLang 0.5.16, two TP2 servers side by side
 # with the eval servers' flags (the kit's serve_h200.sh): D = the port in miles-v0.1.3.sif on GPUs 0-1, A = the kit
 # in flint-sglang.sif on GPUs 2-3. Then, on both: (1) logprobs and top-32 heads on S1's 8 long-game sequences
-# (2k-60k tokens; D also in a batch of 8 and decode vs prefill), (2) decode throughput at 1 and 8 requests, (3) two
-# short real long-game episodes (one Flint, 30k tokens) for tool-call and reasoning parsing. Usage: parity_job.sh
+# (2k-60k tokens; D also in a batch of 8 and decode vs prefill), (2) decode throughput at 1 and 8 requests, (3) four
+# short real long-game episodes (one Flint, 30k tokens) for tool-call and reasoning parsing. gpu_watchdog stops
+# the job when one of its GPUs stays at 0% for 10 min. Usage: parity_job.sh
 # Results: /scratch/gpfs/GROUP/USER/tmp/flint_s3/run_<job>/ (table.txt, bench_*.json, gen.txt).
 set -uo pipefail
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
@@ -27,6 +28,8 @@ OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s3/run_$JID
 export TMPDIR=/scratch/gpfs/GROUP/USER/tmp/job/$JID
 mkdir -p "$TMPDIR" "$OUT"
 trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$TMPDIR"' EXIT
+trap 'exit 1' TERM
+source $W/serving/check/gpu_watchdog.sh
 IFS=, read -ra G <<< "${CUDA_VISIBLE_DEVICES:?no GPUs}"
 [ "${#G[@]}" -eq 4 ] || { echo "need 4 GPUs, got ${G[*]}"; exit 1; }
 echo "job $JID host $(hostname) commit $(git -C $W rev-parse HEAD) GPUs ${G[*]}"
@@ -55,6 +58,7 @@ py() { apptainer exec --home "$TMPDIR" --bind /scratch/gpfs/GROUP "$KSIF" python
 
 serve D "$MSIF" "${G[0]},${G[1]}" $BASEP $((BASEP + 1)) "$TMPDIR/flint_pkg"
 serve A "$KSIF" "${G[2]},${G[3]}" $((BASEP + 2)) $((BASEP + 3)) ""
+gpu_watchdog $$ "${SRV[D]}" "${SRV[A]}" &
 ready D || exit 1
 ready A || exit 1
 
@@ -63,7 +67,7 @@ py $S1/query_sglang.py "$SEQS" "http://127.0.0.1:${PORT[D]}" "$OUT/sglang_D.pt" 
 QD=$!
 py $S1/query_sglang.py "$SEQS" "http://127.0.0.1:${PORT[A]}" "$OUT/sglang_A.pt" > "$OUT/query_A.log" 2>&1
 wait $QD
-tail -1 "$OUT/query_D.log" "$OUT/query_A.log"
+tail -n1 "$OUT/query_D.log" "$OUT/query_A.log"
 py $W/serving/check/compare_servers.py "$SEQS" "$OUT/sglang_A.pt" "$OUT/sglang_D.pt" "$A_S1" | tee "$OUT/table.txt"
 
 # 2. decode throughput, both servers at once (separate GPU pairs)
@@ -73,16 +77,18 @@ py $W/serving/check/bench.py "$SEQS" "http://127.0.0.1:${PORT[A]}" "$OUT/bench_A
 wait $BD
 echo "BENCH D $(cat $OUT/bench_D.json)"; echo "BENCH A $(cat $OUT/bench_A.json)"
 
-# 3. two real long-game episodes on each server (main's driver, one Flint, 30k tokens, smoke8 problems 0 and 5)
+# 3. four real long-game episodes on each server (main's driver, one Flint, 30k tokens, the first four smoke8
+# problems); each driver has a TMPDIR of its own, since the game's work directories are named by problem
 gen() {   # $1 name
-  (cd $W && APPTAINERENV_PYTHONPATH=$W APPTAINERENV_MA_LG_N=1 APPTAINERENV_MA_LG_TOKENS=30000 \
+  mkdir -p "$TMPDIR/gen_$1" "$TMPDIR/judge_$1"
+  (cd $W && APPTAINERENV_TMPDIR=$TMPDIR/gen_$1 APPTAINERENV_PYTHONPATH=$W APPTAINERENV_MA_LG_N=1 \
+     APPTAINERENV_MA_LG_TOKENS=30000 \
      APPTAINERENV_FCS_RM_CONCURRENCY=4 APPTAINERENV_FCS_JUDGE_TMP=$TMPDIR/judge_$1 \
      APPTAINERENV_FCS_JUDGE_CACHE=$TMPDIR/judge_cache_$1 \
      timeout 60m apptainer exec --home "$TMPDIR" --bind /scratch/gpfs/GROUP "$PYSIF" \
      python3 run_eval.py --base-url "http://127.0.0.1:${PORT[$1]}" --model flint \
-     --data data/fcs11_val40_agent_smoke8.jsonl --out "$OUT/gen_$1" --limit 2 --concurrency 2) > "$OUT/gen_$1.log" 2>&1
+     --data data/fcs11_val40_agent_smoke8.jsonl --out "$OUT/gen_$1" --limit 4 --concurrency 4) > "$OUT/gen_$1.log" 2>&1
 }
-mkdir -p "$TMPDIR/judge_D" "$TMPDIR/judge_A"
 gen D &
 GD=$!
 gen A
