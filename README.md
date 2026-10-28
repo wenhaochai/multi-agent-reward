@@ -73,9 +73,10 @@ worktree `miles-rollout`, branch flint-grpo of wenhaochai/miles-private):
     wq submit --prio 10 --time 3:00:00 --project flint-eval rl/rollout_job.sh full   # 8 x 128k with and without top-32
 
 RL on the same problem, one 8-GPU block (4 engines at TP2 colocated with the FSDP actor; GRPO without std
-normalization, score centering over the top-32, routing replay, one step per 8 episodes of 128k, lr 2e-7):
+normalization, score centering over the top-32, routing replay, one step per 8 episodes of 128k, lr 2e-7). The game
+runs with RL's context cap (110k characters, 16k-token turns; the eval's are 400k and 32k), so that a training sample
+stays near the 64k tokens the actor step was measured at:
 
-    wq submit --prio 10 --project flint-eval rl/rl_job.sh memprobe   # 2 training steps alone on a recorded rollout
     wq submit --prio 10 --project flint-eval rl/rl_job.sh test2      # 2 RL steps
     rl/steps.py <run dir>                                             # the per-step table
 
