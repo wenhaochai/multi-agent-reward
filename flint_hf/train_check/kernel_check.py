@@ -40,6 +40,35 @@ def real_tensor(name):
         return f.get_tensor(name)
 
 
+_FLEX = {}
+
+
+def flex_sink_attention(q, k, v, sinks, scale, window, cu_seqlens):
+    """Candidate fallback: PyTorch flex attention on packed documents (block mask: same document, causal, window),
+    the sink applied through the log-sum-exp: o * sigmoid(lse - sink), exact for a value-less sink logit."""
+    from torch.nn.attention.flex_attention import AuxRequest, create_block_mask, flex_attention
+
+    if "fn" not in _FLEX:
+        _FLEX["fn"] = torch.compile(flex_attention, dynamic=False)
+    T, H, D = q.shape
+    cu = cu_seqlens.to(q.device)
+    doc = torch.repeat_interleave(torch.arange(len(cu) - 1, device=q.device), cu[1:] - cu[:-1])
+
+    def mask(b, h, qi, ki):
+        m = (doc[qi] == doc[ki]) & (ki <= qi)
+        return m & (qi - ki < window) if window else m
+
+    bm = create_block_mask(mask, None, None, T, T, device=q.device)
+    out, aux = _FLEX["fn"](q.transpose(0, 1)[None], k.transpose(0, 1)[None], v.transpose(0, 1)[None], block_mask=bm,
+                           scale=scale, enable_gqa=True, return_aux=AuxRequest(lse=True))
+    w = torch.sigmoid(aux.lse.float() - sinks.float()[None, :, None])           # [1, H, T]
+    return (out.float() * w[..., None])[0].transpose(0, 1).to(q.dtype)
+
+
+M.ATTENTION_FUNCTIONS["flex"] = flex_sink_attention
+WORKING = []   # attention candidates that ran forward and backward on the random inputs
+
+
 def check_attention(dev):
     H, KV, D = 32, 4, 128
     sinks = real_tensor("model.layers.2.self_attn.softmax_offset").float().to(dev)
@@ -51,16 +80,24 @@ def check_attention(dev):
         s = sinks.clone().requires_grad_()
         do = torch.randn(4096, H, D, device=dev).bfloat16()
         outs, grads = {}, {}
-        for impl in ("eager", "te"):
+        for impl in ("eager", "te", "flex"):
             for t in (q, k, v, s):
                 t.grad = None
-            o = M.ATTENTION_FUNCTIONS[impl](q, k, v, s, D ** -0.5, window, cu)
-            o.backward(do)
+            try:
+                o = M.ATTENTION_FUNCTIONS[impl](q, k, v, s, D ** -0.5, window, cu)
+                o.backward(do)
+            except Exception as e:   # report and go on: the other candidate may still work
+                print(f"attention {impl} (window {window}) FAILED: {type(e).__name__}: {str(e)[:300]}", flush=True)
+                continue
             outs[impl], grads[impl] = o.detach(), [t.grad.clone() for t in (q, k, v, s)]
+            if impl != "eager" and window is None and impl in outs:
+                WORKING.append(impl)
         tag = f"window {window}"
-        diff(f"attention out ({tag})", outs["te"], outs["eager"])
-        for n, gt, ge in zip(("dq", "dk", "dv", "dsinks"), grads["te"], grads["eager"]):
-            diff(f"attention {n} ({tag})", gt, ge)
+        for impl in ("te", "flex"):
+            if impl in outs:
+                diff(f"attention {impl} out ({tag})", outs[impl], outs["eager"])
+                for n, gt, ge in zip(("dq", "dk", "dv", "dsinks"), grads[impl], grads["eager"]):
+                    diff(f"attention {impl} {n} ({tag})", gt, ge)
     # one long document through te, forward + backward
     T = 65536
     torch.cuda.reset_peak_memory_stats(dev)
@@ -68,13 +105,21 @@ def check_attention(dev):
     k = torch.randn(T, KV, D, device=dev).bfloat16().requires_grad_()
     v = torch.randn(T, KV, D, device=dev).bfloat16().requires_grad_()
     s = sinks.clone().requires_grad_()
-    for window in (513, None):
-        torch.cuda.synchronize(dev)
-        t0 = time.time()
-        M.ATTENTION_FUNCTIONS["te"](q, k, v, s, D ** -0.5, window, torch.tensor([0, T], device=dev)).sum().backward()
-        torch.cuda.synchronize(dev)
-        print(f"attention te {T} tokens window {window}: fwd+bwd {time.time() - t0:.2f} s, finite "
-              f"{all(bool(torch.isfinite(t.grad).all()) for t in (q, k, v, s))}, peak {peak(dev)}", flush=True)
+    for impl in ("te", "flex"):
+        for window in (513, None):
+            for t in (q, k, v, s):
+                t.grad = None
+            torch.cuda.reset_peak_memory_stats(dev)
+            torch.cuda.synchronize(dev)
+            t0 = time.time()
+            try:
+                M.ATTENTION_FUNCTIONS[impl](q, k, v, s, D ** -0.5, window, torch.tensor([0, T], device=dev)).sum().backward()
+            except Exception as e:
+                print(f"attention {impl} {T} tokens window {window} FAILED: {type(e).__name__}: {str(e)[:200]}", flush=True)
+                continue
+            torch.cuda.synchronize(dev)
+            print(f"attention {impl} {T} tokens window {window}: fwd+bwd {time.time() - t0:.2f} s, finite "
+                  f"{all(bool(torch.isfinite(t.grad).all()) for t in (q, k, v, s))}, peak {peak(dev)}", flush=True)
 
 
 def check_experts(dev):
@@ -147,10 +192,12 @@ def check_model(seqs_path, devices):
     for p in probe.values():
         p.requires_grad_(True)
     res = {}
+    fast = WORKING[0] if WORKING else "eager"
+    print(f"model training path uses attention {fast!r}", flush=True)
     for path in ("eager", "training"):
         for m in model.modules():
             if isinstance(m, M.FlintAttention):
-                m.attn_impl = "eager" if path == "eager" else "te"
+                m.attn_impl = "eager" if path == "eager" else fast
             if isinstance(m, M.FlintSparseMoeBlock):
                 m.experts_fn = M.experts_reference if path == "eager" else M.grouped_experts
         for p in probe.values():
