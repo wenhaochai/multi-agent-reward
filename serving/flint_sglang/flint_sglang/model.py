@@ -18,6 +18,11 @@ Serve with ``--moe-runner-backend flashinfer_trtllm_routed`` (Blackwell) or ``tr
 ``flashinfer_trtllm`` and ``triton_kernel`` bypass the routing function and are not supported.
 FlashInfer must use its CUDA RMSNorm kernels (``FLASHINFER_USE_CUDA_NORM=1``); the CuTe-DSL kernels
 produce materially different logits for this model.
+
+Ported from flint_sglang 0.1.4 (SGLang 0.5.16) to SGLang 0.5.23 (miles v0.1.3), where layers declare
+their stage boundaries (``sglang.srt.layers.layer_boundary``) instead of a ``LayerCommunicator``, an FFN
+returns a partial sum that the boundary completes, and server flags are read through
+``sglang.srt.runtime_context``. The numerics are unchanged.
 """
 
 import logging
@@ -28,8 +33,7 @@ from pathlib import Path
 
 import torch
 from flint_sglang.grammar_backend import GRAMMAR_BACKEND_NAME
-from sglang.srt.distributed import get_pp_group
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.layer_boundary import append_stages, declare_attn, declare_ffn
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -46,9 +50,9 @@ from sglang.srt.models.qwen3_moe import (
     Qwen3MoeSparseMoeBlock,
 )
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.true_on_policy import is_true_on_policy_enabled
+from sglang.srt.utils import LazyValue, add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 from torch import nn
 
@@ -81,7 +85,7 @@ class FlintAttention(Qwen3MoeAttention):
         self.use_fused_qk_norm_rope = False
         self.compatible_with_fused_kv_buffer = False
 
-        sinks_dtype = torch.float32 if get_global_server_args().attention_backend == "trtllm_mha" else torch.bfloat16
+        sinks_dtype = torch.float32 if get_server_args().attention_backend == "trtllm_mha" else torch.bfloat16
         self.softmax_offset = nn.Parameter(torch.empty(self.num_heads, dtype=sinks_dtype), requires_grad=False)
 
         # SGLang's sliding_window_size excludes the current token; the config value includes it.
@@ -145,6 +149,8 @@ class FlintSparseMoeBlock(Qwen3MoeSparseMoeBlock):
             custom_routing_function=sigmoid_routing,
         )
 
+        # The routed experts return a partial sum over tensor-parallel ranks, which the layer's FFN boundary
+        # completes; the shared expert's output joins that sum unreduced.
         shared_size = getattr(config, "shared_expert_intermediate_size", 0)
         self.shared_expert = (
             FlintMLP(
@@ -152,6 +158,7 @@ class FlintSparseMoeBlock(Qwen3MoeSparseMoeBlock):
                 intermediate_size=shared_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                reduce_results=False,
                 prefix=add_prefix("shared_expert", prefix),
             )
             if shared_size > 0
@@ -174,8 +181,6 @@ class FlintDecoderLayer(Qwen3MoeDecoderLayer):
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
 
         rope_theta, _ = get_rope_config(config)
         self.rope_theta = rope_theta
@@ -201,15 +206,8 @@ class FlintDecoderLayer(Qwen3MoeDecoderLayer):
             sliding_window=config.sliding_window,
         )
 
-        dense_layers = frozenset(config.mlp_only_layers)
-        self.is_layer_sparse = layer_id not in dense_layers
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=layer_id > 0 and layer_id - 1 not in dense_layers,
-            is_next_layer_sparse=layer_id + 1 < config.num_hidden_layers and layer_id + 1 not in dense_layers,
-        )
+        attn, ffn = self.stage_facts(config, layer_id)
+        self.is_layer_sparse = ffn.sparse
         if self.is_layer_sparse:
             self.mlp = FlintSparseMoeBlock(
                 layer_id=layer_id,
@@ -223,17 +221,24 @@ class FlintDecoderLayer(Qwen3MoeDecoderLayer):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                reduce_results=False,  # the FFN boundary completes the sum, as for the sparse block
                 prefix=add_prefix("mlp", prefix),
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
-            is_last_layer=(layer_id == config.num_hidden_layers - 1),
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (attn, self.input_layernorm), (ffn, self.post_attention_layernorm)
+        )
+
+    @staticmethod
+    def stage_facts(config, layer_id):
+        """The stages this layer declares, from the config alone (the model's layer stack asks for them too):
+        attention, then a dense FFN on ``config.mlp_only_layers`` and a sparse one elsewhere."""
+        dense_layers = frozenset(config.mlp_only_layers)
+        return declare_attn(), declare_ffn(
+            sparse=layer_id not in dense_layers,
+            next_layer_sparse=layer_id + 1 < config.num_hidden_layers and layer_id + 1 not in dense_layers,
         )
 
 
@@ -252,7 +257,7 @@ class FlintForCausalLM(Qwen3MoeForCausalLM):
         nn.Module.__init__(self)
         parallel = get_parallel()
         _check_runtime(parallel)
-        self.pp_group = get_pp_group()
+        self.pp_group = parallel.pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = FlintModel(config, quant_config, prefix=add_prefix("model", prefix))
@@ -261,13 +266,21 @@ class FlintForCausalLM(Qwen3MoeForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=parallel.enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
+        # IPC weight loading bypasses load_weights(), so the EPLB descriptor is set here (as the parent does).
+        self.routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.start_layer, self.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, FlintSparseMoeBlock)
+            }
+        )
         self.attn_cp_size = parallel.attn_cp_size
-        self.attn_cp_rank = parallel.attn_cp_rank
         self.moe_dp_size = parallel.moe_dp_size
+        self.checkpoint_loaded = False  # set by the first load_weights, the startup load
         self.stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -309,12 +322,16 @@ class FlintForCausalLM(Qwen3MoeForCausalLM):
                 yield name, tensor
 
         Qwen3MoeForCausalLM.load_weights(self, canonical_weights(), is_mtp=is_mtp)
+        # The first call is the startup load of the whole checkpoint; later calls are weight updates (an RL trainer
+        # sends buckets of tensors), so only the first checks that every parameter was filled. Every call refuses
+        # tensors that match no parameter.
         _check_load_coverage(
             params=params,
             loaded_targets=loaded_targets,
             unmatched=unmatched,
-            check_missing=not is_mtp and self.quant_config is None,
+            check_missing=not is_mtp and self.quant_config is None and not self.checkpoint_loaded,
         )
+        self.checkpoint_loaded = True
 
     def _skipped_by_parent_loader(
         self, name: str, *, target: str, is_mtp: bool, off_stage_prefixes: tuple[str, ...]
@@ -333,7 +350,12 @@ class FlintForCausalLM(Qwen3MoeForCausalLM):
 
 def _check_runtime(parallel) -> None:
     """Fail fast on serving configurations that silently change Flint's outputs; warn on unvalidated ones."""
-    args = get_global_server_args()
+    args = get_server_args()
+    if is_true_on_policy_enabled():
+        raise RuntimeError(
+            "SGLang's true on-policy mode replaces the MoE router with softmax top-k, which is not Flint's sigmoid "
+            "routing; serve Flint without it."
+        )
     if args.grammar_backend != GRAMMAR_BACKEND_NAME:
         raise RuntimeError(
             f"Flint requires --grammar-backend flint (got {args.grammar_backend}): Flint decides on each turn whether "
