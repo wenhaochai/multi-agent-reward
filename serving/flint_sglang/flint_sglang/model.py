@@ -22,7 +22,8 @@ produce materially different logits for this model.
 Ported from flint_sglang 0.1.4 (SGLang 0.5.16) to SGLang 0.5.23 (miles v0.1.3), where layers declare
 their stage boundaries (``sglang.srt.layers.layer_boundary``) instead of a ``LayerCommunicator``, an FFN
 returns a partial sum that the boundary completes, and server flags are read through
-``sglang.srt.runtime_context``. The numerics are unchanged.
+``sglang.srt.runtime_context``. On real long-game sequences the port and the kit differ by 0.032 nats per assistant
+token, the size of one bf16 rounding step (serving/check, job w533).
 """
 
 import logging
