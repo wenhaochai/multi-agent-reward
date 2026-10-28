@@ -10,8 +10,8 @@
 # concurrent episodes, 4 per engine). Usage: rollout_job.sh probe|full (wq --prio 10).
 #   probe  miles' GPU TITO check for Flint, then 8 episodes of 8k tokens on the RL test problem with the context cut to
 #          20k characters (trims within the episode): the whole path, short
-#   full   8 episodes of 128k tokens on the RL test problem (val40 problem 0) with the top-32 candidates, then 8 without
-#          them (what recording them costs)
+#   full   8 episodes of 128k tokens on the RL test problem (val40 problem 0) with the top-32 candidates, miles' GPU
+#          TITO check, then 8 episodes without the candidates (what recording them costs)
 # Results: tmp/flint_s5a/runs/<job>/. Everything runs in one container with a PID namespace of its own (--pid), so
 # miles' and Ray's cleanup sees only this job and the container's process group holds all of it. Bounds: timeout -s
 # KILL around the container, a GPU-idle watchdog (10 min at 0%), and cleanup of only the process groups this job
@@ -20,7 +20,7 @@
 mkdir -p /scratch/gpfs/GROUP/USER/tmp/flint_s5a/logs
 set -uo pipefail
 MODE=${1:-}
-case "$MODE" in probe) LIMIT=3300;; full) LIMIT=9600;; *) echo "usage: rollout_job.sh probe|full"; exit 1;; esac
+case "$MODE" in probe) LIMIT=3300;; full) LIMIT=10500;; *) echo "usage: rollout_job.sh probe|full"; exit 1;; esac
 JID=${FETCHED_JOB_ID:-$SLURM_JOB_ID}
 [ -n "$JID" ] || { echo "no job id"; exit 1; }
 REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-rollout
@@ -36,6 +36,7 @@ WD=
 trap 'stop "${STARTED[@]}"; [ -z "$WD" ] || kill "$WD" 2>/dev/null; rm -rf -- "/scratch/gpfs/GROUP/USER/tmp/job/$JID"' EXIT
 trap 'exit 143' TERM INT
 echo "[s5a] $(date -u +%FT%TZ) $MODE node=$(hostname) job=$JID gpus=${CUDA_VISIBLE_DEVICES:-} code=$(git -C "$REPO" rev-parse --short HEAD)"
+git -C /scratch/gpfs/GROUP/USER/project/miles-rollout rev-parse --short HEAD > "$OUT/miles_commit"
 # pre-flight: every weight file of the checkpoint is a real file (an evicted cache leaves dangling links)
 python3 - "$FLINT" <<'PY' || exit 1
 import json, os, sys
