@@ -15,7 +15,8 @@
 # Results: tmp/flint_s5a/runs/<job>/. Everything runs in one container with a PID namespace of its own (--pid), so
 # miles' and Ray's cleanup sees only this job and the container's process group holds all of it. Bounds: timeout -s
 # KILL around the container, a GPU-idle watchdog (10 min at 0%), and cleanup of only the process groups this job
-# started (serving/check/procs.sh).
+# started (serving/check/procs.sh). The container writes only to job directories bound in (its own writable layer is
+# 64 MB): /tmp and /root/datasets (miles' TITO verifier writes its prompt there).
 mkdir -p /scratch/gpfs/GROUP/USER/tmp/flint_s5a/logs
 set -uo pipefail
 MODE=${1:-}
@@ -27,7 +28,7 @@ SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif
 FLINT=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint
 OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5a/runs/$JID
 export TMPDIR=/scratch/gpfs/GROUP/USER/tmp/job/$JID
-mkdir -p "$OUT" "$TMPDIR/tmp"
+mkdir -p "$OUT" "$TMPDIR/tmp" "$TMPDIR/datasets"
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 source "$REPO/serving/check/procs.sh"
 source "$REPO/serving/check/gpu_watchdog.sh"
@@ -58,8 +59,8 @@ PY
 IDLE_MAX=20 gpu_watchdog $$ &
 WD=$!
 start timeout -s KILL "$LIMIT" apptainer exec --pid --nv --contain --cleanenv --writable-tmpfs \
-  --bind /scratch/gpfs/GROUP --bind "$TMPDIR/tmp":/tmp --bind /dev/shm \
-  --env PYTHONNOUSERSITE=1 --env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" --env JID="$JID" --env OUT="$OUT" \
+  --bind /scratch/gpfs/GROUP --bind "$TMPDIR/tmp":/tmp --bind "$TMPDIR/datasets":/root/datasets \
+  --env PYTHONNOUSERSITE=1 --env PYTHONDONTWRITEBYTECODE=1 --env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" --env JID="$JID" --env OUT="$OUT" \
   --env PKG="$PKG" --env TMPDIR="$TMPDIR" "$SIF" bash "$REPO/rl/rollout_inner.sh" "$MODE"
 wait "${STARTED[0]}"
 rc=$?
