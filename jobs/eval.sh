@@ -18,9 +18,12 @@
 #              60, under the 90-min idle-GPU host cancel; 0 = off). The episodes resume from their checkpoints.
 #   rounds=N   MA_LG_MAX_ROUNDS (default 20000)
 #   repo=PATH  code tree (default the clean worktree of main, miles-q38-build-clean); it must be clean
-# Results: runs/<SPLIT>_t<TOKENS>_e<EPISODES>_budget_low0.75[_n<N>_own_mustpost] (the names of the same game before
-# the cleanup of 2026-10-28, so a run resumes there). Exit: 0 when every episode is scored or given up; 99 (wq
-# requeues) when episodes are left and the driver can resume them; 1 on a setup failure or a run without progress.
+# Results: runs/<SPLIT>_t<TOKENS>_e<EPISODES>_n<N>_r<ROUNDS>. Every setting a run may change is in the name and the
+# rest is fixed in the code (segments.jsonl records each segment's commit), so two runs with different settings never
+# share a directory; one driver per directory (run_eval.py's lock). The runs of the code before 2026-10-28 used other
+# names (..._budget_low0.75[_n4_own_mustpost]) and another judge rule: this script never writes there.
+# Exit: 0 when every episode is scored or given up; 99 (wq requeues) when episodes are left and the driver can resume
+# them; 1 on a setup failure, a run without progress, or a directory another driver holds.
 set -euo pipefail
 # The servers bind 127.0.0.1, and SGLang's own warmup request goes there: a proxy in the environment (module
 # proxy/default) answers it with 403 and the server exits (smoke 16159073). Nothing here needs the internet.
@@ -50,11 +53,13 @@ JID=${FETCHED_JOB_ID:-${SLURM_JOB_ID:-}}
 export TMPDIR=/scratch/gpfs/GROUP/USER/tmp/job/$JID
 mkdir -p "$TMPDIR"
 trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "/scratch/gpfs/GROUP/USER/tmp/job/$JID" || true' EXIT
-OUT=$FE/runs/${SPLIT}_t${TOKENS}_e${EPISODES}_budget_low0.75
-[ "$AGENTS" = 1 ] || OUT=${OUT}_n${AGENTS}_own_mustpost
+OUT=$FE/runs/${SPLIT}_t${TOKENS}_e${EPISODES}_n${AGENTS}_r${ROUNDS}
 DATA=$REPO/data/fcs11_${SPLIT}_agent.jsonl
 SEG=$(date +%m%d-%H%M%S)   # one stamp per segment (wq run): each segment keeps its own server logs
 mkdir -p "$OUT/servers" "$FE/triton_cache"
+# the driver's lock (run_eval.py lock_out), tried here so a job whose directory is taken stops before its servers start
+python3 -c 'import fcntl, sys; fcntl.lockf(open(sys.argv[1], "a"), fcntl.LOCK_EX | fcntl.LOCK_NB)' "$OUT/.lock" \
+  2>/dev/null || { echo "another driver holds $OUT: refusing"; exit 1; }
 echo "segment $SEG host $(hostname) job $JID slurm ${SLURM_JOB_ID:-none}"
 echo "split $SPLIT tokens $TOKENS episodes $EPISODES agents $AGENTS conc $CONC narrow $NARROW idle ${IDLE_MIN}m rounds $ROUNDS repo $REPO"
 
