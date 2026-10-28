@@ -29,7 +29,8 @@ missing += [f for f in ("rollout_0.pt", "rollout_1.pt") if not os.path.isfile(os
 sys.exit(f"PREFLIGHT_FAIL missing {missing}") if missing else print(f"preflight: {len(files)} weight files, batch present")
 PY
 echo "[s2] $(date -u +%FT%TZ) node=$(hostname) job=$JID gpus=$CUDA_VISIBLE_DEVICES"
-nvidia-smi --query-gpu=timestamp,index,memory.used --format=csv,noheader -l 2 > "$OUT/gpu_mem.csv" 2>/dev/null &
+# only this job's GPUs: on a shared host the others belong to another guest
+nvidia-smi -i "$CUDA_VISIBLE_DEVICES" --query-gpu=timestamp,index,memory.used --format=csv,noheader -l 2 > "$OUT/gpu_mem.csv" 2>/dev/null &
 ( while true; do echo "$(date +%s) $(free -m | awk '/Mem:/{print $3}')"; sleep 2; done ) > "$OUT/host_mem.txt" &
 apptainer exec --nv --contain --cleanenv --writable-tmpfs \
   --bind /scratch/gpfs/GROUP/USER --bind "$JOBTMP":/tmp --bind "$TMPDIR" --bind /dev/shm \

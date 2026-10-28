@@ -25,8 +25,11 @@ ray start --head --node-ip-address 127.0.0.1 --num-gpus "$NG" --port=$PORT --das
 export RAY_ADDRESS=127.0.0.1:$PORT
 trap 'ray stop --force >/dev/null 2>&1; pkill -9 -u "$(id -u)" -f -- "$RAY_TMP" 2>/dev/null || true' EXIT
 cd "$W"
+# miles builds a prompt data source even when it replays --load-debug-rollout-data; one unused prompt satisfies it
+[ -f "$OUT/unused_prompt.jsonl" ] || echo '{"prompt": "unused", "label": ""}' > "$OUT/unused_prompt.jsonl"
 python3 "$W/train.py" \
   --train-backend fsdp --hf-checkpoint "$MODEL" --attn-implementation eager \
+  --prompt-data "$OUT/unused_prompt.jsonl" --input-key prompt --label-key label \
   --load-debug-rollout-data "$DATA/rollout_{rollout_id}.pt" --save-debug-train-data "$OUT/train_{rollout_id}_{rank}.pt" \
   --num-rollout 2 --rollout-batch-size 1 --n-samples-per-prompt 8 --global-batch-size 8 \
   --rollout-temperature 1 --rollout-top-logprobs-num 32 \
