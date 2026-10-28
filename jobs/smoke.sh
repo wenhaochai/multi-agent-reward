@@ -10,9 +10,10 @@
 #              more: the first N of val40) (default 2)
 #   agents=N   agents per episode (default 4)   tokens=T  tokens per agent (default 150000)
 #   repo=PATH  code tree (default the clean worktree of main, miles-q38-build-clean)
-# Gate (exit 0): every episode ended clean, and in a team every owed post was paid (after each submission the agent's
-# next command that ran was a post with a message; refused commands between are fine). How many posts were owed is
-# printed: a short smoke may have no submission, and then the post rule is untested.
+# Gate (exit 0): the driver exited 0, every episode ended clean (a trace record each, in this run's own directory
+# runs/smoke_<job>_<time>), and in a team every owed post was paid (after each submission the agent's next command that
+# ran was a post with a message; refused commands between are fine). How many posts were owed is printed: a short
+# smoke may have no submission, and then the post rule is untested.
 # Wall time 2:45 = up to 30 min of server start + 120 min of driver + 15 min to spare (the post smoke w522 of
 # 2026-10-28, 2 episodes x 4 agents x 150k at TP4: driver 91 min); smoke_wq.sh runs this script under the same limit.
 set -euo pipefail
@@ -36,8 +37,8 @@ JID=${FETCHED_JOB_ID:-${SLURM_JOB_ID:-}}
 export TMPDIR=/scratch/gpfs/GROUP/USER/tmp/job/$JID
 mkdir -p "$TMPDIR"
 trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$TMPDIR" || true' EXIT
-OUT=$FE/runs/smoke_$JID
-SLOG=$OUT/server-$(date +%Y%m%dT%H%M%S).log
+OUT=$FE/runs/smoke_${JID}_$(date +%Y%m%dT%H%M%S)   # a fresh directory: a rerun of the job counts only its own records
+SLOG=$OUT/server.log
 mkdir -p "$OUT" "$FE/triton_cache"
 echo "run $(date -Is) host $(hostname) job $JID: n $N agents $AGENTS tokens $TOKENS repo $REPO" \
      "commit $(git -C "$REPO" rev-parse HEAD)"
@@ -77,9 +78,9 @@ APPTAINERENV_FCS_RM_CONCURRENCY=8 APPTAINERENV_FCS_JUDGE_TMP=$TMPDIR APPTAINEREN
 rc=${PIPESTATUS[0]}
 set -e
 echo "driver exit $rc"
-python3 - "$OUT" "$N" "$AGENTS" <<'PY'
+python3 - "$OUT" "$N" "$AGENTS" "$rc" <<'PY'
 import glob, json, re, sys
-out, n_ep, team = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]) > 1
+out, n_ep, team, rc = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]) > 1, int(sys.argv[4])
 recs = [json.loads(l) for f in glob.glob(out + "/traces/*.jsonl") for l in open(f)]
 POST_RE = re.compile(r"\s*post\s+(.+?)\s*", re.S)   # flint.game.POST_RE
 bad = paid = 0
@@ -101,7 +102,7 @@ for r in recs:
 subs = sum(len(r["submissions"]) for r in recs)
 if team:
     print("POST rule broken", bad, "paid", paid, "submissions", subs, "(untested: no submission)" if not subs else "")
-ok = len(recs) == n_ep and bad == 0
-print("SMOKE_PASS" if ok else "SMOKE_FAIL", f"{len(recs)}/{n_ep} episodes")
+ok = rc == 0 and len(recs) == n_ep and bad == 0
+print("SMOKE_PASS" if ok else "SMOKE_FAIL", f"{len(recs)}/{n_ep} episodes, driver exit {rc}")
 sys.exit(0 if ok else 1)
 PY
