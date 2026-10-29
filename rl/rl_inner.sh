@@ -96,17 +96,30 @@ ray start --head --node-ip-address 127.0.0.1 --num-gpus "$NG" --port=$P --dashbo
 export RAY_ADDRESS=127.0.0.1:$P
 trap 'ray stop --force >/dev/null 2>&1' EXIT   # this PID namespace's Ray only
 
+# train.py in the background; once the engines serve (the first rollout request), the served-weights probe runs once
+# on the initial weights (flint.miles_agent.startup_probe): if it fails, train.py is stopped, minutes into the run
+train() {
+  python3 "$MILES/train.py" "$@" > "$OUT/train.log" 2>&1 &
+  local tp=$!
+  (
+    until grep -q 'POST /v1/chat/completions' "$OUT/train.log" 2>/dev/null; do kill -0 $tp 2>/dev/null || exit; sleep 15; done
+    python3 -c "import sys; from flint.miles_agent import startup_probe as p; sys.exit(p('$OUT', '$OUT/train.log', '$FLINT'))" \
+      > "$OUT/probe_start.log" 2>&1 || { echo "[s5] startup probe failed: $(tail -1 "$OUT/probe_start.log")"; kill $tp; }
+  ) &
+  wait $tp
+}
+
 t0=$SECONDS
 case "$MODE" in
   smoke)   # the same path, short: 2 steps of 8 episodes x 4k tokens, the context cut to 20k characters (trims happen),
     # no actor save: rollout, log_rollout (check, probe), training step, weight sync, rollout 2, probe change. An episode
     # is ~100 turns of ~70 tokens at ~7 s per model call plus its commands (w611: 8k-token episodes took 18-31+ min)
     export MA_LG_TOKENS=4000 MA_LG_CTX_CHARS=20000
-    python3 "$MILES/train.py" "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" --colocate --num-rollout 2 > "$OUT/train.log" 2>&1 ;;
-  test2) python3 "$MILES/train.py" "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RL[@]}" --num-rollout 2 > "$OUT/train.log" 2>&1 ;;
-  run20) python3 "$MILES/train.py" "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RL[@]}" --num-rollout 20 > "$OUT/train.log" 2>&1 ;;
+    train "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" --colocate --num-rollout 2 ;;
+  test2) train "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RL[@]}" --num-rollout 2 ;;
+  run20) train "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RL[@]}" --num-rollout 20 ;;
 esac
 rc=$?
-echo "[s5] $(date -u +%FT%TZ) train.py exit $rc after $((SECONDS - t0)) s"
+echo "[s5] $(date -u +%FT%TZ) train.py exit $rc after $((SECONDS - t0)) s; $(tail -1 "$OUT/probe_start.log" 2>/dev/null)"
 python3 "$REPO/rl/steps.py" "$OUT"
 exit $rc

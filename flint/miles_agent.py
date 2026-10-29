@@ -104,12 +104,15 @@ def drop_failed_groups(args, data) -> None:
 
 
 def _post(args, path: str, body: dict) -> tuple[int, object]:
-    """POST JSON to miles' router (it proxies to an engine): (status, the parsed reply or the error body as text)."""
+    """POST JSON to miles' router (sgl-router): (status, the parsed reply or the error body as text). Its consistent
+    hashing policy routes by the X-SMG-Routing-Key header and refuses a request without one (w612: 400
+    missing_routing_key); a fixed key sends every probe to the same engine."""
     import urllib.error
     import urllib.request
 
     req = urllib.request.Request(f"http://{args.sglang_router_ip}:{args.sglang_router_port}{path}",
-                                 data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+                                 data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json", "X-SMG-Routing-Key": "flint-probe"})
     try:
         with urllib.request.urlopen(req, timeout=600) as r:
             return r.status, json.loads(r.read())
@@ -132,6 +135,32 @@ def _probe(args, ids: list[int], messages: list) -> dict:
         raise RuntimeError(f"probe: {refused}; /v1/chat/completions {status}: {out}")
     top = out["choices"][0]["logprobs"]["content"][0]["top_logprobs"]
     return {"kind": "chat", "top": {x["token"]: x["logprob"] for x in top}, "generate_refused": refused}
+
+
+def startup_probe(out: str, train_log: str, model: str) -> int:
+    """Before rollout 0 (rl/rl_inner.sh, once the engines serve): the probe on the initial weights, so that a broken
+    probe ends the run in minutes. The probe sequence is the problem prompt as Flint's chat template renders it, fixed
+    for the run ($MA_RL_OUT/probe_ids.json, which log_rollout reuses). Returns 0 when the probe works."""
+    import re
+    from types import SimpleNamespace
+
+    from transformers import AutoTokenizer
+
+    try:
+        m = re.findall(r"Router ready at host='([^']+)' port=(\d+)", open(train_log, errors="replace").read())
+        args = SimpleNamespace(sglang_router_ip=m[0][0], sglang_router_port=int(m[0][1]))
+        messages = json.loads(open(os.path.join(out, "data_p0.jsonl")).readline())["prompt"]
+        ids = AutoTokenizer.from_pretrained(model).apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+        ids = [int(t) for t in (ids["input_ids"] if hasattr(ids, "keys") else ids)]   # transformers 5: a BatchEncoding
+        json.dump(ids, open(os.path.join(out, "probe_ids.json"), "w"))
+        probe = [_probe(args, ids, messages), _probe(args, ids, messages)]
+        json.dump(probe, open(os.path.join(out, "probe_start.json"), "w"))
+        print(f"[flint probe] start: {probe[0]['kind']}, {len(ids)} tokens, repeat max |diff| "
+              f"{max(_probe_diffs(*probe), default=None)}", flush=True)
+        return 0 if probe[0]["kind"] == "generate" else 1
+    except Exception as e:
+        print(f"[flint probe] start FAILED: {type(e).__name__}: {e}", flush=True)
+        return 1
 
 
 def _probe_diffs(a: dict, b: dict) -> list[float]:
