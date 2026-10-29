@@ -68,7 +68,7 @@ TRAIN=(--train-backend fsdp --hf-checkpoint "$FLINT" --attn-implementation eager
 # engine width: 4 x TP2 by default; smoke_tp4 / smoke_tp8 serve the same episodes from 2 x TP4 / 1 x TP8 engines, so
 # no engine waits for the group's slowest episode (a serving change: same weights, same sampling)
 ENGINE_TP=2
-case "$MODE" in *_tp4) ENGINE_TP=4;; *_tp8) ENGINE_TP=8;; esac
+case "$MODE" in *_tp4) ENGINE_TP=4;; *_tp8|run20) ENGINE_TP=8;; esac   # run20: 1 x TP8 from rollout 4 (w662)
 SERVE=(--rollout-num-gpus "$NG" --rollout-num-gpus-per-engine "$ENGINE_TP"
   --sglang-attention-backend fa3 --sglang-moe-runner-backend triton --sglang-enable-fp32-lm-head
   --sglang-context-length 262144 --sglang-chunked-prefill-size 4096 --sglang-swa-full-tokens-ratio 0.4

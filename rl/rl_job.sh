@@ -29,6 +29,8 @@ MILES=/scratch/gpfs/GROUP/USER/project/miles-rollout
 SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif
 FLINT=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint
 OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/$JID
+# run20 lives in one fixed directory, so that any submission resumes it (the checkpoints, steps.jsonl, the traces)
+[ "$MODE" = run20 ] && OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/run20_p0
 export TMPDIR=/scratch/gpfs/GROUP/USER/tmp/job/$JID
 mkdir -p "$OUT" "$TMPDIR/tmp" "$TMPDIR/datasets"
 rm -f "$OUT/exit_code" "$OUT/stop_request" "$OUT/save_now" "$OUT/train_segment.log"   # this segment's stop state (run20 resumes in the same directory)
@@ -42,6 +44,15 @@ WD= MEM= SMI=
 trap 'stop "${STARTED[@]}"; kill $WD $MEM $SMI 2>/dev/null; rm -rf -- "/scratch/gpfs/GROUP/USER/tmp/job/$JID"' EXIT
 trap 'exit "$(cat "$OUT/exit_code" 2>/dev/null || echo 143)"' TERM INT   # a planned stop leaves its exit code there
 echo "[s5] $(date -u +%FT%TZ) $MODE node=$(hostname) job=$JID gpus=${CUDA_VISIBLE_DEVICES:-}"
+# this segment's end: Slurm's (or a fetching host's) SLURM_JOB_END_TIME, else the time limit of the parent timeout (a
+# fetched guest runs under `timeout <s>s`), else LIMIT; the planned time stop comes 75 min before it
+END=$(( $(date +%s) + LIMIT )) SRC=LIMIT
+if [ -n "${SLURM_JOB_END_TIME:-}" ]; then
+  [ "$SLURM_JOB_END_TIME" -lt "$END" ] && END=$SLURM_JOB_END_TIME; SRC=SLURM_JOB_END_TIME
+elif d=$(tr '\0' '\n' < /proc/$PPID/cmdline 2>/dev/null | grep -xE '[0-9]+s' | tail -1 | tr -d s) && [ -n "$d" ]; then
+  [ $(( $(date +%s) + d )) -lt "$END" ] && END=$(( $(date +%s) + d )); SRC="parent timeout ${d}s"
+fi
+echo "[s5] segment end $(date -d @"$END" +%FT%T) ($((END - $(date +%s))) s left; from $SRC)"
 echo "mas-rl $(git -C "$REPO" rev-parse --short HEAD) dirty=$(git -C "$REPO" status --porcelain -uno | wc -l)" \
   "miles $(git -C "$MILES" rev-parse --short HEAD) dirty=$(git -C "$MILES" status --porcelain -uno | wc -l)" | tee "$OUT/code"
 python3 - "$FLINT" <<'PY' || exit 1
@@ -84,7 +95,7 @@ TRACKER=$OUT/actor/latest_checkpointed_iteration.txt
     echo "$(date +%s) $(free -m | awk '/Mem:/{print $3}') $cg"
     if [ "$cg" -gt $((875 * 1024)) ]; then finish "3 host memory $cg MiB over 875 GB"; break; fi
     [ "$cg" -gt $((860 * 1024)) ] && request "3 host memory $cg MiB over 860 GB"
-    [ "$MODE" = run20 ] && [ $((SECONDS - t0)) -gt $((LIMIT - 4500)) ] && request "99 time: less than 75 min left"
+    [ "$MODE" = run20 ] && [ "$(date +%s)" -gt $((END - 4500)) ] && request "99 time: less than 75 min left"
     if [ "$MODE" = run20 ] && [ -n "$FRESH" ] && [ -e "$TRACKER" ]; then finish "99 first segment: checkpoint $(cat "$TRACKER") written, resume next"; break; fi
     if [ -e "$OUT/stop_request" ] && [ -z "$asked" ]; then touch "$OUT/save_now"; asked=1; fi
     if [ -n "$asked" ] && [ ! -e "$OUT/save_now" ]; then finish "$(cat "$OUT/stop_request")"; break; fi
