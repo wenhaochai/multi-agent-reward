@@ -131,7 +131,9 @@ class Router(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         code = 200
-        if self.path == "/generate" and refuse[0]:
+        if self.headers.get("X-SMG-Routing-Key") != "flint-probe":   # sgl-router's consistent hashing (w612)
+            code, reply = 400, {"code": "missing_routing_key"}
+        elif self.path == "/generate" and refuse[0]:
             code, reply = 400, {"error": "no input log-probs here"}
         elif self.path == "/generate":
             probes.append(body)
@@ -194,6 +196,15 @@ lines = [json.loads(x) for x in open(os.path.join(out_dir, "steps.jsonl"))]
 check("log: /generate refused -> chat probe, the 400 body kept, the change measured",
       lines[3]["probe_kind"] == "chat" and "no input log-probs" in lines[3]["probe_generate_refused"]
       and abs(lines[3]["probe_change_max_abs"] - 0.04) < 1e-9 and len(chats) == 4 and chats[0]["messages"] == MSG, lines[3])
+# startup_probe: the router from miles' log line, the prompt as Flint's chat template renders it
+refuse[0] = False
+probes.clear()
+log = os.path.join(out_dir, "train.log")
+open(log, "w").write(f"x router_manager.py:64 - Router ready at host='127.0.0.1' port={srv.server_port} external_host=None\n")
+rc = MA.startup_probe(out_dir, log, "/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint")
+ids = json.load(open(os.path.join(out_dir, "probe_ids.json")))
+check("startup probe: works, the templated prompt, written for log_rollout", rc == 0 and len(probes) == 2
+      and probes[0]["input_ids"] == ids and len(ids) >= 3, (rc, len(ids)))
 import pickle  # noqa: E402
 subprocess.run = lambda cmd, **kw: SimpleNamespace(returncode=1, stdout="INSPECT_FAIL {}\n", stderr="")
 try:
