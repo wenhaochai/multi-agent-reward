@@ -202,7 +202,7 @@ probes.clear()
 log = os.path.join(out_dir, "train.log")
 open(log, "w").write(f"x router_manager.py:64 - Router ready at host='127.0.0.1' port={srv.server_port} external_host=None\n")
 FLINT = "/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint"
-want = {"MA_LG_N": 1, "MA_LG_TOKENS": 4000, "MA_LG_CTX_CHARS": 20000, "MA_AG_TURN": 16384}
+want = {"MA_LG_N": 1, "MA_LG_TOKENS": 4000, "MA_LG_CTX_CHARS": 20000, "MA_AG_TURN": 16384, "MA_LG_WALL_MIN": 45}
 json.dump(want, open(os.path.join(out_dir, "game_settings.json"), "w"))
 os.makedirs(os.path.join(out_dir, "settings_seen"))
 json.dump({**want, "MA_LG_TOKENS": 128000}, open(os.path.join(out_dir, "settings_seen", "1.json"), "w"))

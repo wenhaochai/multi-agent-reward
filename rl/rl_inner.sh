@@ -28,6 +28,10 @@ export MA_LG_N=1 MA_LG_TOKENS=128000 MA_AG_TOOL_STRICT=0 FCS_PROC=/host/proc
 # and 16k-token turns bound a sample at ~59k tokens (w562: 2 of 640 turns were over 16,384 tokens).
 # flint.miles_agent.log_rollout ends the run before training if a sample is over MA_RL_MAX_SAMPLE_TOKENS.
 export MA_LG_CTX_CHARS=110000 MA_AG_TURN=16384 MA_RL_MAX_SAMPLE_TOKENS=70000
+# a wall cap per episode: 128k episodes take 17-44 min (w634, w647), and one at 67 min (w647 rollout 0) kept 3 engines
+# at 0% for 45-50 min; at 45 min an episode ends as at its token budget (scored the same way), so an engine idles at
+# most ~28 min. The game RL optimizes is then the time-limited one; it changes only episodes slower than 45 min.
+export MA_LG_WALL_MIN=45
 # flint.miles_agent.log_rollout: the run directory, and where the agents write traces (moved per rollout)
 export MA_RL_OUT=$OUT MA_AG_TRACE_DIR=$OUT/traces_live
 # smoke: the same path, short: 8 episodes x 4k tokens per step, the context cut to 20k characters (trims happen). The
@@ -35,7 +39,7 @@ export MA_RL_OUT=$OUT MA_AG_TRACE_DIR=$OUT/traces_live
 # environment Ray started with (w624's smoke set them after it, and its agents played 128k). Each episode checks its
 # game's settings against $OUT/game_settings.json (flint.miles_agent.run) and stops the run if they differ.
 [ "$MODE" = smoke ] && export MA_LG_TOKENS=4000 MA_LG_CTX_CHARS=20000
-python3 -c "import json, os; json.dump({k: os.environ[k] for k in ('MA_LG_N', 'MA_LG_TOKENS', 'MA_LG_CTX_CHARS', 'MA_AG_TURN')}, open('$OUT/game_settings.json', 'w'))"
+python3 -c "import json, os; json.dump({k: os.environ[k] for k in ('MA_LG_N', 'MA_LG_TOKENS', 'MA_LG_CTX_CHARS', 'MA_AG_TURN', 'MA_LG_WALL_MIN')}, open('$OUT/game_settings.json', 'w'))"
 ulimit -n "$(ulimit -Hn)"
 NG=$(awk -F, '{print NF}' <<< "$CUDA_VISIBLE_DEVICES")
 JNUM=${JID//[!0-9]/}
