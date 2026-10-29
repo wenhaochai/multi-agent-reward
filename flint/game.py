@@ -39,7 +39,9 @@ by the problem and the episode). N = 1 is the lone-agent control.
 
 Env: MA_LG_N (4 agents), MA_LG_TOKENS (125000 per agent), MA_LG_CTX_CHARS (400000), MA_LG_CTX_LOW (0.75),
 MA_LG_MAX_ROUNDS (20000, a safety cap), MA_LG_CKPT_S (300), MA_AG_TURN (32768 tokens per turn), MA_AG_MAX_LEN (262144
-context tokens), MA_AG_TIMEOUT (60 s per command), MA_AG_TRACE_DIR (traces; none if unset), MA_AG_CMD_WORKERS (32).
+context tokens), MA_AG_TIMEOUT (60 s per command), MA_AG_TRACE_DIR (traces; none if unset), MA_AG_CMD_WORKERS (32),
+MA_LG_WALL_MIN (0: none; RL rollouts set it: an episode that is still playing after that many minutes of wall time ends
+there, like at its token budget, so one slow episode cannot keep the other engines of its group idle).
 """
 from __future__ import annotations
 
@@ -71,6 +73,7 @@ CTX_CHARS = int(os.environ.get("MA_LG_CTX_CHARS", "400000"))
 # a trim cuts the history to CTX_LOW x CTX_CHARS (hysteresis): the prompt prefix, and with it the server's prefix cache,
 # then holds for many steps between trims (audit 2026-10-24: at 1.0 every step past the limit re-prefilled it all)
 CTX_LOW = float(os.environ.get("MA_LG_CTX_LOW", "0.75"))
+WALL_MIN = float(os.environ.get("MA_LG_WALL_MIN", "0"))
 assert 0 < CTX_LOW <= 1, CTX_LOW
 MAX_ROUNDS = int(os.environ.get("MA_LG_MAX_ROUNDS", "20000"))
 CKPT_S = float(os.environ.get("MA_LG_CKPT_S", "300"))
@@ -400,7 +403,7 @@ async def episode(input, messages: list, label: str, new_session, ckpt: Checkpoi
               "N": N, "TOKENS": TOKENS, "CTX_CHARS": CTX_CHARS, "CTX_LOW": CTX_LOW, "HARNESS": "v1", "END": "budget",
               "VERDICTS": False, "TURN": TURN, "MAX_LEN": MAX_LEN, "ON_STOP": "fresh",
               "prompt": sha1(P.SYSTEM + instance(problem, "agent1")),
-              **({"REPOS": "own", "POST": "submit"} if TEAM else {})}
+              **({"REPOS": "own", "POST": "submit"} if TEAM else {}), **({"WALL_MIN": WALL_MIN} if WALL_MIN else {})}
 
     def state() -> dict:   # whole turns: the trace keeps them whole too
         return {"config": config, "rounds": rounds, "run_s": run_s, "subs": subs, "board": board, "events": events,
@@ -617,6 +620,11 @@ async def episode(input, messages: list, label: str, new_session, ckpt: Checkpoi
                 await loop.run_in_executor(POOL, R.repo_init, work)
             await loop.run_in_executor(POOL, write_logs)
         while any(not a.done for a in agents) and rounds < MAX_ROUNDS:
+            if WALL_MIN and time.monotonic() - t_ep > 60 * WALL_MIN:   # the wall cap ends the episode as its budget would
+                for a in agents:
+                    if not a.done:
+                        a.done, a.exit = True, "WallExceeded"
+                break
             rounds += 1
             active = [a for a in agents if not a.done]
             cmds = await asyncio.gather(*[a.think() for a in active])
@@ -743,7 +751,7 @@ async def episode(input, messages: list, label: str, new_session, ckpt: Checkpoi
             "fo_ag_run_min": run_s / 60, "fo_ag_compile_fail": float(bool(best) and best["status"] == "compile error"),
             "fo_ag_no_code": float(best is None), "fo_ag_top_author": max(shares.values()) if shares else 0.0,
             **{f"fo_ag_exit_{e}": sum(a.exit == e for a in agents) / N for e in
-               ("Finished", "IdleFinish", "TokensExceeded", "ContextExceeded", "RepeatedFormatError")},
+               ("Finished", "IdleFinish", "TokensExceeded", "ContextExceeded", "RepeatedFormatError", "WallExceeded")},
             # a submission still infra after the retries (run_eval reruns such a row)
             "fo_judge_infra_error": float(any(s["infra"] for s in subs)),
             "fo_judge_infra_unresolved": float(any(s["infra"] for s in subs)),

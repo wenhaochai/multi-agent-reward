@@ -33,6 +33,8 @@ export TMPDIR=/scratch/gpfs/GROUP/USER/tmp/job/$JID
 mkdir -p "$OUT" "$TMPDIR/tmp" "$TMPDIR/datasets"
 rm -f "$OUT/exit_code" "$OUT/stop_request" "$OUT/save_now" "$OUT/train_segment.log"   # this segment's stop state (run20 resumes in the same directory)
 FRESH=; [ -e "$OUT/actor/latest_checkpointed_iteration.txt" ] || FRESH=1
+# an interrupted segment's episode traces belong to no rollout of this one
+[ -d "$OUT/traces_live" ] && mv "$OUT/traces_live" "$OUT/traces_live.stale_$(date +%s)"
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 source "$REPO/serving/check/procs.sh"
 source "$REPO/rl/gpu_watch.sh"

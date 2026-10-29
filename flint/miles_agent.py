@@ -72,10 +72,11 @@ async def run(base_url: str, prompt, request_kwargs: dict, metadata: dict, **kwa
     settings = None
     if os.environ.get("MA_RL_OUT"):   # the RL job's settings (rl/rl_inner.sh) must be the game's in this process
         out_dir = os.environ["MA_RL_OUT"]
-        got = {"MA_LG_N": G.N, "MA_LG_TOKENS": G.TOKENS, "MA_LG_CTX_CHARS": G.CTX_CHARS, "MA_AG_TURN": G.TURN}
+        got = {"MA_LG_N": G.N, "MA_LG_TOKENS": G.TOKENS, "MA_LG_CTX_CHARS": G.CTX_CHARS, "MA_AG_TURN": G.TURN,
+               "MA_LG_WALL_MIN": G.WALL_MIN}
         os.makedirs(os.path.join(out_dir, "settings_seen"), exist_ok=True)
         json.dump(got, open(os.path.join(out_dir, "settings_seen", f"{os.getpid()}.json"), "w"))   # startup_probe reads it
-        expected = {k: int(v) for k, v in json.load(open(os.path.join(out_dir, "game_settings.json"))).items()}
+        expected = {k: float(v) for k, v in json.load(open(os.path.join(out_dir, "game_settings.json"))).items()}
         if got != expected:   # miles only logs an agent's exception, so the episode fails its group instead
             settings = f"the game's settings {got} are not the job's {expected}"
     client = Client([base_url], "default", float(request_kwargs.get("temperature", 1.0)),
@@ -221,7 +222,7 @@ def startup_probe(out: str, train_log: str, model: str) -> int:
         json.dump(ids, open(os.path.join(out, "probe_ids.json"), "w"))
         import time
 
-        expected = {k: int(v) for k, v in json.load(open(os.path.join(out, "game_settings.json"))).items()}
+        expected = {k: float(v) for k, v in json.load(open(os.path.join(out, "game_settings.json"))).items()}
         seen_dir = os.path.join(out, "settings_seen")
         for _ in range(60):   # the agents that made the first requests write their game's settings at episode start
             seen = [json.load(open(os.path.join(seen_dir, f))) for f in os.listdir(seen_dir)] if os.path.isdir(seen_dir) else []
