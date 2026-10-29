@@ -38,7 +38,7 @@ export MA_RL_OUT=$OUT MA_AG_TRACE_DIR=$OUT/traces_live
 # game's settings must be in the environment before `ray start` below: Ray's workers, the agents among them, take the
 # environment Ray started with (w624's smoke set them after it, and its agents played 128k). Each episode checks its
 # game's settings against $OUT/game_settings.json (flint.miles_agent.run) and stops the run if they differ.
-[ "$MODE" = smoke ] && export MA_LG_TOKENS=4000 MA_LG_CTX_CHARS=20000
+case "$MODE" in smoke*) export MA_LG_TOKENS=4000 MA_LG_CTX_CHARS=20000;; esac
 python3 -c "import json, os; json.dump({k: os.environ[k] for k in ('MA_LG_N', 'MA_LG_TOKENS', 'MA_LG_CTX_CHARS', 'MA_AG_TURN', 'MA_LG_WALL_MIN')}, open('$OUT/game_settings.json', 'w'))"
 ulimit -n "$(ulimit -Hn)"
 NG=$(awk -F, '{print NF}' <<< "$CUDA_VISIBLE_DEVICES")
@@ -65,7 +65,11 @@ TRAIN=(--train-backend fsdp --hf-checkpoint "$FLINT" --attn-implementation eager
 
 # Flint's serving flags (the eval servers: TP2, fa3, Triton MoE, fp32 LM head); 0.72 of each GPU for the engine (its
 # weights ~37 GB, KV for 2 episodes of up to ~150k tokens), the rest for what the offloaded actor keeps on the GPU
-SERVE=(--rollout-num-gpus "$NG" --rollout-num-gpus-per-engine 2
+# engine width: 4 x TP2 by default; smoke_tp4 / smoke_tp8 serve the same episodes from 2 x TP4 / 1 x TP8 engines, so
+# no engine waits for the group's slowest episode (a serving change: same weights, same sampling)
+ENGINE_TP=2
+case "$MODE" in *_tp4) ENGINE_TP=4;; *_tp8) ENGINE_TP=8;; esac
+SERVE=(--rollout-num-gpus "$NG" --rollout-num-gpus-per-engine "$ENGINE_TP"
   --sglang-attention-backend fa3 --sglang-moe-runner-backend triton --sglang-enable-fp32-lm-head
   --sglang-context-length 262144 --sglang-chunked-prefill-size 4096 --sglang-swa-full-tokens-ratio 0.4
   --sglang-mem-fraction-static 0.72 --sglang-grammar-backend flint)
@@ -132,7 +136,7 @@ train() {
 
 t0=$SECONDS
 case "$MODE" in
-  smoke)   # 2 steps, no actor save: rollout, log_rollout (check, probe), training step, weight sync, rollout 2, probe
+  smoke|smoke_tp4|smoke_tp8)   # 2 steps, no actor save: rollout, log_rollout (check, probe), training step, weight sync, rollout 2, probe
     train "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" --colocate --num-rollout 2 ;;
   test2) train "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RL[@]}" --num-rollout 2 ;;
   run20)
