@@ -201,7 +201,15 @@ refuse[0] = False
 probes.clear()
 log = os.path.join(out_dir, "train.log")
 open(log, "w").write(f"x router_manager.py:64 - Router ready at host='127.0.0.1' port={srv.server_port} external_host=None\n")
-rc = MA.startup_probe(out_dir, log, "/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint")
+FLINT = "/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint"
+want = {"MA_LG_N": 1, "MA_LG_TOKENS": 4000, "MA_LG_CTX_CHARS": 20000, "MA_AG_TURN": 16384}
+json.dump(want, open(os.path.join(out_dir, "game_settings.json"), "w"))
+os.makedirs(os.path.join(out_dir, "settings_seen"))
+json.dump({**want, "MA_LG_TOKENS": 128000}, open(os.path.join(out_dir, "settings_seen", "1.json"), "w"))
+check("startup probe: an agent's game settings that are not the job's stop the run",
+      MA.startup_probe(out_dir, log, FLINT) == 1 and not probes)
+json.dump(want, open(os.path.join(out_dir, "settings_seen", "1.json"), "w"))
+rc = MA.startup_probe(out_dir, log, FLINT)
 ids = json.load(open(os.path.join(out_dir, "probe_ids.json")))
 check("startup probe: works, the templated prompt, written for log_rollout", rc == 0 and len(probes) == 2
       and probes[0]["input_ids"] == ids and len(ids) >= 3, (rc, len(ids)))

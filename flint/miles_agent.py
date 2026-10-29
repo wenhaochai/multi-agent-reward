@@ -69,6 +69,15 @@ async def run(base_url: str, prompt, request_kwargs: dict, metadata: dict, **kwa
     from flint.chat import ChatSession, Client
 
     assert G.N == 1, f"one Flint per episode, got MA_LG_N={G.N}"
+    settings = None
+    if os.environ.get("MA_RL_OUT"):   # the RL job's settings (rl/rl_inner.sh) must be the game's in this process
+        out_dir = os.environ["MA_RL_OUT"]
+        got = {"MA_LG_N": G.N, "MA_LG_TOKENS": G.TOKENS, "MA_LG_CTX_CHARS": G.CTX_CHARS, "MA_AG_TURN": G.TURN}
+        os.makedirs(os.path.join(out_dir, "settings_seen"), exist_ok=True)
+        json.dump(got, open(os.path.join(out_dir, "settings_seen", f"{os.getpid()}.json"), "w"))   # startup_probe reads it
+        expected = {k: int(v) for k, v in json.load(open(os.path.join(out_dir, "game_settings.json"))).items()}
+        if got != expected:   # miles only logs an agent's exception, so the episode fails its group instead
+            settings = f"the game's settings {got} are not the job's {expected}"
     client = Client([base_url], "default", float(request_kwargs.get("temperature", 1.0)),
                     float(request_kwargs.get("top_p", 0.95)), int(request_kwargs.get("top_k", 20)), route=False)
     await client.open()
@@ -76,6 +85,9 @@ async def run(base_url: str, prompt, request_kwargs: dict, metadata: dict, **kwa
                           sample=SimpleNamespace(index=0, group_index=random.getrandbits(32), label=metadata["label"],
                                                  metadata=metadata))
     out = {"flint_session": base_url.rsplit("/", 1)[-1], "flint_trace_pid": os.getpid()}
+    if settings:
+        await client.close()
+        return {**out, "reward": 0.0, "flint_failed": settings}
     try:
         _, S, info = await G.episode(inp, metadata["messages"], metadata["label"],
                                      lambda i, name: ChatSession(client, i, name, G.MAX_LEN))
@@ -138,8 +150,8 @@ def _probe(args, ids: list[int], messages: list) -> dict:
 
 
 def startup_probe(out: str, train_log: str, model: str) -> int:
-    """Before rollout 0 (rl/rl_inner.sh, once the engines serve): the probe on the initial weights, so that a broken
-    probe ends the run in minutes. The probe sequence is the problem prompt as Flint's chat template renders it, fixed
+    """Before rollout 0 (rl/rl_inner.sh, once the engines serve): the agents' game settings (each episode writes them)
+    against the job's, and the probe on the initial weights, so that either problem ends the run in minutes. The probe sequence is the problem prompt as Flint's chat template renders it, fixed
     for the run ($MA_RL_OUT/probe_ids.json, which log_rollout reuses). Returns 0 when the probe works."""
     import re
     from types import SimpleNamespace
@@ -153,6 +165,17 @@ def startup_probe(out: str, train_log: str, model: str) -> int:
         ids = AutoTokenizer.from_pretrained(model).apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
         ids = [int(t) for t in (ids["input_ids"] if hasattr(ids, "keys") else ids)]   # transformers 5: a BatchEncoding
         json.dump(ids, open(os.path.join(out, "probe_ids.json"), "w"))
+        import time
+
+        expected = {k: int(v) for k, v in json.load(open(os.path.join(out, "game_settings.json"))).items()}
+        seen_dir = os.path.join(out, "settings_seen")
+        for _ in range(60):   # the agents that made the first requests write their game's settings at episode start
+            seen = [json.load(open(os.path.join(seen_dir, f))) for f in os.listdir(seen_dir)] if os.path.isdir(seen_dir) else []
+            if seen:
+                break
+            time.sleep(5)
+        if not seen or any(x != expected for x in seen):
+            raise RuntimeError(f"agents' game settings {seen[:2]} are not the job's {expected}")
         probe = [_probe(args, ids, messages), _probe(args, ids, messages)]
         json.dump(probe, open(os.path.join(out, "probe_start.json"), "w"))
         print(f"[flint probe] start: {probe[0]['kind']}, {len(ids)} tokens, repeat max |diff| "
