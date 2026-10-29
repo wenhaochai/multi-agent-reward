@@ -21,7 +21,7 @@
 set -uo pipefail
 MODE=${1:-}
 # run20: wq --partial --time 23:00:00
-case "$MODE" in smoke) LIMIT=4800;; test2) LIMIT=9600;; run20) LIMIT=81000;; *) echo "usage: rl_job.sh smoke|test2|run20"; exit 1;; esac
+case "$MODE" in smoke|smoke_tp4|smoke_tp8) LIMIT=4800;; test2) LIMIT=9600;; run20) LIMIT=81000;; *) echo "usage: rl_job.sh smoke[_tp4|_tp8]|test2|run20"; exit 1;; esac
 JID=${FETCHED_JOB_ID:-$SLURM_JOB_ID}
 [ -n "$JID" ] || { echo "no job id"; exit 1; }
 REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-rollout
