@@ -35,15 +35,29 @@ def original(name):
             else:
                 rows.append(hf_tensor(f"{base}.{e}.down_proj.weight"))
             e += 1
+        if not rows:
+            raise KeyError(name)
         return torch.stack(rows)
     return hf_tensor(name)
 
 
+def hf_name(key):
+    """The checkpoint key's name in the HF index (ModelState saves {"model": state_dict}; FSDP may prefix more)."""
+    name = key
+    while True:
+        probe = name.replace(".experts.gate_up_proj", ".experts.0.gate_proj.weight").replace(
+            ".experts.down_proj", ".experts.0.down_proj.weight")
+        if probe in index or "." not in name:
+            return name
+        name = name.split(".", 1)[1]
+
+
+print("first checkpoint keys:", [k for k in list(meta)[:3]])
 rows, missing = [], []
 for key, m in meta.items():
     if not hasattr(m, "size"):
         continue
-    name = key.removeprefix("model.")   # ModelState saves {"model": state_dict}
+    name = hf_name(key)
     t = torch.empty(m.size, dtype=m.properties.dtype)
     dcp.load({key: t}, storage_reader=reader, no_dist=True)
     try:
