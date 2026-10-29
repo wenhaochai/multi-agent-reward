@@ -213,6 +213,32 @@ rc = MA.startup_probe(out_dir, log, FLINT)
 ids = json.load(open(os.path.join(out_dir, "probe_ids.json")))
 check("startup probe: works, the templated prompt, written for log_rollout", rc == 0 and len(probes) == 2
       and probes[0]["input_ids"] == ids and len(ids) >= 3, (rc, len(ids)))
+# run20's stop rules and checkpoint retention
+rd = tempfile.mkdtemp()
+def steplog(*rows):
+    open(os.path.join(rd, "train.log"), "w").write("".join(
+        f"x log_utils.py:554 - step {i}: {{'train/grad_norm': {g}, 'train/train_rollout_kl': {k}}}\n" for i, g, k in rows))
+def rolls(*S):
+    open(os.path.join(rd, "steps.jsonl"), "w").write("".join(json.dumps({"rollout_id": i, "S": s}) + "\n" for i, s in enumerate(S)))
+steplog((0, 20.0, 0.0003), (1, 50.0, 0.0003)); rolls([0.4, 0], [0.5, 0])
+check("rules: a healthy run goes on", MA._stop_rule(rd, 1) is None)
+steplog((0, 20.0, 0.0003), (1, 50.0, 0.02))
+check("rules: KL over 0.01 stops", "KL" in (MA._stop_rule(rd, 1) or ""))
+steplog((0, 20.0, 0.0003), (1, 250.0, 0.0003), (2, 210.0, 0.0003))
+check("rules: grad norm over 10x step 0's twice stops", "grad norm" in (MA._stop_rule(rd, 2) or ""))
+steplog((0, 20.0, 0.0003), (1, 250.0, 0.0003), (2, 150.0, 0.0003))
+check("rules: once is not enough", MA._stop_rule(rd, 2) is None)
+steplog((0, 20.0, 0.0003)); rolls([0.4, 0], [0, 0], [0, 0], [0, 0])
+check("rules: 3 rollouts all at 0 stop", "S = 0" in (MA._stop_rule(rd, 3) or ""))
+check("rules: 2 are not enough", MA._stop_rule(rd, 2) is None)
+ck = os.path.join(rd, "actor")
+for it in (1, 3, 5, 7):
+    os.makedirs(os.path.join(ck, f"iter_{it:07d}"))
+os.makedirs(os.path.join(ck, "rollout"))
+open(os.path.join(ck, "latest_checkpointed_iteration.txt"), "w").write("7")
+MA._keep_newest_checkpoints(ck, 2)
+check("retention: the newest 2 checkpoints stay, nothing else is touched",
+      sorted(os.listdir(ck)) == ["iter_0000005", "iter_0000007", "latest_checkpointed_iteration.txt", "rollout"], os.listdir(ck))
 import pickle  # noqa: E402
 subprocess.run = lambda cmd, **kw: SimpleNamespace(returncode=1, stdout="INSPECT_FAIL {}\n", stderr="")
 try:

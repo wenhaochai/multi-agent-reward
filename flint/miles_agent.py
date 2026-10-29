@@ -105,6 +105,60 @@ def _samples(node) -> list:
     return [s for x in node for s in _samples(x)] if isinstance(node, list) else [node]
 
 
+def _train_steps(train_log: str) -> dict[int, dict]:
+    """miles' per-step training metrics ("step N: {...}" in train.log; a resumed step's last record wins)."""
+    import ast
+    import re
+
+    steps = {}
+    for line in open(train_log, errors="replace") if os.path.exists(train_log) else []:
+        m = re.search(r"\bstep (\d+): (\{.*\})\s*$", line)
+        if m and "train/grad_norm" in m.group(2):
+            try:
+                steps[int(m.group(1))] = ast.literal_eval(m.group(2))
+            except (ValueError, SyntaxError):
+                pass
+    return steps
+
+
+def _stop_rule(out: str, rollout_id: int) -> str | None:
+    """run20's stop rules (coordinator 2026-10-29), checked after each rollout: the last training step's KL(rollout ||
+    train) over 0.01; the grad norm (before clipping) over 10x step 0's in the last 2 steps; every episode at S = 0 in
+    the last 3 rollouts. Returns the reason, or None."""
+    steps = _train_steps(os.path.join(out, "train.log"))
+    if steps:
+        last = steps[max(steps)]
+        if last.get("train/train_rollout_kl", 0) > 0.01:
+            return f"step {max(steps)}: KL(rollout || train) {last['train/train_rollout_kl']:.4f} > 0.01"
+        g0 = steps.get(0, {}).get("train/grad_norm")
+        recent = [steps[k]["train/grad_norm"] for k in sorted(steps)[-2:]]
+        if g0 and len(steps) >= 3 and len(recent) == 2 and all(g > 10 * g0 for g in recent):
+            return f"grad norm {recent} > 10 x step 0's {g0:.2f} in 2 steps"
+    rollouts = {}
+    for line in open(os.path.join(out, "steps.jsonl")):
+        r = json.loads(line)
+        rollouts[r["rollout_id"]] = r
+    last3 = [rollouts.get(i) for i in range(rollout_id - 2, rollout_id + 1)]
+    if all(r is not None and max(r["S"]) == 0 for r in last3):
+        return f"every episode at S = 0 in rollouts {rollout_id - 2}-{rollout_id}"
+    return None
+
+
+def _keep_newest_checkpoints(root: str, keep: int) -> None:
+    """Delete miles' checkpoints (root/iter_NNNNNNN) but the newest ``keep`` and the one the tracker names."""
+    import re
+    import shutil
+
+    if not os.path.isdir(root):
+        return
+    tracker = os.path.join(root, "latest_checkpointed_iteration.txt")
+    named = int(open(tracker).read().strip()) if os.path.exists(tracker) else None
+    iters = sorted(int(m.group(1)) for x in os.listdir(root) if (m := re.fullmatch(r"iter_(\d{7})", x)))
+    for it in iters[:-keep]:
+        if it != named and os.path.isdir(os.path.join(root, f"iter_{it:07d}")):
+            shutil.rmtree(os.path.join(root, f"iter_{it:07d}"))
+
+
 def drop_failed_groups(args, data) -> None:
     """miles' sample filter: every sample of a group with a failed episode leaves the loss. A group holds one entry per
     episode, a list of the episode's samples (one per session-tree leaf)."""
@@ -221,6 +275,8 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
     os.makedirs(d, exist_ok=True)
     live = os.environ.get("MA_AG_TRACE_DIR")
     if live and os.path.isdir(live):
+        if os.path.isdir(os.path.join(d, "traces")):   # this rollout ran before, in a segment that stopped
+            os.rename(os.path.join(d, "traces"), os.path.join(d, f"traces.before_{int(os.path.getmtime(os.path.join(d, 'traces')))}"))
         os.rename(live, os.path.join(d, "traces"))
 
     ids_path = os.path.join(out, "probe_ids.json")
@@ -283,6 +339,11 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
     with open(os.path.join(out, "steps.jsonl"), "a") as f:
         f.write(json.dumps(rec) + "\n")
     print(f"[flint rollout {rollout_id}] {json.dumps(rec)}", flush=True)
+    _keep_newest_checkpoints(os.path.join(out, "actor"), 2)
+    stop = _stop_rule(out, rollout_id)
+    if stop and not os.path.exists(os.path.join(out, "stop_request")):
+        open(os.path.join(out, "stop_request"), "w").write(f"3 rule: {stop}\n")   # rl/rl_job.sh: checkpoint, then stop
+        print(f"[flint rollout {rollout_id}] STOP RULE: {stop}", flush=True)
     if r.returncode != 0:
         raise RuntimeError(f"rollout {rollout_id}: the sample check failed ({rec['inspect']}); see {d}/inspect.txt")
     cap = int(os.environ.get("MA_RL_MAX_SAMPLE_TOKENS", "0"))

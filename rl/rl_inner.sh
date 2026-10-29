@@ -82,6 +82,9 @@ GAME=(--prompt-data "$OUT/data_p0.jsonl" --input-key prompt --label-key label --
 # the weights go to the engines after every step. The actor (model only, no optimizer) is saved once, after the last
 # step: 1000 rows of one problem keep miles' epoch boundary, also a save point, out of the run.
 RL=(--colocate --save "$OUT/actor" --save-interval 100000 --no-save-optim --save-trigger-sentinel "$OUT/save_now")
+# run20 resumes: actor, optimizer, scheduler, RNG and the data position every 2 steps (and at the end), loaded from the
+# same directory on every start (miles skips the load when there is none yet); log_rollout keeps the newest 2
+RUN20=(--colocate --save "$OUT/actor" --load "$OUT/actor" --save-interval 2 --save-trigger-sentinel "$OUT/save_now")
 
 MEMPROBE=(--prompt-data "$OUT/data_p0.jsonl" --input-key prompt --label-key label --metadata-key metadata --num-rollout 2
   --load-debug-rollout-data "$MEMPROBE_DATA/rollout_{rollout_id}.pt" --rollout-temperature 1.0 --rollout-top-p 0.95
@@ -89,7 +92,8 @@ MEMPROBE=(--prompt-data "$OUT/data_p0.jsonl" --input-key prompt --label-key labe
 if [ "$MODE" = args ]; then   # off-GPU: miles parses and checks each mode's arguments (rl/args_check.py)
   python3 "$REPO/rl/args_check.py" "${TRAIN[@]}" "${MEMPROBE[@]}" || exit 1
   python3 "$REPO/rl/schedule_check.py" "$MEMPROBE_DATA/rollout_0.pt" "${TRAIN[@]}" "${MEMPROBE[@]}" || exit 1
-  python3 "$REPO/rl/args_check.py" "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RL[@]}" --num-rollout 2
+  python3 "$REPO/rl/args_check.py" "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RL[@]}" --num-rollout 2 || exit 1
+  python3 "$REPO/rl/args_check.py" "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RUN20[@]}" --num-rollout 20
   exit
 fi
 
@@ -105,14 +109,21 @@ trap 'ray stop --force >/dev/null 2>&1' EXIT   # this PID namespace's Ray only
 # train.py in the background; once the engines serve (the first rollout request), the served-weights probe runs once
 # on the initial weights (flint.miles_agent.startup_probe): if it fails, train.py is stopped, minutes into the run
 train() {
-  python3 "$MILES/train.py" "$@" > "$OUT/train.log" 2>&1 &
+  if [ -n "${APPEND:-}" ]; then echo "=== segment $(date -u +%FT%TZ)" >> "$OUT/train.log"; else : > "$OUT/train.log"; fi
+  local from=$(( $(wc -l < "$OUT/train.log") + 1 ))   # this segment's lines (run20 appends one segment after another)
+  tail -n +"$from" -F "$OUT/train.log" > "$OUT/train_segment.log" 2>/dev/null &
+  local tl=$!
+  python3 "$MILES/train.py" "$@" >> "$OUT/train.log" 2>&1 &
   local tp=$!
   (
-    until grep -q 'POST /v1/chat/completions' "$OUT/train.log" 2>/dev/null; do kill -0 $tp 2>/dev/null || exit; sleep 15; done
-    python3 -c "import sys; from flint.miles_agent import startup_probe as p; sys.exit(p('$OUT', '$OUT/train.log', '$FLINT'))" \
+    until grep -q 'POST /v1/chat/completions' "$OUT/train_segment.log" 2>/dev/null; do kill -0 $tp 2>/dev/null || exit; sleep 15; done
+    python3 -c "import sys; from flint.miles_agent import startup_probe as p; sys.exit(p('$OUT', '$OUT/train_segment.log', '$FLINT'))" \
       > "$OUT/probe_start.log" 2>&1 || { echo "[s5] startup probe failed: $(tail -1 "$OUT/probe_start.log")"; kill $tp; }
   ) &
   wait $tp
+  local rc=$?
+  kill $tl 2>/dev/null
+  return $rc
 }
 
 t0=$SECONDS
@@ -120,7 +131,9 @@ case "$MODE" in
   smoke)   # 2 steps, no actor save: rollout, log_rollout (check, probe), training step, weight sync, rollout 2, probe
     train "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" --colocate --num-rollout 2 ;;
   test2) train "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RL[@]}" --num-rollout 2 ;;
-  run20) train "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RL[@]}" --num-rollout 20 ;;
+  run20)
+    echo "[s5] run20 starts from checkpoint: $(cat "$OUT/actor/latest_checkpointed_iteration.txt" 2>/dev/null || echo none)"
+    APPEND=1 train "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RUN20[@]}" --num-rollout 20 ;;
 esac
 rc=$?
 echo "[s5] $(date -u +%FT%TZ) train.py exit $rc after $((SECONDS - t0)) s; $(tail -1 "$OUT/probe_start.log" 2>/dev/null)"
