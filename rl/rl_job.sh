@@ -63,7 +63,18 @@ PY
 # 8k episodes 18-28 min and one over 31), so a loaded GPU may idle 45 min (the host is cancelled at 90)
 GPU_IDLE_MIN=45 gpu_watch $$ "$OUT/gpu.log" "grep -q 'POST /v1/chat/completions' '$OUT/train.log' 2>/dev/null" 35 &
 WD=$!
-( while sleep 10; do echo "$(date +%s) $(free -m | awk '/Mem:/{print $3}')"; done ) > "$OUT/host_mem.txt" &
+# host memory every 10 s: the node's used MiB and this job's cgroup MiB (what --mem bounds). Above 860 GB of cgroup
+# memory the run asks miles for a checkpoint at the next save point (--save-trigger-sentinel $OUT/save_now) and stops
+# once it is written; above 875 GB it stops at once (a kernel OOM kill would leave the engines and Ray in pieces)
+CG=/sys/fs/cgroup$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup | sed -E 's#(/job_[0-9]+)/.*#\1#')/memory.current   # the job's
+( asked=
+  while sleep 10; do
+    cg=$(( $(cat "$CG" 2>/dev/null || echo 0) / 1048576 ))
+    echo "$(date +%s) $(free -m | awk '/Mem:/{print $3}') $cg"
+    if [ "$cg" -gt $((875 * 1024)) ]; then echo "HOST_MEM_ABORT: $cg MiB" >&2; kill -TERM $$; break; fi
+    if [ -z "$asked" ] && [ "$cg" -gt $((860 * 1024)) ]; then touch "$OUT/save_now"; asked=1; echo "HOST_MEM_SAVE: $cg MiB" >&2; fi
+    if [ -n "$asked" ] && [ ! -e "$OUT/save_now" ]; then echo "HOST_MEM_STOP after the checkpoint" >&2; kill -TERM $$; break; fi
+  done ) > "$OUT/host_mem.txt" &
 MEM=$!
 nvidia-smi -i "$CUDA_VISIBLE_DEVICES" --query-gpu=timestamp,index,memory.used --format=csv,noheader,nounits -l 2 > "$OUT/gpu_mem.csv" 2>/dev/null &
 SMI=$!
@@ -82,7 +93,7 @@ for line in open(f"{out}/gpu_mem.csv"):
     p = [x.strip() for x in line.split(",")]
     if len(p) == 3 and p[2].isdigit():
         peak[int(p[1])] = max(peak[int(p[1])], int(p[2]))
-host = max((int(l.split()[1]) for l in open(f"{out}/host_mem.txt") if len(l.split()) == 2), default=0)
-print("[s5] peak GPU memory (2 s samples, MiB):", dict(sorted(peak.items())), "| peak host used (10 s samples, MiB):", host)
+host = max((int(l.split()[-1]) for l in open(f"{out}/host_mem.txt") if len(l.split()) >= 2), default=0)
+print("[s5] peak GPU memory (2 s samples, MiB):", dict(sorted(peak.items())), "| peak job memory (cgroup, 10 s samples, MiB):", host)
 PY
 exit $rc

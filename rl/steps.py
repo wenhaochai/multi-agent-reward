@@ -34,7 +34,7 @@ COLS = [("S mean", "flint/reward_mean", "{:.4f}"), ("S var", "flint/reward_var",
         ("R3 pick", "train/r3_pick_mismatch", "{:.4f}"), ("R3 tok", "train/r3_token_mismatch", "{:.4f}"),
         ("rollout s", "flint/rollout_s", "{:.0f}"), ("train s", "perf/actor_train_time", "{:.0f}"),
         ("logp s", "perf/log_probs_time", "{:.0f}"), ("sync s", "perf/update_weights_time", "{:.0f}"),
-        ("step s", "perf/step_time", "{:.0f}")]
+        ("step s", "perf/step_time", "{:.0f}"), ("mem GB", "flint/job_mem_gb", "{:.0f}"), ("peak GB", "flint/job_mem_peak_gb", "{:.0f}")]
 print("step " + " ".join(f"{c[0]:>10}" for c in COLS))
 for i in sorted(steps):
     row = []
