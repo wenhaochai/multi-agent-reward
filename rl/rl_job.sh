@@ -20,6 +20,7 @@
 # watch (rl/gpu_watch.sh) and cleanup of only the process groups this job started (serving/check/procs.sh).
 set -uo pipefail
 MODE=${1:-}
+# run20: wq --partial --time 23:00:00
 case "$MODE" in smoke) LIMIT=4800;; test2) LIMIT=9600;; run20) LIMIT=81000;; *) echo "usage: rl_job.sh smoke|test2|run20"; exit 1;; esac
 JID=${FETCHED_JOB_ID:-$SLURM_JOB_ID}
 [ -n "$JID" ] || { echo "no job id"; exit 1; }
@@ -30,12 +31,14 @@ FLINT=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint
 OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/$JID
 export TMPDIR=/scratch/gpfs/GROUP/USER/tmp/job/$JID
 mkdir -p "$OUT" "$TMPDIR/tmp" "$TMPDIR/datasets"
+rm -f "$OUT/exit_code" "$OUT/stop_request" "$OUT/save_now" "$OUT/train_segment.log"   # this segment's stop state (run20 resumes in the same directory)
+FRESH=; [ -e "$OUT/actor/latest_checkpointed_iteration.txt" ] || FRESH=1
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 source "$REPO/serving/check/procs.sh"
 source "$REPO/rl/gpu_watch.sh"
 WD= MEM= SMI=
 trap 'stop "${STARTED[@]}"; kill $WD $MEM $SMI 2>/dev/null; rm -rf -- "/scratch/gpfs/GROUP/USER/tmp/job/$JID"' EXIT
-trap 'exit 143' TERM INT
+trap 'exit "$(cat "$OUT/exit_code" 2>/dev/null || echo 143)"' TERM INT   # a planned stop leaves its exit code there
 echo "[s5] $(date -u +%FT%TZ) $MODE node=$(hostname) job=$JID gpus=${CUDA_VISIBLE_DEVICES:-}"
 echo "mas-rl $(git -C "$REPO" rev-parse --short HEAD) dirty=$(git -C "$REPO" status --porcelain -uno | wc -l)" \
   "miles $(git -C "$MILES" rev-parse --short HEAD) dirty=$(git -C "$MILES" status --porcelain -uno | wc -l)" | tee "$OUT/code"
@@ -61,24 +64,33 @@ PY
 # request: the start (actor weights 8 min in w583, then the engines; GPUs idle 11 min) may take up to 35 min. An
 # engine whose episodes are done idles until the group's slowest episode ends (128k episodes take 17-34 min; w611's
 # 8k episodes 18-28 min and one over 31), so a loaded GPU may idle 45 min (the host is cancelled at 90)
-GPU_IDLE_MIN=45 gpu_watch $$ "$OUT/gpu.log" "grep -q 'POST /v1/chat/completions' '$OUT/train.log' 2>/dev/null" 35 &
+GPU_IDLE_MIN=45 gpu_watch $$ "$OUT/gpu.log" "grep -q 'POST /v1/chat/completions' '$OUT/train_segment.log' 2>/dev/null" 35 &
 WD=$!
-# host memory every 10 s: the node's used MiB and this job's cgroup MiB (what --mem bounds). Above 860 GB of cgroup
-# memory the run asks miles for a checkpoint at the next save point (--save-trigger-sentinel $OUT/save_now) and stops
-# once it is written; above 875 GB it stops at once (a kernel OOM kill would leave the engines and Ray in pieces)
+# host memory every 10 s (the node's used MiB, this job's cgroup MiB: what --mem bounds) and the planned stops. A
+# stop request ($OUT/stop_request: "<exit code> <reason>", from here or from flint.miles_agent.log_rollout's rules)
+# asks miles for a checkpoint at its next save point (--save-trigger-sentinel $OUT/save_now); once miles has written it
+# (the sentinel is gone) the job stops with that exit code. Requests: cgroup memory over 860 GB (3: a failure); less
+# than 75 min left of LIMIT (99: wq requeues it, the next segment resumes from the checkpoint); run20's first segment
+# stops after its first checkpoint (99), so the second one proves the resume. Over 875 GB the job stops at once (3).
 CG=/sys/fs/cgroup$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup | sed -E 's#(/job_[0-9]+)/.*#\1#')/memory.current   # the job's
-( asked=
+TRACKER=$OUT/actor/latest_checkpointed_iteration.txt
+( t0=$SECONDS asked=
+  request() { [ -e "$OUT/stop_request" ] || echo "$1" > "$OUT/stop_request"; }
+  finish() { echo "$1" | cut -d' ' -f1 > "$OUT/exit_code"; echo "PLANNED_STOP: $1" >&2; kill -TERM $$; }
   while sleep 10; do
     cg=$(( $(cat "$CG" 2>/dev/null || echo 0) / 1048576 ))
     echo "$(date +%s) $(free -m | awk '/Mem:/{print $3}') $cg"
-    if [ "$cg" -gt $((875 * 1024)) ]; then echo "HOST_MEM_ABORT: $cg MiB" >&2; kill -TERM $$; break; fi
-    if [ -z "$asked" ] && [ "$cg" -gt $((860 * 1024)) ]; then touch "$OUT/save_now"; asked=1; echo "HOST_MEM_SAVE: $cg MiB" >&2; fi
-    if [ -n "$asked" ] && [ ! -e "$OUT/save_now" ]; then echo "HOST_MEM_STOP after the checkpoint" >&2; kill -TERM $$; break; fi
-  done ) > "$OUT/host_mem.txt" &
+    if [ "$cg" -gt $((875 * 1024)) ]; then finish "3 host memory $cg MiB over 875 GB"; break; fi
+    [ "$cg" -gt $((860 * 1024)) ] && request "3 host memory $cg MiB over 860 GB"
+    [ "$MODE" = run20 ] && [ $((SECONDS - t0)) -gt $((LIMIT - 4500)) ] && request "99 time: less than 75 min left"
+    if [ "$MODE" = run20 ] && [ -n "$FRESH" ] && [ -e "$TRACKER" ]; then finish "99 first segment: checkpoint $(cat "$TRACKER") written, resume next"; break; fi
+    if [ -e "$OUT/stop_request" ] && [ -z "$asked" ]; then touch "$OUT/save_now"; asked=1; fi
+    if [ -n "$asked" ] && [ ! -e "$OUT/save_now" ]; then finish "$(cat "$OUT/stop_request")"; break; fi
+  done ) >> "$OUT/host_mem.txt" 2>> "$OUT/stops.log" &
 MEM=$!
 nvidia-smi -i "$CUDA_VISIBLE_DEVICES" --query-gpu=timestamp,index,memory.used --format=csv,noheader,nounits -l 2 > "$OUT/gpu_mem.csv" 2>/dev/null &
 SMI=$!
-start timeout -s KILL "$LIMIT" apptainer exec --pid --nv --contain --cleanenv --writable-tmpfs \
+start timeout -k 300 "$LIMIT" apptainer exec --pid --nv --contain --cleanenv --writable-tmpfs \
   --bind /scratch/gpfs/GROUP --bind "$TMPDIR/tmp":/tmp --bind "$TMPDIR/datasets":/root/datasets --bind /proc:/host/proc \
   --bind /dev/shm --env PYTHONNOUSERSITE=1 --env PYTHONDONTWRITEBYTECODE=1 --env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" \
   --env JID="$JID" --env OUT="$OUT" --env PKG="$PKG" --env TMPDIR="$TMPDIR" "$SIF" bash "$REPO/rl/rl_inner.sh" "$MODE"
