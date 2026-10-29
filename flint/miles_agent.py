@@ -125,7 +125,8 @@ def _train_steps(train_log: str) -> dict[int, dict]:
 def _stop_rule(out: str, rollout_id: int) -> str | None:
     """run20's stop rules (coordinator 2026-10-29), checked after each rollout: the last training step's KL(rollout ||
     train) over 0.01; the grad norm (before clipping) over 10x step 0's in the last 2 steps; every episode at S = 0 in
-    the last 3 rollouts. Returns the reason, or None."""
+    the last 3 rollouts; more than 1 episode ended by the wall cap (MA_LG_WALL_MIN) in each of the last 2 rollouts.
+    Returns the reason, or None."""
     steps = _train_steps(os.path.join(out, "train.log"))
     if steps:
         last = steps[max(steps)]
@@ -139,6 +140,9 @@ def _stop_rule(out: str, rollout_id: int) -> str | None:
     for line in open(os.path.join(out, "steps.jsonl")):
         r = json.loads(line)
         rollouts[r["rollout_id"]] = r
+    last2 = [rollouts.get(i) for i in (rollout_id - 1, rollout_id)]
+    if all(r is not None and r.get("wall_exceeded", 0) > 1 for r in last2):   # the cap binds often: it would teach
+        return f"more than 1 episode ended at the wall cap in rollouts {rollout_id - 1}-{rollout_id}"   # not to submit
     last3 = [rollouts.get(i) for i in range(rollout_id - 2, rollout_id + 1)]
     if all(r is not None and max(r["S"]) == 0 for r in last3):
         return f"every episode at S = 0 in rollouts {rollout_id - 2}-{rollout_id}"
@@ -323,9 +327,12 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
                         "turn_cap_hits": sum(1 for x in turns if x.get("cut") and (x.get("completion_tokens") or 0) >= cap),
                         "turns": len(turns), "trims": sum(1 for x, y in zip(dropped, dropped[1:]) if y > x),
                         "submissions": len(t.get("submissions", [])), "restarts": t["agents"][0].get("restarts"),
+                        "exit": t["agents"][0].get("exit"),
                         "max_prompt_tokens": max((x.get("prompt_tokens") or 0 for x in turns), default=0)})
     rec |= {"trace_episodes": eps, "cut_turns": sum(e["cut_turns"] for e in eps),
-            "turn_cap_hits": sum(e["turn_cap_hits"] for e in eps), "turns": sum(e["turns"] for e in eps)}
+            "turn_cap_hits": sum(e["turn_cap_hits"] for e in eps), "turns": sum(e["turns"] for e in eps),
+            "wall_exceeded": sum(e["exit"] == "WallExceeded" for e in eps),
+            "wall_exceeded_S": [e["S"] for e in eps if e["exit"] == "WallExceeded"]}
 
     # the job's memory now and its peak so far (rl/rl_job.sh samples its cgroup every 10 s into host_mem.txt)
     mem = [int(x.split()[-1]) for x in open(os.path.join(out, "host_mem.txt")) if len(x.split()) == 3] \

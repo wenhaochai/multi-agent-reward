@@ -182,7 +182,8 @@ check("log: the probe is rollout 0's first 4096 tokens, twice per rollout",
 check("log: one line per rollout, episodes' S and submissions",
       [(x["episodes"], x["samples"], x["S"], x["submissions"]) for x in lines] == [(2, 3, [0.1, 0.5], [2, 1])] * 2, lines)
 check("log: per-episode trace numbers", lines[0]["trace_episodes"] == [{"S": 0.5, "cut_turns": 1, "turn_cap_hits": 1, "turns": 3, "trims": 1,
-      "submissions": 2, "restarts": 1, "max_prompt_tokens": 30}] and lines[0]["cut_turns"] == 1, lines[0])
+      "submissions": 2, "restarts": 1, "exit": None, "max_prompt_tokens": 30}] and lines[0]["cut_turns"] == 1
+      and lines[0]["wall_exceeded"] == 0, lines[0])
 check("log: the probe change after the update", "probe_change_mean_abs" not in lines[0]
       and abs(lines[1]["probe_change_mean_abs"] - 0.01) < 1e-9 and lines[1]["probe_repeat_max_abs"] == 0.0, lines[1])
 check("log: the sample check runs on the rollout's dump", runs[0][-2:] == [os.path.join(out_dir, "r0"), "rollout.pt"], runs[0])
@@ -231,6 +232,10 @@ check("rules: once is not enough", MA._stop_rule(rd, 2) is None)
 steplog((0, 20.0, 0.0003)); rolls([0.4, 0], [0, 0], [0, 0], [0, 0])
 check("rules: 3 rollouts all at 0 stop", "S = 0" in (MA._stop_rule(rd, 3) or ""))
 check("rules: 2 are not enough", MA._stop_rule(rd, 2) is None)
+open(os.path.join(rd, "steps.jsonl"), "w").write("".join(json.dumps({"rollout_id": i, "S": [0.4], "wall_exceeded": w}) + "\n"
+                                                         for i, w in enumerate([2, 1, 2, 3])))
+check("rules: the wall cap binding for more than 1 episode in 2 rollouts stops", "wall cap" in (MA._stop_rule(rd, 3) or "")
+      and MA._stop_rule(rd, 2) is None and MA._stop_rule(rd, 1) is None)
 ck = os.path.join(rd, "actor")
 for it in (1, 3, 5, 7):
     os.makedirs(os.path.join(ck, f"iter_{it:07d}"))
