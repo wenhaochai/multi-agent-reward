@@ -270,6 +270,11 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
     rec |= {"trace_episodes": eps, "cut_turns": sum(e["cut_turns"] for e in eps),
             "turn_cap_hits": sum(e["turn_cap_hits"] for e in eps), "turns": sum(e["turns"] for e in eps)}
 
+    # the job's memory now and its peak so far (rl/rl_job.sh samples its cgroup every 10 s into host_mem.txt)
+    mem = [int(x.split()[-1]) for x in open(os.path.join(out, "host_mem.txt")) if len(x.split()) == 3] \
+        if os.path.exists(os.path.join(out, "host_mem.txt")) else []
+    rec |= {"job_mem_gb": round(mem[-1] / 1024, 1) if mem else None, "job_mem_peak_gb": round(max(mem) / 1024, 1) if mem else None}
+
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     r = subprocess.run([sys.executable, os.path.join(repo, "rl", "inspect_rollout.py"), d, "rollout.pt"],
                        capture_output=True, text=True)

@@ -81,7 +81,7 @@ GAME=(--prompt-data "$OUT/data_p0.jsonl" --input-key prompt --label-key label --
 # colocated: the engines release weights and KV while the actor trains, the actor goes to the CPU while they generate;
 # the weights go to the engines after every step. The actor (model only, no optimizer) is saved once, after the last
 # step: 1000 rows of one problem keep miles' epoch boundary, also a save point, out of the run.
-RL=(--colocate --save "$OUT/actor" --save-interval 100000 --no-save-optim)
+RL=(--colocate --save "$OUT/actor" --save-interval 100000 --no-save-optim --save-trigger-sentinel "$OUT/save_now")
 
 MEMPROBE=(--prompt-data "$OUT/data_p0.jsonl" --input-key prompt --label-key label --metadata-key metadata --num-rollout 2
   --load-debug-rollout-data "$MEMPROBE_DATA/rollout_{rollout_id}.pt" --rollout-temperature 1.0 --rollout-top-p 0.95
