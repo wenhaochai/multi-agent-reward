@@ -136,6 +136,8 @@ train() {
 
 t0=$SECONDS
 case "$MODE" in
+  base_tp8)   # control: the original weights at 1 x TP8 in the RL game, 2 rollouts of 8 episodes, no training
+    train "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" --debug-rollout-only --num-rollout 2 ;;
   smoke|smoke_tp4|smoke_tp8)   # 2 steps, no actor save: rollout, log_rollout (check, probe), training step, weight sync, rollout 2, probe
     train "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" --colocate --num-rollout 2 ;;
   test2) train "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RL[@]}" --num-rollout 2 ;;
