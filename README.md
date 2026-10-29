@@ -78,6 +78,11 @@ runs with RL's context cap (110k characters, 16k-token turns; the eval's are 400
 stays near the 64k tokens the actor step was measured at:
 
     wq submit --prio 10 --project flint-eval rl/rl_job.sh test2      # 2 RL steps
+    wq submit --partial --prio 10 --time 23:00:00 --project flint-eval rl/rl_job.sh run20   # 20 steps, runs/run20_p0
+
+Updates are judged by KL(rollout || train) and S. The served-weights probe (log-probs of 1,105 prompt tokens) only
+shows that new weights reached the engines: the same weights served at TP8 instead of TP2 move it by 0.517 nats on
+average (w662 vs w632), as much as one training step does, so it measures MoE routing sensitivity, not update size.
     rl/steps.py <run dir>                                             # the per-step table
 
 ## Tests
