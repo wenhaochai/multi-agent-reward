@@ -98,9 +98,10 @@ trap 'ray stop --force >/dev/null 2>&1' EXIT   # this PID namespace's Ray only
 
 t0=$SECONDS
 case "$MODE" in
-  smoke)   # the same path, short: 2 steps of 8 episodes x 8k tokens, the context cut to 20k characters (trims happen),
-    # no actor save: rollout, log_rollout (check, probe), training step, weight sync, rollout 2, probe change
-    export MA_LG_TOKENS=8000 MA_LG_CTX_CHARS=20000
+  smoke)   # the same path, short: 2 steps of 8 episodes x 4k tokens, the context cut to 20k characters (trims happen),
+    # no actor save: rollout, log_rollout (check, probe), training step, weight sync, rollout 2, probe change. An episode
+    # is ~100 turns of ~70 tokens at ~7 s per model call plus its commands (w611: 8k-token episodes took 18-31+ min)
+    export MA_LG_TOKENS=4000 MA_LG_CTX_CHARS=20000
     python3 "$MILES/train.py" "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" --colocate --num-rollout 2 > "$OUT/train.log" 2>&1 ;;
   test2) python3 "$MILES/train.py" "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RL[@]}" --num-rollout 2 > "$OUT/train.log" 2>&1 ;;
   run20) python3 "$MILES/train.py" "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RL[@]}" --num-rollout 20 > "$OUT/train.log" 2>&1 ;;
