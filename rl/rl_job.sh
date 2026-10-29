@@ -11,7 +11,7 @@
 # score centering over the sampler's top-32 candidates, routing replay (R3), one optimizer step per rollout (problem 0,
 # 8 episodes of 128k tokens), the rollout engines (4 x TP2) and the FSDP actor (CPU-offloaded parameters and Adam)
 # colocated. Usage: rl_job.sh smoke|test2|run20 (wq --prio 10; smoke and run20 with their own --time). smoke: the
-# same path in ~30 min (2 steps of 8 episodes x 8k tokens, no actor save); run it before test2. The game runs with RL's context cap
+# same path in ~50 min (2 steps of 8 episodes x 4k tokens, no actor save); run it before test2. The game runs with RL's context cap
 # (rl/rl_inner.sh: 110k characters, 16k-token turns) so that a training sample stays near 64k tokens.
 #   test2     2 colocated RL steps, the actor saved at the end
 #   run20     20 colocated RL steps, the actor saved at the end
@@ -20,7 +20,7 @@
 # watch (rl/gpu_watch.sh) and cleanup of only the process groups this job started (serving/check/procs.sh).
 set -uo pipefail
 MODE=${1:-}
-case "$MODE" in smoke) LIMIT=2700;; test2) LIMIT=9600;; run20) LIMIT=81000;; *) echo "usage: rl_job.sh smoke|test2|run20"; exit 1;; esac
+case "$MODE" in smoke) LIMIT=4800;; test2) LIMIT=9600;; run20) LIMIT=81000;; *) echo "usage: rl_job.sh smoke|test2|run20"; exit 1;; esac
 JID=${FETCHED_JOB_ID:-$SLURM_JOB_ID}
 [ -n "$JID" ] || { echo "no job id"; exit 1; }
 REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-rollout
@@ -58,8 +58,10 @@ rows[0]["metadata"]["label"] = rows[0]["label"]
 open(sys.argv[2], "w").write((json.dumps(rows[0]) + "\n") * 1000)
 PY
 # one line per GPU and minute; stops the job when a GPU idles (rl/gpu_watch.sh), counting from the first rollout
-# request: the start (actor weights 8 min in w583, then the engines; GPUs idle 11 min) may take up to 35 min
-gpu_watch $$ "$OUT/gpu.log" "grep -q 'POST /v1/chat/completions' '$OUT/train.log' 2>/dev/null" 35 &
+# request: the start (actor weights 8 min in w583, then the engines; GPUs idle 11 min) may take up to 35 min. An
+# engine whose episodes are done idles until the group's slowest episode ends (128k episodes take 17-34 min; w611's
+# 8k episodes 18-28 min and one over 31), so a loaded GPU may idle 45 min (the host is cancelled at 90)
+GPU_IDLE_MIN=45 gpu_watch $$ "$OUT/gpu.log" "grep -q 'POST /v1/chat/completions' '$OUT/train.log' 2>/dev/null" 35 &
 WD=$!
 ( while sleep 10; do echo "$(date +%s) $(free -m | awk '/Mem:/{print $3}')"; done ) > "$OUT/host_mem.txt" &
 MEM=$!
