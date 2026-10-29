@@ -30,6 +30,12 @@ export MA_LG_N=1 MA_LG_TOKENS=128000 MA_AG_TOOL_STRICT=0 FCS_PROC=/host/proc
 export MA_LG_CTX_CHARS=110000 MA_AG_TURN=16384 MA_RL_MAX_SAMPLE_TOKENS=70000
 # flint.miles_agent.log_rollout: the run directory, and where the agents write traces (moved per rollout)
 export MA_RL_OUT=$OUT MA_AG_TRACE_DIR=$OUT/traces_live
+# smoke: the same path, short: 8 episodes x 4k tokens per step, the context cut to 20k characters (trims happen). The
+# game's settings must be in the environment before `ray start` below: Ray's workers, the agents among them, take the
+# environment Ray started with (w624's smoke set them after it, and its agents played 128k). Each episode checks its
+# game's settings against $OUT/game_settings.json (flint.miles_agent.run) and stops the run if they differ.
+[ "$MODE" = smoke ] && export MA_LG_TOKENS=4000 MA_LG_CTX_CHARS=20000
+python3 -c "import json, os; json.dump({k: os.environ[k] for k in ('MA_LG_N', 'MA_LG_TOKENS', 'MA_LG_CTX_CHARS', 'MA_AG_TURN')}, open('$OUT/game_settings.json', 'w'))"
 ulimit -n "$(ulimit -Hn)"
 NG=$(awk -F, '{print NF}' <<< "$CUDA_VISIBLE_DEVICES")
 JNUM=${JID//[!0-9]/}
@@ -111,10 +117,7 @@ train() {
 
 t0=$SECONDS
 case "$MODE" in
-  smoke)   # the same path, short: 2 steps of 8 episodes x 4k tokens, the context cut to 20k characters (trims happen),
-    # no actor save: rollout, log_rollout (check, probe), training step, weight sync, rollout 2, probe change. An episode
-    # is ~100 turns of ~70 tokens at ~7 s per model call plus its commands (w611: 8k-token episodes took 18-31+ min)
-    export MA_LG_TOKENS=4000 MA_LG_CTX_CHARS=20000
+  smoke)   # 2 steps, no actor save: rollout, log_rollout (check, probe), training step, weight sync, rollout 2, probe
     train "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" --colocate --num-rollout 2 ;;
   test2) train "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RL[@]}" --num-rollout 2 ;;
   run20) train "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RL[@]}" --num-rollout 20 ;;
