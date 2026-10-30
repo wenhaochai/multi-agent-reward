@@ -1,0 +1,10 @@
+#!/bin/bash
+# fake nvidia-smi: 8 GPUs at 0 %, 0 MiB; "-l N" repeats every N s
+n=1; case " $* " in *" -l "*) n=0;; esac
+while :; do
+  for i in 0 1 2 3 4 5 6 7; do
+    case "$*" in *timestamp*) echo "2026/10/30 00:00:00.000, $i, 0, 0";; *) echo "$i, 0, 0";; esac
+  done
+  [ $n = 1 ] && exit 0
+  sleep 2
+done

@@ -12,13 +12,28 @@ want = {"train_backend": "fsdp", "fsdp_cpu_offload": True, "advantage_estimator"
         "rollout_top_logprobs_num": 32, "rollout_top_k": 20, "lr": 2e-7, "kl_coef": 0, "entropy_coef": 0,
         "global_batch_size": 8, "n_samples_per_prompt": 8, "rollout_batch_size": 1, "use_routing_replay": True,
         "use_rollout_routing_replay": True, "log_routing_replay_mismatch": True, "gradient_checkpointing": True}
-if a.load_debug_rollout_data is None:   # the colocated RL run
+if getattr(a, "rollout_external", False):   # engines in other jobs (rl/rl_inner_ext.sh): resumable, weights by NCCL
+    want |= {"colocate": False, "offload_train": False, "offload_rollout": False,
+             "rollout_num_gpus_per_engine": 8, "rollout_num_gpus": 8, "update_weight_transfer_mode": "broadcast",
+             "update_weights_timeout": 900, "use_session_server": "v2", "tito_model": "flint",
+             "pause_generation_mode": "in_place", "sglang_mem_fraction_static": 0.85, "max_tokens_per_gpu": 65536,
+             "rollout_max_response_len": 16384, "sglang_enable_fp32_lm_head": True,
+             "sglang_cuda_graph_backend_prefill": "disabled", "sglang_reasoning_parser": "flint",
+             "sglang_tool_call_parser": "flint", "sglang_grammar_backend": "flint",
+             "custom_rollout_log_function_path": "flint.miles_agent.log_rollout",
+             "rollout_sample_filter_path": "flint.miles_agent.drop_failed_groups",
+             "no_save_optim": False, "save_interval": 2, "load": a.save}
+    if not (a.rollout_external_engine_addrs and all(not x.startswith(("127.", "localhost")) for x in a.rollout_external_engine_addrs)):
+        want["rollout_external_engine_addrs"] = "routable host:port of every engine"
+elif a.load_debug_rollout_data is None:   # the colocated RL run
     want |= {"colocate": True, "offload_train": True, "offload_rollout": True, "rollout_num_gpus_per_engine": 2,
              "use_session_server": "v2", "tito_model": "flint", "pause_generation_mode": "in_place",
              "sglang_mem_fraction_static": 0.72, "max_tokens_per_gpu": 65536, "rollout_max_response_len": 16384,
              "custom_rollout_log_function_path": "flint.miles_agent.log_rollout",
              "rollout_sample_filter_path": "flint.miles_agent.drop_failed_groups"}
-if a.load_debug_rollout_data is None and a.load is None and os.environ.get("T67"):
+if getattr(a, "rollout_external", False):
+    pass   # elastic: its save settings above
+elif a.load_debug_rollout_data is None and a.load is None and os.environ.get("T67"):
     pass   # train67_smoke: no save (its settings below)
 elif a.load_debug_rollout_data is None and a.load is None:   # test2: one save at the end, no optimizer
     want |= {"no_save_optim": True, "save_interval": 100000}
@@ -68,6 +83,7 @@ bad = {k: (getattr(a, k, "<missing>"), v) for k, v in want.items() if getattr(a,
 print("parsed:", {k: getattr(a, k, None) for k in ("num_rollout", "rollout_num_gpus", "actor_num_gpus_per_node",
                                                    "max_tokens_per_gpu", "train_env_vars", "save", "colocate",
                                                    "rollout_batch_size", "n_samples_per_prompt", "global_batch_size",
-                                                   "seed", "rollout_seed")})
+                                                   "seed", "rollout_seed", "rollout_external_engine_addrs",
+                                                   "update_weight_transfer_mode")})
 print("ARGS_FAIL", bad) if bad else print("ARGS_OK", len(want), "settings")
 sys.exit(1 if bad else 0)
