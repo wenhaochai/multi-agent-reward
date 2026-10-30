@@ -1,0 +1,21 @@
+#!/bin/bash
+# fake apptainer for tests/dryrun_ext.sh: "exec [options] SIF CMD...": --env pairs exported, binds ignored; the plugin
+# build makes a stub flint package; engine_inner.sh becomes a fake SGLang server; anything else runs on the host
+# with tests/fake_ext/inner first on PATH (a fake ray).
+[ "$1" = exec ] || { echo "fake apptainer: only exec"; exit 2; }
+shift
+while [ $# -gt 0 ]; do
+  case $1 in --env) export "$2"; shift 2;; --bind|-B) shift 2;; --*) shift;; *) break;; esac
+done
+shift   # the SIF
+D=$(cd "$(dirname "$0")" && pwd)
+if [[ "$*" == *"pip install"* ]]; then
+  t=; prev=; for a in "$@"; do [ "$prev" = --target ] && t=$a; prev=$a; done
+  mkdir -p "$t/flint" && touch "$t/flint/__init__.py" && cp "$D/miles_agent_stub.py" "$t/flint/miles_agent.py"; exit
+fi
+[ "$1" = python3 ] && [ "$2" = -c ] && [[ "$3" == *entry_points* ]] && { echo "flint-sglang fake installed"; exit 0; }
+if [[ "$*" == *engine_inner.sh* ]]; then
+  echo "fake engine: NCCL_CUMEM_ENABLE (set by engine_inner.sh, not here) ip=$IP port=$PORT base=$BASE" >&2
+  exec python3 "$D/fake_sglang.py" "$IP" "$PORT"
+fi
+PATH=$D/inner:$PATH exec "$@"

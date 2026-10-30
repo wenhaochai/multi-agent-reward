@@ -7,10 +7,14 @@
 # With READY_CMD (a shell test, e.g. that the first rollout request is in the log): until it succeeds the job is
 # loading (the actor's weights, then the engines; GPUs idle by design) and idle minutes are not counted, but the load
 # phase may last at most LOAD_MIN minutes.
+# GPU_ACTIVE_CMD (optional, a shell test; the external-engine trainer, rl/rl_job_ext.sh): idle minutes are counted
+# only while it succeeds (a training phase: the trainer's GPUs idle by design while remote engines generate), and both
+# counters restart when it fails. GPU_IDLE_MAX_MIN (optional): a GPU at 0% for that many minutes in any phase, the
+# load phase included, stops the job too (the outer bound under the host's 90-min cancel).
 gpu_watch() {
-  local bare=() any=() line i u m ready= minutes=0
+  local bare=() any=() all=() line i u m ready= minutes=0 active=1
   [ -n "${3:-}" ] || ready=1
-  while sleep 60; do
+  while sleep 60 && kill -0 "$1" 2>/dev/null; do   # ends with the job's shell, even after a KILL
     minutes=$((minutes + 1))
     if [ -z "$ready" ]; then
       if eval "$3"; then
@@ -22,15 +26,24 @@ gpu_watch() {
         return
       fi
     fi
+    if [ -n "${GPU_ACTIVE_CMD:-}" ]; then
+      if eval "$GPU_ACTIVE_CMD"; then active=1; else active=; fi
+    fi
     i=0
     while IFS=', ' read -r idx u m; do
-      echo "$(date -u +%FT%TZ) gpu $idx util $u mem_mib $m" >> "$2"
-      if [ -n "$ready" ]; then
-        if [ "$u" = 0 ]; then any[i]=$(( ${any[i]:-0} + 1 )); else any[i]=0; fi
-        if [ "$u" = 0 ] && [ "$m" -lt 1024 ]; then bare[i]=$(( ${bare[i]:-0} + 1 )); else bare[i]=0; fi
+      echo "$(date -u +%FT%TZ) gpu $idx util $u mem_mib $m${GPU_ACTIVE_CMD:+ active ${active:-0}}" >> "$2"
+      if [ -n "${GPU_IDLE_MAX_MIN:-}" ]; then
+        if [ "$u" = 0 ]; then all[i]=$(( ${all[i]:-0} + 1 )); else all[i]=0; fi
       fi
-      if [ "${bare[i]:-0}" -ge 10 ] || [ "${any[i]:-0}" -ge "${GPU_IDLE_MIN:-20}" ]; then
-        echo "GPU_IDLE_ABORT: GPU $idx at 0% for ${any[i]} min (${bare[i]} min with nothing loaded)" | tee -a "$2"
+      if [ -n "$ready" ]; then
+        if [ -z "$active" ]; then any[i]=0; bare[i]=0
+        else
+          if [ "$u" = 0 ]; then any[i]=$(( ${any[i]:-0} + 1 )); else any[i]=0; fi
+          if [ "$u" = 0 ] && [ "$m" -lt 1024 ]; then bare[i]=$(( ${bare[i]:-0} + 1 )); else bare[i]=0; fi
+        fi
+      fi
+      if [ "${bare[i]:-0}" -ge 10 ] || [ "${any[i]:-0}" -ge "${GPU_IDLE_MIN:-20}" ] || { [ -n "${GPU_IDLE_MAX_MIN:-}" ] && [ "${all[i]:-0}" -ge "$GPU_IDLE_MAX_MIN" ]; }; then
+        echo "GPU_IDLE_ABORT: GPU $idx at 0% for ${any[i]} min (${bare[i]} min with nothing loaded; ${all[i]} min in any phase)" | tee -a "$2"
         kill -TERM "$1"
         return
       fi
