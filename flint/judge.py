@@ -677,10 +677,26 @@ async def judge_code(problem_dir: str, code: str) -> dict:
     """judge_full in a thread under the shared FCS_RM_CONCURRENCY semaphore. The slot is held until the thread ends,
     also when the caller is cancelled (an aborted episode): a cancelled await would otherwise free the slot while the
     judge keeps running, and the extra judges oversubscribe the node."""
-    async with _sem():
+    async with _node_slot(), _sem():
         fut = asyncio.ensure_future(_thread(judge_full, problem_dir, code))
         try:
             return await asyncio.shield(fut)
         except asyncio.CancelledError:
             await asyncio.wait([fut])
             raise
+
+
+def _node_slot():
+    """FCS_RM_NODE_SLOTS (RL rollouts, rl/rl_inner.sh): at most that many programs judged at once by all the episodes of
+    a miles rollout together. Each episode is a process of its own (miles' subproc agent mode), so _sem() bounds only
+    one episode; with 32 episodes their 32 semaphores would let 32 judges x CASE_WORKERS cases run on 96 cores, and a
+    program killed at 2x its time limit in wall time would lose cases to the crowding. miles' rollout_semaphore is a
+    set of flock'd files shared by a rollout process and the agent processes it starts. Unset: no node limit."""
+    import contextlib
+
+    n = int(os.environ.get("FCS_RM_NODE_SLOTS", "0"))
+    if n <= 0:
+        return contextlib.AsyncExitStack()
+    from miles.rollout.agentic.rollout_limits import rollout_semaphore
+
+    return rollout_semaphore("fcs-judge", n)
