@@ -17,11 +17,13 @@
 #   run20     20 colocated RL steps, the actor saved at the end
 # train67 modes (Frontier-CS v1.1's 67 training problems, data/fcs11_train67_agent.jsonl, pre-shuffled with a fixed seed
 # by rl/train67_data.py): P problems per step x G episodes each, one GRPO group per problem, one TP8 engine; usage
-# rl_job.sh train67[_test|_smoke] [P G [STEPS]] (defaults 4 8, train67 40 steps):
+# rl_job.sh train67[_test|_smoke] [P G [STEPS]] [set=NAME] (defaults 4 8, train67 40 steps; set=NAME trains on the
+# problems of data/train67_sets/NAME.txt only, default all 67; the run dirs then hold _NAME):
 #   train67_smoke  B = P x G episodes of 4k tokens, 2 steps, no save (~1 h)
 #   train67_test   B episodes of 128k, 2 steps, a full checkpoint after each (host memory at its peak: the end of the
-#                  optimizer step and the save; step time), resumable in runs/train67_test_p<P>g<G>, exit 0 when done
-#   train67        the run, resumable in runs/train67_p<P>g<G>: checkpoints every 2 steps, the newest 2 kept
+#                  optimizer step and the save; step time), resumable in runs/train67_test[_NAME]_p<P>g<G>, exit 0
+#                  when done
+#   train67        the run, resumable in runs/train67[_NAME]_p<P>g<G>: checkpoints every 2 steps, the newest 2 kept
 # The first failure ends the job: nothing is retried. Results: tmp/flint_s5/runs/<job>/. One container with a PID
 # namespace of its own (--pid) holds everything (see rl/rollout_job.sh); bounds: timeout -s KILL around it, the GPU
 # watch (rl/gpu_watch.sh) and cleanup of only the process groups this job started (serving/check/procs.sh).
@@ -32,22 +34,33 @@ MODE=${1:-}
 # stop comes 105 min before the end, at 4.25 h); train67_smoke: wq --time 1:45:00
 case "$MODE" in smoke|smoke_tp4|smoke_tp8) LIMIT=4800;; train67_smoke) LIMIT=6000;; base_tp8) LIMIT=8400;; test2) LIMIT=9600;;
   run20|train67) LIMIT=81000;; train67_test) LIMIT=21600;;
-  *) echo "usage: rl_job.sh smoke[_tp4|_tp8]|base_tp8|test2|run20|train67[_test|_smoke] [P G [STEPS]]"; exit 1;; esac
-T67_P=${2:-4} T67_G=${3:-8} T67_STEPS=${4:-40}
+  *) echo "usage: rl_job.sh smoke[_tp4|_tp8]|base_tp8|test2|run20|train67[_test|_smoke] [P G [STEPS]] [set=NAME]"; exit 1;; esac
+# train67: set=NAME at any place after the mode; the other arguments are P G STEPS in this order
+T67_SET= POS=()
+for x in "${@:2}"; do
+  case "$x" in set=*) T67_SET=${x#set=};; *) POS+=("$x");; esac
+done
+T67_P=${POS[0]:-4} T67_G=${POS[1]:-8} T67_STEPS=${POS[2]:-40}
 case "$MODE" in train67*) [[ $T67_P =~ ^[1-9][0-9]*$ && $T67_G =~ ^[1-9][0-9]*$ && $T67_STEPS =~ ^[1-9][0-9]*$ ]] \
-  || { echo "P G STEPS must be positive integers: $T67_P $T67_G $T67_STEPS"; exit 1; };; esac
+  || { echo "P G STEPS must be positive integers: $T67_P $T67_G $T67_STEPS"; exit 1; }
+  [ ${#POS[@]} -le 3 ] || { echo "too many arguments: ${POS[*]}"; exit 1; }
+  [ -z "$T67_SET" ] || [[ $T67_SET =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || { echo "set=NAME: letters, digits, _ and -: $T67_SET"; exit 1; }
+  ;;
+  *) [ -z "$T67_SET" ] || { echo "set=NAME is for the train67 modes only, not $MODE"; exit 1; };; esac
 JID=${FETCHED_JOB_ID:-$SLURM_JOB_ID}
 [ -n "$JID" ] || { echo "no job id"; exit 1; }
-REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-train67
+REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-train67b
 MILES=/scratch/gpfs/GROUP/USER/project/miles-rollout
 SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif
 FLINT=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint
 OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/$JID
 # run20 lives in one fixed directory, so that any submission resumes it (the checkpoints, steps.jsonl, the traces)
 [ "$MODE" = run20 ] && OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/run20_p0
-# so do the resumable train67 runs, one directory per batch shape
-[ "$MODE" = train67 ] && OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/train67_p${T67_P}g${T67_G}
-[ "$MODE" = train67_test ] && OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/train67_test_p${T67_P}g${T67_G}
+# so do the resumable train67 runs, one directory per problem set and batch shape (a set run never resumes a run on all
+# 67 problems, nor the reverse)
+T67_TAG=${T67_SET:+_$T67_SET}
+[ "$MODE" = train67 ] && OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/train67${T67_TAG}_p${T67_P}g${T67_G}
+[ "$MODE" = train67_test ] && OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/train67_test${T67_TAG}_p${T67_P}g${T67_G}
 RESUMABLE=; case "$MODE" in run20|train67|train67_test) RESUMABLE=1;; esac
 # the planned time stop: one step and a save must fit after it (run20: 43 min a step; train67 at B = 32: up to the
 # 60-min wall cap, ~4 x run20's 4-min train time, sync and save, ~85 min)
@@ -94,10 +107,13 @@ assert len(rows) == 1
 rows[0]["metadata"]["label"] = rows[0]["label"]
 open(sys.argv[2], "w").write((json.dumps(rows[0]) + "\n") * 1000)
 PY
-# train67: the training problems in a fixed order (seed 67, 30 epochs: miles' epoch end, a save point, comes after
-# 67 x 30 / P steps, outside any run). A resumed run must read the same file: an existing one is checked, not rebuilt.
+# train67: the training problems (all 67, or set=NAME's) in a fixed order (seed 67, 30 epochs: miles' epoch end, a save
+# point, comes after n x 30 / P steps, 255 for 34 problems at P = 4, outside any run). A resumed run must read the same
+# file: an existing one is checked, not rebuilt.
 if [[ $MODE == train67* ]]; then
-  python3 "$REPO/rl/train67_data.py" "$REPO/data/fcs11_train67_agent.jsonl" "$OUT/data_train67.new.jsonl" "$T67_P" || exit 1
+  echo "[s5] problem set: ${T67_SET:-none (all 67)}"   # train67_data.py's line below gives its size
+  python3 "$REPO/rl/train67_data.py" "$REPO/data/fcs11_train67_agent.jsonl" "$OUT/data_train67.new.jsonl" "$T67_P" \
+    ${T67_SET:+--set "$T67_SET"} || exit 1
   if [ -e "$OUT/data_train67.jsonl" ] && ! cmp -s "$OUT/data_train67.jsonl" "$OUT/data_train67.new.jsonl"; then
     echo "[s5] $OUT/data_train67.jsonl differs from the one this code builds: a resumed run would see other problems"; exit 1
   fi

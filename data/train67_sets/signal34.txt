@@ -1,0 +1,38 @@
+# signal34: the train67 problems that can give a GRPO group a learning signal (owner popup 2026-10-31, "留 34 题").
+# Rule: the 67 minus 20 'dead' (S < 0.01 in both 128k episodes), 7 'flat' (the same S in 3 runs) and the 6 'mixed'
+# problems whose checker scores against a hidden baseline (150, 152, 158, 161, 165, 167): 31 mixed + 3 saturated.
+# Source: /scratch/gpfs/GROUP/USER/tmp/rl_setup_traces/T1_report.md and T1_classes.csv. One pid per line.
+1
+9
+23
+24
+33
+41
+44
+47
+48
+50
+61
+75
+83
+109
+111
+112
+174
+177
+186
+188
+301
+302
+304
+305
+306
+307
+308
+309
+310
+311
+312
+313
+314
+315

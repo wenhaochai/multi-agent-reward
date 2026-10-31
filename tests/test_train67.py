@@ -1,5 +1,7 @@
 """train67 (rl/rl_job.sh train67*): (a) rl/train67_data.py: the 67 problems (112 only with its fixed checker), each
-epoch a permutation fixed by the seed, every step P different problems, the same file on every build; (b) the GRPO
+epoch a permutation fixed by the seed, every step P different problems, the same file on every build, byte-identical to
+864a904's without a set; a set (data/train67_sets/signal34.txt) the same way over its 34 problems, an unknown pid an
+error; (b) the GRPO
 groups miles forms from it: P groups of G per step, one problem each, centered within the group; (c) the fractional
 stop rules (wall cap over 25% of a rollout's episodes in 2 rollouts in a row; over 25% of the episodes out of the
 loss), with run20's absolute rule kept when the fractions are unset; (d) log_rollout's train67 record: per-problem S
@@ -59,6 +61,60 @@ check("build: the first 16 steps cover 64 different problems", len(first16) == 6
 out = subprocess.run([sys.executable, os.path.join(ROOT, "rl", "train67_data.py"), SRC, os.path.join(tmp, "c.jsonl"), "4"],
                      capture_output=True, text=True)
 check("cli: runs and reports", out.returncode == 0 and "67 problems (112 kept" in out.stdout, out.stdout + out.stderr)
+# without a set: byte-identical to rl-train67's 864a904: its train67_data.py and flint/checkers, exported from git (so it
+# sees 112's fixed checker as this tree does), run on the same source
+btree = os.path.join(tmp, "btree")
+r = subprocess.run(f"mkdir -p {btree} && git -C {ROOT} archive 864a904 rl/train67_data.py flint/checkers | tar -x -C {btree}",
+                   shell=True, capture_output=True, text=True)
+for P in (4, 3, 8, 5):
+    x, y = os.path.join(tmp, f"b{P}.jsonl"), os.path.join(tmp, f"t{P}.jsonl")
+    o1 = subprocess.run([sys.executable, os.path.join(btree, "rl", "train67_data.py"), SRC, x, str(P)], capture_output=True, text=True)
+    o2 = subprocess.run([sys.executable, os.path.join(ROOT, "rl", "train67_data.py"), SRC, y, str(P)], capture_output=True, text=True)
+    check(f"no set, P={P}: file and printed line byte-identical to 864a904's", r.returncode == 0 and o1.returncode == 0
+          and o2.returncode == 0 and open(x, "rb").read() == open(y, "rb").read() and o1.stdout == o2.stdout,
+          (r.stderr, o1.stderr, o2.stderr, o1.stdout, o2.stdout))
+
+# a set: data/train67_sets/signal34.txt (owner popup 2026-10-31)
+SIG = ["1", "9", "23", "24", "33", "41", "44", "47", "48", "50", "61", "75", "83", "109", "111", "112", "174", "177", "186",
+       "188", "301", "302", "304", "305", "306", "307", "308", "309", "310", "311", "312", "313", "314", "315"]
+check("set signal34: the 34 pids of the owner's list", T.load_set("signal34") == SIG and len(SIG) == 34)
+sel34 = T.select(rows, T.load_set("signal34"))
+check("set signal34: 34 rows, in the source's order, label in the metadata",
+      [r["metadata"]["pid"] for r in sel34] == [p for p in pids if p in SIG]
+      and all(r["metadata"]["label"] == r["label"] for r in sel34))
+for P in (4, 3, 8):
+    s1, s2 = os.path.join(tmp, f"s{P}a.jsonl"), os.path.join(tmp, f"s{P}b.jsonl")
+    got = T.build(SRC, s1, P, set_name="signal34")
+    T.build(SRC, s2, P, set_name="signal34")
+    gp = [r["metadata"]["pid"] for r in got]
+    ep = [gp[e * 34:(e + 1) * 34] for e in range(30)]
+    check(f"set signal34 P={P}: 30 epochs of 34 rows, each a permutation of the 34", len(gp) == 30 * 34
+          and all(sorted(e, key=int) == sorted(SIG, key=int) for e in ep))
+    check(f"set signal34 P={P}: every step {P} different problems",
+          all(len(set(gp[i:i + P])) == P for i in range(0, len(gp) - P + 1, P)))
+    check(f"set signal34 P={P}: deterministic (byte-identical on every build), the seeded order of the 34 rows",
+          open(s1, "rb").read() == open(s2, "rb").read() and gp == [sel34[i]["metadata"]["pid"] for i in T.order(34, P, 67, 30)])
+out = subprocess.run([sys.executable, os.path.join(ROOT, "rl", "train67_data.py"), SRC, os.path.join(tmp, "d.jsonl"), "4",
+                      "--set", "signal34"], capture_output=True, text=True)
+check("cli --set: runs and reports the set and its size", out.returncode == 0
+      and "set signal34: 34 problems (112 kept" in out.stdout and "1020 rows" in out.stdout, out.stdout + out.stderr)
+os.makedirs(os.path.join(ROOT, "data", "train67_sets"), exist_ok=True)
+bad = os.path.join(ROOT, "data", "train67_sets", f"_test_bad_{os.getpid()}.txt")
+open(bad, "w").write("# a pid that is not a training problem\n1\n0\n9999\n")
+try:
+    out = subprocess.run([sys.executable, os.path.join(ROOT, "rl", "train67_data.py"), SRC, os.path.join(tmp, "e.jsonl"),
+                          "4", "--set", os.path.basename(bad)[:-4]], capture_output=True, text=True)
+    check("set with an unknown pid: an error naming it, no file", out.returncode != 0 and "['0', '9999']" in out.stderr
+          and not os.path.exists(os.path.join(tmp, "e.jsonl")), out.stdout + out.stderr)
+finally:
+    os.remove(bad)
+for name in ("no_such_set", "../signal34", ""):
+    try:
+        T.load_set(name)
+        raised = False
+    except ValueError:
+        raised = True
+    check(f"set {name!r}: an error", raised)
 
 # (b) the groups miles forms: its data source reads P rows per rollout in file order (no --rollout-shuffle) and gives
 # each row's G copies one group_index; GRPO centers rewards within a group_index
