@@ -123,10 +123,13 @@ def _train_steps(train_log: str) -> dict[int, dict]:
 
 
 def _stop_rule(out: str, rollout_id: int) -> str | None:
-    """run20's stop rules (coordinator 2026-10-29), checked after each rollout: the last training step's KL(rollout ||
-    train) over 0.01; the grad norm (before clipping) over 10x step 0's in the last 2 steps; every episode at S = 0 in
-    the last 3 rollouts; more than 1 episode ended by the wall cap (MA_LG_WALL_MIN) in each of the last 2 rollouts.
-    Returns the reason, or None."""
+    """The stop rules, checked after each rollout: the last training step's KL(rollout || train) over 0.01; the grad
+    norm (before clipping) over 10x step 0's in the last 2 steps; every episode at S = 0 in the last 3 rollouts; the
+    wall cap (MA_LG_WALL_MIN) binding often in each of the last 2 rollouts (it would teach the policy not to submit):
+    run20 (coordinator 2026-10-29), 8 episodes per rollout: more than 1 episode; with MA_RL_WALL_STOP_FRAC (train67):
+    more than that fraction of the rollout's episodes. With MA_RL_MAX_DROPPED_FRAC (train67) also: more than that
+    fraction of the rollout's episodes out of the loss (failed episodes take their whole group out). Returns the
+    reason, or None."""
     steps = _train_steps(os.path.join(out, "train.log"))
     if steps:
         last = steps[max(steps)]
@@ -141,11 +144,21 @@ def _stop_rule(out: str, rollout_id: int) -> str | None:
         r = json.loads(line)
         rollouts[r["rollout_id"]] = r
     last2 = [rollouts.get(i) for i in (rollout_id - 1, rollout_id)]
-    if all(r is not None and r.get("wall_exceeded", 0) > 1 for r in last2):   # the cap binds often: it would teach
-        return f"more than 1 episode ended at the wall cap in rollouts {rollout_id - 1}-{rollout_id}"   # not to submit
+    frac = os.environ.get("MA_RL_WALL_STOP_FRAC")
+    if frac:
+        if all(r is not None and r.get("wall_exceeded", 0) > float(frac) * max(len(r["S"]), 1) for r in last2):
+            return (f"more than {float(frac):.0%} of the episodes ended at the wall cap in rollouts {rollout_id - 1}-"
+                    f"{rollout_id} ({[r['wall_exceeded'] for r in last2]} of {[len(r['S']) for r in last2]})")
+    elif all(r is not None and r.get("wall_exceeded", 0) > 1 for r in last2):
+        return f"more than 1 episode ended at the wall cap in rollouts {rollout_id - 1}-{rollout_id}"
     last3 = [rollouts.get(i) for i in range(rollout_id - 2, rollout_id + 1)]
     if all(r is not None and max(r["S"]) == 0 for r in last3):
         return f"every episode at S = 0 in rollouts {rollout_id - 2}-{rollout_id}"
+    drop = os.environ.get("MA_RL_MAX_DROPPED_FRAC")
+    r = rollouts.get(rollout_id)
+    if drop and r is not None and r.get("dropped_episodes", 0) > float(drop) * max(len(r["S"]), 1):
+        return (f"rollout {rollout_id}: {r['dropped_episodes']} of {len(r['S'])} episodes out of the loss (failed "
+                f"{r.get('failed')}), more than {float(drop):.0%}")
     return None
 
 
@@ -220,7 +233,7 @@ def startup_probe(out: str, train_log: str, model: str) -> int:
     try:
         m = re.findall(r"Router ready at host='([^']+)' port=(\d+)", open(train_log, errors="replace").read())
         args = SimpleNamespace(sglang_router_ip=m[0][0], sglang_router_port=int(m[0][1]))
-        messages = json.loads(open(os.path.join(out, "data_p0.jsonl")).readline())["prompt"]
+        messages = json.loads(open(_data_file(out)).readline())["prompt"]
         ids = AutoTokenizer.from_pretrained(model).apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
         ids = [int(t) for t in (ids["input_ids"] if hasattr(ids, "keys") else ids)]   # transformers 5: a BatchEncoding
         json.dump(ids, open(os.path.join(out, "probe_ids.json"), "w"))
@@ -243,6 +256,69 @@ def startup_probe(out: str, train_log: str, model: str) -> int:
     except Exception as e:
         print(f"[flint probe] start FAILED: {type(e).__name__}: {e}", flush=True)
         return 1
+
+
+def _data_file(out: str) -> str:
+    """The run's prompt file (rl/rl_inner.sh: MA_RL_DATA; run20's data_p0.jsonl by default): the probe's prompt is
+    its first row, train67's planned problems its rows in order."""
+    return os.environ.get("MA_RL_DATA") or os.path.join(out, "data_p0.jsonl")
+
+
+def _pid(meta: dict) -> str:
+    return str(meta.get("pid") or os.path.basename(str(meta.get("label") or "")) or "?")
+
+
+def _per_problem(episodes: dict) -> dict:
+    """Per problem (a GRPO group, train67): its episodes' S (sorted), mean, the fraction that submitted, failures."""
+    import statistics
+
+    by = {}
+    for m, S in episodes.values():
+        by.setdefault(_pid(m), []).append((m, S))
+    return {pid: {"S_mean": statistics.fmean(S for _, S in xs), "S": sorted(S for _, S in xs), "episodes": len(xs),
+                  "submitted_frac": sum((m.get("fo_lg_submissions") or 0) > 0 for m, _ in xs) / len(xs),
+                  "failed": sum(bool(m.get("flint_failed")) for m, _ in xs)}
+            for pid, xs in sorted(by.items(), key=lambda kv: (len(kv[0]), kv[0]))}
+
+
+def _planned(out: str, rollout_id: int, p: int) -> list[str] | None:
+    """The problems the data file plans for this rollout (rows rollout_id*p ... +p-1; miles reads it in order and saves
+    its position with each checkpoint), or None without a file."""
+    f = _data_file(out)
+    if not os.path.exists(f):
+        return None
+    rows = []
+    with open(f) as fh:
+        for i, line in enumerate(fh):
+            if i >= rollout_id * p + p:
+                break
+            if i >= rollout_id * p:
+                rows.append(_pid(json.loads(line)["metadata"]))
+    return rows
+
+
+def _inspect(d: str, samples: list) -> tuple[dict, dict, list[str]]:
+    """rl/inspect_rollout.py's check() on this rollout's samples, in this process (tests replace it)."""
+    import importlib.util
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    spec = importlib.util.spec_from_file_location("flint_inspect_rollout", os.path.join(repo, "rl", "inspect_rollout.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.check(d, samples)
+
+
+def _dump_samples(d: str, samples: list) -> None:
+    """The rollout's samples as miles' debug dump would hold them, one file per episode (r<k>/samples/<i>.pt), so the
+    copy that pickling makes stays one episode's size (~0.7 GB) instead of the whole batch's."""
+    import torch
+
+    os.makedirs(os.path.join(d, "samples"), exist_ok=True)
+    by = {}
+    for s in samples:
+        by.setdefault((s.metadata or {}).get("flint_session"), []).append(s)
+    for i, (_, ss) in enumerate(sorted(by.items(), key=lambda kv: str(kv[0]))):
+        torch.save({"samples": [s.to_dict() for s in ss]}, os.path.join(d, "samples", f"{i:03d}.pt"))
 
 
 def _probe_diffs(a: dict, b: dict) -> list[float]:
@@ -270,10 +346,17 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
       weights the engines serve: they change after a weight update, and the repeat gives the noise floor;
     - one line per rollout goes to $MA_RL_OUT/steps.jsonl: the episodes' rewards (S), submissions and failures, and
       the probe's change since the previous rollout.
+    With MA_RL_P (train67: P problems per rollout, one GRPO group each) the hook also logs per problem (S mean, the
+    fraction of episodes that submitted, failures) and the problems the data file planned; it checks the samples in
+    this process (no rollout.pt is read back: rl/rl_inner.sh drops miles' per-step dump) and writes them only every
+    MA_RL_DUMP_EVERY rollouts (r<k>/samples/); failed episodes take their groups out of the loss and fail the run only
+    through the stop rule's MA_RL_MAX_DROPPED_FRAC (a checkpoint first), every other sample problem still ends it.
     Returns False: miles' own rollout logging follows."""
     import statistics
     import subprocess
     import sys
+
+    P = int(os.environ.get("MA_RL_P", "0"))
 
     out = os.environ["MA_RL_OUT"]
     d = os.path.join(out, f"r{rollout_id}")
@@ -288,7 +371,7 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
     if not os.path.exists(ids_path):
         json.dump([int(t) for t in samples[0].tokens[:4096]], open(ids_path, "w"))
     ids = json.load(open(ids_path))
-    messages = json.loads(open(os.path.join(out, "data_p0.jsonl")).readline())["prompt"]
+    messages = json.loads(open(_data_file(out)).readline())["prompt"]
     probe = [_probe(args, ids, messages), _probe(args, ids, messages)]
     json.dump(probe, open(os.path.join(d, "probe.json"), "w"))
     rec = {"rollout_id": rollout_id, "rollout_s": round(rollout_time, 1), "probe_kind": probe[0]["kind"],
@@ -308,9 +391,22 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
     rec |= {"episodes": len(episodes), "samples": len(samples), "failed": sum(bool(m.get("flint_failed")) for m in episodes.values()),
             "reward_mean": statistics.fmean(S), "reward_var": statistics.pvariance(S), "S": sorted(S),
             "submissions": [m.get("fo_lg_submissions") for m in episodes.values()],
+            "submitted_frac": sum((m.get("fo_lg_submissions") or 0) > 0 for m in episodes.values()) / len(episodes),
             "restarts": [m.get("fo_lg_restarts") for m in episodes.values()],
             "wall_min_max": max((m.get("fo_lg_wall_min") or 0) for m in episodes.values()),
             "tokens": sum(len(s.tokens) for s in samples), "max_sample_tokens": max(len(s.tokens) for s in samples)}
+    if P:   # train67: one GRPO group per problem; a failed episode takes its whole group out of the loss
+        groups = {}
+        for k, s in first.items():
+            groups.setdefault(s.group_index if getattr(s, "group_index", None) is not None else _pid(s.metadata or {}), []).append(k)
+        dropped = [g for g, ks in groups.items() if any(episodes[k].get("flint_failed") for k in ks)]
+        per = _per_problem({k: (episodes[k], first[k].reward) for k in first})
+        rec |= {"problems": list(per), "planned": _planned(out, rollout_id, P), "per_problem": per,
+                "groups": len(groups), "dropped_groups": len(dropped),
+                "dropped_episodes": sum(len(groups[g]) for g in dropped),
+                "S_mean_by_problem": {pid: round(v["S_mean"], 4) for pid, v in per.items()},
+                "submitted_frac_by_problem": {pid: v["submitted_frac"] for pid, v in per.items()},
+                "groups_with_signal": sum(1 for v in per.values() if len(set(v["S"])) > 1)}
 
     # from the episodes' traces, per episode: cut turns (no command; the last one usually at the token budget's end),
     # those cut at the turn cap (MA_AG_TURN), trims, submissions
@@ -339,11 +435,23 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
         if os.path.exists(os.path.join(out, "host_mem.txt")) else []
     rec |= {"job_mem_gb": round(mem[-1] / 1024, 1) if mem else None, "job_mem_peak_gb": round(max(mem) / 1024, 1) if mem else None}
 
-    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    r = subprocess.run([sys.executable, os.path.join(repo, "rl", "inspect_rollout.py"), d, "rollout.pt"],
-                       capture_output=True, text=True)
-    open(os.path.join(d, "inspect.txt"), "w").write(r.stdout + r.stderr)
-    rec["inspect"] = (r.stdout.strip().splitlines() or ["no output"])[-1]
+    if P:   # in this process, on the samples miles holds anyway; failed episodes are the stop rule's to judge
+        summary, problems, lines = _inspect(d, samples)
+        bad = {k: v for k, v in problems.items() if v and k not in ("failed episodes", "judge infra submissions")}
+        rec["inspect"] = f"INSPECT_FAIL {bad}" if bad else "INSPECT_OK" + (
+            f" (failed episodes {problems['failed episodes']}, out of the loss)" if problems["failed episodes"] else "")
+        open(os.path.join(d, "inspect.txt"), "w").write("\n".join(lines + [rec["inspect"]]) + "\n")
+        r = subprocess.CompletedProcess([], 1 if bad else 0)
+        every = int(os.environ.get("MA_RL_DUMP_EVERY", "0"))
+        if every and rollout_id % every == 0:
+            _dump_samples(d, samples)
+            rec["dumped"] = True
+    else:
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        r = subprocess.run([sys.executable, os.path.join(repo, "rl", "inspect_rollout.py"), d, "rollout.pt"],
+                           capture_output=True, text=True)
+        open(os.path.join(d, "inspect.txt"), "w").write(r.stdout + r.stderr)
+        rec["inspect"] = (r.stdout.strip().splitlines() or ["no output"])[-1]
     with open(os.path.join(out, "steps.jsonl"), "a") as f:
         f.write(json.dumps(rec) + "\n")
     print(f"[flint rollout {rollout_id}] {json.dumps(rec)}", flush=True)
