@@ -33,13 +33,22 @@ by the problem and the episode). N = 1 is the lone-agent control.
                   dropped (once over MA_LG_CTX_CHARS, down to MA_LG_CTX_LOW of it, so the server's prefix cache holds
                   between trims) and its instance message says how many; the agents are told to keep what matters in
                   files (notes, SCORES.md, BOARD.md).
+  dedup           (MA_LG_DEDUP_SUBMIT=1; off by default) a `submit` of a file whose text equals one of the agent's own
+                  earlier submissions that the judge finished (not an infra failure) is not judged and not recorded:
+                  the reply names that submission and its provisional score and asks for a change first, so S, the
+                  best provisional and every score stay as they would be. The finish command keeps its own rule (an
+                  unchanged solution.cpp starts the conversation over). The trace counts them per agent
+                  (dup_submits), info as fo_lg_dup_submits (per agent) (trace analysis 2026-10-31: in run20 rollout
+                  17 one episode submitted the same solution.cpp 124 times in a row, 14k tokens and 6.6 min of
+                  judging, with a positive advantage; identical resubmissions rose from 25% to 43% over run20).
   checkpoint      an episode saves its state at the end of a round, every MA_LG_CKPT_S seconds and after every round
                   with a submission, and a later call with the same Checkpoint path resumes from it: a 1M-token episode
                   outlasts one wq segment.
 
 Env: MA_LG_N (4 agents), MA_LG_TOKENS (125000 per agent), MA_LG_CTX_CHARS (400000), MA_LG_CTX_LOW (0.75),
-MA_LG_MAX_ROUNDS (20000, a safety cap), MA_LG_CKPT_S (300), MA_AG_TURN (32768 tokens per turn), MA_AG_MAX_LEN (262144
-context tokens), MA_AG_TIMEOUT (60 s per command), MA_AG_TRACE_DIR (traces; none if unset), MA_AG_CMD_WORKERS (32),
+MA_LG_MAX_ROUNDS (20000, a safety cap), MA_LG_CKPT_S (300), MA_LG_DEDUP_SUBMIT (0 = off; 1), MA_AG_TURN (32768 tokens
+per turn), MA_AG_MAX_LEN (262144 context tokens), MA_AG_TIMEOUT (60 s per command), MA_AG_TRACE_DIR (traces; none if
+unset), MA_AG_CMD_WORKERS (32),
 MA_LG_WALL_MIN (0: none; RL rollouts set it: an episode that is still playing after that many minutes of wall time ends
 there, like at its token budget, so one slow episode cannot keep the other engines of its group idle).
 """
@@ -77,6 +86,10 @@ WALL_MIN = float(os.environ.get("MA_LG_WALL_MIN", "0"))
 assert 0 < CTX_LOW <= 1, CTX_LOW
 MAX_ROUNDS = int(os.environ.get("MA_LG_MAX_ROUNDS", "20000"))
 CKPT_S = float(os.environ.get("MA_LG_CKPT_S", "300"))
+DEDUP_SUBMIT = os.environ.get("MA_LG_DEDUP_SUBMIT") or "0"   # 0: every submit is judged (every game before 2026-10-31)
+if DEDUP_SUBMIT not in ("0", "1"):
+    raise ValueError(f"MA_LG_DEDUP_SUBMIT={DEDUP_SUBMIT}: must be 0 (off) or 1")
+DEDUP_SUBMIT = DEDUP_SUBMIT == "1"
 TURN = int(os.environ.get("MA_AG_TURN", "32768"))
 MAX_LEN = int(os.environ.get("MA_AG_MAX_LEN", "262144"))
 MAX_FORMAT_ERRORS = 3
@@ -135,7 +148,8 @@ def subset_mean(cases: list[float], idx: list[int]) -> float:
 def harness_tag() -> str:
     """The game's name in results.jsonl and the trace: the tag of the same game before the cleanup of 2026-10-28
     (harness v1, budget end, fresh restarts; a team: own repositories, must post)."""
-    return f"long-v1-budget-fresh-ctxlow{CTX_LOW:g}" + ("-own-mustpost" if TEAM else "")
+    return (f"long-v1-budget-fresh-ctxlow{CTX_LOW:g}" + ("-own-mustpost" if TEAM else "")
+            + ("-dedup" if DEDUP_SUBMIT else ""))
 
 
 def sha1(code: str) -> str:
@@ -178,6 +192,7 @@ class Agent:
     restarts = 0       # conversations started over
     owe_post = False   # a team agent has submitted and not posted since
     post_refused = 0   # commands not run because a post was owed
+    dup_submits = 0    # submits not judged: the file equals one of this agent's judged submissions (MA_LG_DEDUP_SUBMIT)
 
     def __init__(self, sess, j: int, problem: str):
         self.name = f"agent{j + 1}"
@@ -274,7 +289,8 @@ class Paused(Exception):
 
 
 _AGENT_STATE = ("chat", "steps", "fmt_run", "fmt_total", "timeouts", "cut_n", "done", "exit", "turns", "generated",
-                "dropped", "seen", "n_submit", "n_post", "last_sha", "idle_fin", "restarts", "owe_post", "post_refused")
+                "dropped", "seen", "n_submit", "n_post", "last_sha", "idle_fin", "restarts", "owe_post", "post_refused",
+                "dup_submits")
 _SESS_STATE = ("used", "queue", "cont", "n_cont", "last_reasoning", "fresh")   # ChatSession's state
 _TAR_MAX = 32 << 20   # a larger file (a generated test input) stays out of the checkpoint; the agent can rebuild it
 
@@ -403,7 +419,8 @@ async def episode(input, messages: list, label: str, new_session, ckpt: Checkpoi
               "N": N, "TOKENS": TOKENS, "CTX_CHARS": CTX_CHARS, "CTX_LOW": CTX_LOW, "HARNESS": "v1", "END": "budget",
               "VERDICTS": False, "TURN": TURN, "MAX_LEN": MAX_LEN, "ON_STOP": "fresh",
               "prompt": sha1(P.SYSTEM + instance(problem, "agent1")),
-              **({"REPOS": "own", "POST": "submit"} if TEAM else {}), **({"WALL_MIN": WALL_MIN} if WALL_MIN else {})}
+              **({"REPOS": "own", "POST": "submit"} if TEAM else {}), **({"WALL_MIN": WALL_MIN} if WALL_MIN else {}),
+              **({"DEDUP_SUBMIT": True} if DEDUP_SUBMIT else {})}
 
     def state() -> dict:   # whole turns: the trace keeps them whole too
         return {"config": config, "rounds": rounds, "run_s": run_s, "subs": subs, "board": board, "events": events,
@@ -504,6 +521,25 @@ async def episode(input, messages: list, label: str, new_session, ckpt: Checkpoi
             msg += "Compiler output:\n" + res["msg"][:3000] + "\n"
         msg += f"About {max(0, TOKENS - a.generated):,} of your {TOKENS:,} tokens are left.\n"
         return {"output": msg, "returncode": 0, "exception_info": ""}
+
+    def dup_submit(a, path: str):
+        """MA_LG_DEDUP_SUBMIT: the reply to a submit of a file whose text equals one of a's own submissions the judge
+        finished (the latest such), or None (judge it). The text is what the judge would get, so its result would be
+        that submission's again; the state is subs, which the checkpoint keeps. a.last_sha moves as a judged submit
+        of solution.cpp would move it, so the finish command then acts as in the game that judges the duplicate."""
+        got = read_code(path, a.dir)
+        if got is None or got[1] is None:
+            return None
+        k, x = next(((i, x) for i, x in reversed(list(enumerate(subs, 1))) if x["agent"] == a.name and not x["infra"]
+                     and x["code"] == got[1]), (0, None))
+        if x is None:
+            return None
+        a.dup_submits += 1
+        if got[0] == os.path.realpath(os.path.join(a.dir, "solution.cpp")):
+            a.last_sha = x["sha"]
+        return {"output": f"submit: {path} is unchanged since your submission #{k} (provisional {100 * x['prov']:.2f}), "
+                          f"so it was not judged again and no new submission was recorded. Change {path} before you "
+                          "submit it again.\n", "returncode": 1, "exception_info": ""}
 
     async def finish(a, out: dict) -> dict:
         """The finish command (its command output `out`): submit solution.cpp; unchanged since a.last_sha, a reply
@@ -654,7 +690,10 @@ async def episode(input, messages: list, label: str, new_session, ckpt: Checkpoi
                     timing["post_refused"] = True
                     out, secs = {"output": P.POST_REFUSED, "returncode": 1, "exception_info": ""}, 0.0
                 elif m_sub:
-                    out, secs = await do_submit(a, m_sub.group(1) or "solution.cpp"), 0.0
+                    dup = dup_submit(a, m_sub.group(1) or "solution.cpp") if DEDUP_SUBMIT else None
+                    if dup is not None:
+                        timing["dup_submit"] = True
+                    out, secs = dup or await do_submit(a, m_sub.group(1) or "solution.cpp"), 0.0
                 elif m_post:
                     out, secs = do_post(a, m_post.group(1)), 0.0
                     a.owe_post = False
@@ -766,6 +805,7 @@ async def episode(input, messages: list, label: str, new_session, ckpt: Checkpoi
             "fo_lg_harness_min": total_min("harness_s"),
             "fo_lg_idle_finishes": sum(bool(t.get("idle_finish")) for a in agents for t in a.turns) / N,
             "fo_lg_restarts": sum(a.restarts for a in agents) / N,
+            **({"fo_lg_dup_submits": sum(a.dup_submits for a in agents) / N} if DEDUP_SUBMIT else {}),
             **({"fo_lg_must_post": 1.0, "fo_lg_post_refused": sum(a.post_refused for a in agents) / N,
                 "fo_lg_own_repos": 1.0, "fo_lg_adoptions": len(adoptions), "fo_lg_fetch_min": total_min("fetch_s"),
                 "fo_lg_fetch_fail": sync["fetch_fail"], "fo_lg_commit_skipped": sync["commit_skipped"],
@@ -781,6 +821,7 @@ async def episode(input, messages: list, label: str, new_session, ckpt: Checkpoi
            # full turns (text = <think>reasoning</think>answer) and submissions with their code (audit 2026-10-24)
            "agents": [{"name": a.name, "exit": a.exit, "steps": a.steps, "generated": a.generated,
                        "dropped": a.dropped, "submits": a.n_submit, "posts": a.n_post, "restarts": a.restarts,
-                       **({"post_refused": a.post_refused} if TEAM else {}), "turns": a.turns}
+                       **({"post_refused": a.post_refused} if TEAM else {}),
+                       **({"dup_submits": a.dup_submits} if DEDUP_SUBMIT else {}), "turns": a.turns}
                       for a in agents]})
     return agents, S, info
