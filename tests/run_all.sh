@@ -37,6 +37,7 @@ t test_checker_fixes X=1
 # miles' session matcher lives in miles v0.1.3: this test runs in its container
 SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif t test_miles_agent X=1
 SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif t test_wall_cap X=1
+SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif t test_train67 X=1
 rm -rf "$TMPDIR"
 echo "${#fail[@]} failed${fail:+: ${fail[*]}}"
 [ ${#fail[@]} -eq 0 ]

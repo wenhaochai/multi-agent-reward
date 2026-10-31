@@ -26,6 +26,8 @@ if os.path.exists(os.path.join(d, "steps.jsonl")):
 json.dump(steps, open(os.path.join(d, "steps.json"), "w"), indent=1, default=str)
 
 COLS = [("S mean", "flint/reward_mean", "{:.4f}"), ("S var", "flint/reward_var", "{:.5f}"),
+        ("submitted", "flint/submitted_frac", "{:.2f}"), ("signal", "flint/groups_with_signal", "{}"),
+        ("dropped", "flint/dropped_episodes", "{}"), ("wall cap", "flint/wall_exceeded", "{}"),
         ("subs", "flint/submissions", "{}"), ("failed", "flint/failed", "{}"),
         ("probe chg", "flint/probe_change_mean_abs", "{:.2e}"), ("probe rep", "flint/probe_repeat_max_abs", "{:.1e}"),
         ("KL(r||t)", "train/train_rollout_kl", "{:.4f}"), ("|dlogp|", "train/train_rollout_logprob_abs_diff", "{:.4f}"),
@@ -42,3 +44,9 @@ for i in sorted(steps):
         v = steps[i].get(key)
         row.append(f"{'-' if v is None else fmt.format(v):>10}"[-10:] if not isinstance(v, list) else f"{str(v):>10}")
     print(f"{i:>4} " + " ".join(row))
+# train67: S mean and the fraction of episodes that submitted, per problem and step
+if any("flint/S_mean_by_problem" in steps[i] for i in steps):
+    print("step  problem: S mean (submitted)")
+    for i in sorted(steps):
+        m, f = steps[i].get("flint/S_mean_by_problem") or {}, steps[i].get("flint/submitted_frac_by_problem") or {}
+        print(f"{i:>4}  " + "  ".join(f"{p}: {m[p]:.3f} ({f.get(p, 0):.2f})" for p in m))
