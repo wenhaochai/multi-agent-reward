@@ -18,6 +18,7 @@ t test_game MA_LG_N=4
 t test_game MA_LG_N=1
 t test_restart X=1
 t test_finish X=1
+t test_dedup X=1
 t test_post X=1
 t test_trace X=1
 t test_resume X=1

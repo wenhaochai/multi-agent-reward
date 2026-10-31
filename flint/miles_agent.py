@@ -73,7 +73,7 @@ async def run(base_url: str, prompt, request_kwargs: dict, metadata: dict, **kwa
     if os.environ.get("MA_RL_OUT"):   # the RL job's settings (rl/rl_inner.sh) must be the game's in this process
         out_dir = os.environ["MA_RL_OUT"]
         got = {"MA_LG_N": G.N, "MA_LG_TOKENS": G.TOKENS, "MA_LG_CTX_CHARS": G.CTX_CHARS, "MA_AG_TURN": G.TURN,
-               "MA_LG_WALL_MIN": G.WALL_MIN}
+               "MA_LG_WALL_MIN": G.WALL_MIN, **({"MA_LG_DEDUP_SUBMIT": 1} if G.DEDUP_SUBMIT else {})}
         os.makedirs(os.path.join(out_dir, "settings_seen"), exist_ok=True)
         json.dump(got, open(os.path.join(out_dir, "settings_seen", f"{os.getpid()}.json"), "w"))   # startup_probe reads it
         expected = {k: float(v) for k, v in json.load(open(os.path.join(out_dir, "game_settings.json"))).items()}
@@ -97,6 +97,8 @@ async def run(base_url: str, prompt, request_kwargs: dict, metadata: dict, **kwa
     finally:
         await client.close()
     out = {**out, "reward": S, **{k: info[k] for k in INFO_KEYS}}
+    if "fo_lg_dup_submits" in info:   # MA_LG_DEDUP_SUBMIT=1 (train67)
+        out["fo_lg_dup_submits"] = info["fo_lg_dup_submits"]
     if info["fo_judge_infra_error"]:
         out["flint_failed"] = "judge infra error"
     return out
@@ -393,6 +395,8 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
             "submissions": [m.get("fo_lg_submissions") for m in episodes.values()],
             "submitted_frac": sum((m.get("fo_lg_submissions") or 0) > 0 for m in episodes.values()) / len(episodes),
             "restarts": [m.get("fo_lg_restarts") for m in episodes.values()],
+            **({"dup_submits": [m.get("fo_lg_dup_submits") for m in episodes.values()]}
+               if any("fo_lg_dup_submits" in m for m in episodes.values()) else {}),
             "wall_min_max": max((m.get("fo_lg_wall_min") or 0) for m in episodes.values()),
             "tokens": sum(len(s.tokens) for s in samples), "max_sample_tokens": max(len(s.tokens) for s in samples)}
     if P:   # train67: one GRPO group per problem; a failed episode takes its whole group out of the loss

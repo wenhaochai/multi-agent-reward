@@ -99,12 +99,19 @@ episodes in a rollout:
 Every 5th rollout writes its samples (`r<k>/samples/`). `steps.jsonl` records the S mean of each problem and the
 fraction of episodes that submitted.
 
-A problem set comes from the trace analysis of 2026-10-31 (`tmp/rl_setup_traces/T1_report.md`; owner popup of
-2026-10-31): `set=NAME` trains on the problems of `data/train67_sets/NAME.txt` only. The default is all 67. `signal34`
-keeps 34 problems: 31 'mixed' and 3 'saturated'. It drops 20 'dead' problems (S < 0.01 in both 128k episodes), 7
-'flat' problems (the same S in 3 runs) and 6 'mixed' problems whose checker scores against a hidden baseline (150,
-152, 158, 161, 165, 167). A set run has its own directories (`runs/train67[_test]_NAME_p<P>g<G>`), so it never resumes
-a 67-problem run.
+Two settings come from the trace analysis of 2026-10-31 (`tmp/rl_setup_traces/T1_report.md`, `T2_report.md`; owner
+popups of 2026-10-31):
+
+1. `set=NAME` trains on the problems of `data/train67_sets/NAME.txt` only. The default is all 67. `signal34` keeps 34
+   problems: 31 'mixed' and 3 'saturated'. It drops 20 'dead' problems (S < 0.01 in both 128k episodes), 7 'flat'
+   problems (the same S in 3 runs) and 6 'mixed' problems whose checker scores against a hidden baseline (150, 152,
+   158, 161, 165, 167). A set run has its own directories (`runs/train67[_test]_NAME_p<P>g<G>`), so it never resumes a
+   67-problem run.
+2. The train67 modes do not judge a resubmission of unchanged code (`MA_LG_DEDUP_SUBMIT=1`, in `rl/rl_inner.sh`). When
+   the file equals one of the agent's own judged submissions, the judge is not called and no submission is recorded.
+   The reply names that submission and its provisional score. S and the best provisional do not change.
+   `steps.jsonl` records `dup_submits` per episode. Reason: in run20 rollout 17 one episode submitted the same
+   solution.cpp 124 times in a row and got a positive advantage. run20, base_tp8 and the evals judge every submit.
 
     wq submit --prio 10 --time 1:45:00 --project flint-eval rl/rl_job.sh train67_smoke   # 2 steps x 32 x 4k
     wq submit --partial --prio 10 --time 6:00:00 --project flint-eval rl/rl_job.sh train67_test   # 2 steps x 32 x 128k

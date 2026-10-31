@@ -60,9 +60,12 @@ T67_B=$((T67_P * T67_G))
 case "$MODE" in
   train67*)
     export MA_LG_WALL_MIN=60 MA_RL_P=$T67_P MA_RL_WALL_STOP_FRAC=0.25 MA_RL_MAX_DROPPED_FRAC=0.25 MA_RL_DUMP_EVERY=5 \
-      MA_RL_DATA=$OUT/data_train67.jsonl FCS_RM_NODE_SLOTS=10 FCS_CASE_PROCS=12 ;;
+      MA_RL_DATA=$OUT/data_train67.jsonl FCS_RM_NODE_SLOTS=10 FCS_CASE_PROCS=12 MA_LG_DEDUP_SUBMIT=1 ;;
 esac
-python3 -c "import json, os; json.dump({k: os.environ[k] for k in ('MA_LG_N', 'MA_LG_TOKENS', 'MA_LG_CTX_CHARS', 'MA_AG_TURN', 'MA_LG_WALL_MIN')}, open('$OUT/game_settings.json', 'w'))"
+# - a submit of code the agent already submitted is not judged again (flint/game.py MA_LG_DEDUP_SUBMIT; trace analysis
+#   2026-10-31: run20 rollout 17, one episode submitted one solution.cpp 124 times in a row, with a positive advantage);
+#   run20, base_tp8 and the evals keep judging every submit
+python3 -c "import json, os; json.dump({k: os.environ[k] for k in ('MA_LG_N', 'MA_LG_TOKENS', 'MA_LG_CTX_CHARS', 'MA_AG_TURN', 'MA_LG_WALL_MIN', 'MA_LG_DEDUP_SUBMIT') if k in os.environ}, open('$OUT/game_settings.json', 'w'))"
 ulimit -n "$(ulimit -Hn)"
 NG=$(awk -F, '{print NF}' <<< "$CUDA_VISIBLE_DEVICES")
 JNUM=${JID//[!0-9]/}
