@@ -112,7 +112,10 @@ SERVE=(--rollout-num-gpus "$NG" --rollout-num-gpus-per-engine "$ENGINE_TP"
 #   gate      the fused sigmoid router (FLINT_FUSED_SIGMOID_GATE=1, serving/flint_sglang/flint_sglang/model.py)
 #   graphs    a decode CUDA graph at every batch size 1..32 (SGLang's default list pads between 1 2 4 8 12 16 24 32)
 #   arfusion  FlashInfer allreduce fusion (trtllm backend)
-#   pgraph    prefill CUDA graphs (breakable backend)
+#   pgraph    prefill CUDA graphs (breakable backend; breaks colocated RL: SGLang refuses it with miles'
+#             SGLANG_MEMORY_SAVER_CUDA_GRAPH, w787)
+#   moecfg    fused-MoE Triton configs tuned for TP8 (E=256, N=64; kernels job w779): SGLANG_MOE_CONFIG_DIR =
+#             serving/moe_configs (other shapes, e.g. N=128 at TP4, keep SGLang's defaults)
 # Set before `ray start` below: the engines take Ray's environment.
 T67_LEVERS=${T67_LEVERS:-} T67_TP=8
 for lever in ${T67_LEVERS//,/ }; do
@@ -122,11 +125,14 @@ for lever in ${T67_LEVERS//,/ }; do
     graphs) SERVE+=(--sglang-cuda-graph-bs-decode $(seq 1 32) $(seq 40 8 256) $(seq 272 16 512));;
     arfusion) SERVE+=(--sglang-flashinfer-allreduce-fusion-backend trtllm);;
     pgraph) SERVE+=(--sglang-cuda-graph-backend-prefill breakable);;
+    moecfg) [ -f "$REPO/serving/moe_configs/configs/triton_3_8_0/E=256,N=64,device_name=NVIDIA_H100_80GB_HBM3.json" ] \
+              || { echo "[s5] moecfg: no tuned config in $REPO/serving/moe_configs"; exit 1; }
+            export SGLANG_MOE_CONFIG_DIR=$REPO/serving/moe_configs;;
     *) echo "[s5] unknown engine lever: $lever"; exit 1;;
   esac
 done
 case "$MODE" in train67*) ENGINE_TP=$T67_TP; SERVE[3]=$ENGINE_TP;; esac
-[ -z "$T67_LEVERS" ] || echo "[s5] engine levers: $T67_LEVERS (train67 engines: $((8 / T67_TP)) x TP$T67_TP, FLINT_FUSED_SIGMOID_GATE=${FLINT_FUSED_SIGMOID_GATE:-unset})"
+[ -z "$T67_LEVERS" ] || echo "[s5] engine levers: $T67_LEVERS (train67 engines: $((8 / T67_TP)) x TP$T67_TP, FLINT_FUSED_SIGMOID_GATE=${FLINT_FUSED_SIGMOID_GATE:-unset}, SGLANG_MOE_CONFIG_DIR=${SGLANG_MOE_CONFIG_DIR:-unset})"
 # the long game as a miles agent on problem 0 (flint/miles_agent.py), sampling as in the eval; the engines return each
 # token's routed experts, incremental rows per turn (pause mode in_place); an episode the judge could not score takes
 # its group out of the loss (drop_failed_groups) and fails the rollout's check (log_rollout), which ends the run
