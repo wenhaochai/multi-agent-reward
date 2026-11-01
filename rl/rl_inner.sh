@@ -62,6 +62,11 @@ case "$MODE" in
     export MA_LG_WALL_MIN=60 MA_RL_P=$T67_P MA_RL_WALL_STOP_FRAC=0.25 MA_RL_MAX_DROPPED_FRAC=0.25 MA_RL_DUMP_EVERY=5 \
       MA_RL_DATA=$OUT/data_train67.jsonl FCS_RM_NODE_SLOTS=10 FCS_CASE_PROCS=12 MA_LG_DEDUP_SUBMIT=1 ;;
 esac
+# - milestones (train67 only): besides the newest 2 full checkpoints, the model part (DCP model/ and meta.json, ~149 GB;
+#   no optimizer) of every checkpoint iter_k with k % 20 == 0 stays, in $OUT/milestones/iter_k: hard links made by
+#   flint.miles_agent.log_rollout before its pruning deletes the checkpoint, and once more after train.py ends (the
+#   last checkpoint comes after the last rollout's hook). The full checkpoints and the resume are as before.
+[ "$MODE" = train67 ] && export MA_RL_KEEP_EVERY=20
 # - a submit of code the agent already submitted is not judged again (flint/game.py MA_LG_DEDUP_SUBMIT; trace analysis
 #   2026-10-31: run20 rollout 17, one episode submitted one solution.cpp 124 times in a row, with a positive advantage);
 #   run20, base_tp8 and the evals keep judging every submit
@@ -223,5 +228,10 @@ case "$MODE" in
 esac
 rc=$?
 echo "[s5] $(date -u +%FT%TZ) train.py exit $rc after $((SECONDS - t0)) s; $(tail -1 "$OUT/probe_start.log" 2>/dev/null)"
+if [ "${MA_RL_KEEP_EVERY:-0}" -gt 0 ]; then   # the milestone of a checkpoint written after the last rollout's hook
+  python3 -c "from flint.miles_agent import _keep_newest_checkpoints as k; k('$OUT/actor', 2, $MA_RL_KEEP_EVERY)" \
+    || echo "[s5] milestone pass failed (the checkpoints are untouched)"
+  echo "[s5] milestones: $(ls "$OUT/milestones" 2>/dev/null | tr '\n' ' ')"
+fi
 python3 "$REPO/rl/steps.py" "$OUT"
 exit $rc
