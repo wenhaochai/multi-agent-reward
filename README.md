@@ -126,6 +126,17 @@ as before: the same data file, train.py arguments and run directories. Another N
 
 The job log prints the seeds at the start (`[s5] seed N: ...`).
 
+Milestones: the train67 run keeps the newest 2 full checkpoints in `actor/` (for the resume, as before) and, besides
+them, the model part of every 20th checkpoint (`MA_RL_KEEP_EVERY=20`, train67 mode only; 0 elsewhere):
+`runs/<dir>/milestones/iter_0000020/{model/,meta.json}`, ~149 GB each, no optimizer state. They are hard links, made
+before the pruning in `flint.miles_agent.log_rollout` deletes the checkpoint, and once more after train.py ends. An 80-step
+run keeps iter_20, iter_40, iter_60 and iter_80 (~600 GB). To evaluate a milestone, convert it to a HF model directory
+with `tools/dcp_to_hf.py` of the `rl-eval` branch (on CPU: a vis node or a cpu job, in miles-v0.1.3.sif for torch),
+then evaluate it with that branch's `jobs/eval.sh ... model=PATH` (its README, "An RL-trained Flint"):
+
+    python3 <rl-eval worktree>/tools/dcp_to_hf.py runs/<dir>/milestones/iter_0000040 <FLINT of rl/rl_job.sh> <out dir>
+    wq submit --partial --project flint-eval jobs/eval.sh val40 128000 32 model=<out dir>   # from the rl-eval worktree
+
     wq submit --prio 10 --time 1:45:00 --project flint-eval rl/rl_job.sh train67_smoke   # 2 steps x 32 x 4k
     wq submit --partial --prio 10 --time 6:00:00 --project flint-eval rl/rl_job.sh train67_test   # 2 steps x 32 x 128k
     wq submit --partial --time 23:00:00 --project flint-eval rl/rl_job.sh train67 4 8 40   # runs/train67_p4g8

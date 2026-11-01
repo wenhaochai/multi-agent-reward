@@ -164,8 +164,33 @@ def _stop_rule(out: str, rollout_id: int) -> str | None:
     return None
 
 
-def _keep_newest_checkpoints(root: str, keep: int) -> None:
-    """Delete miles' checkpoints (root/iter_NNNNNNN) but the newest ``keep`` and the one the tracker names."""
+def _keep_milestone(root: str, it: int, milestones: str) -> None:
+    """The model part of root/iter_NNNNNNN (model/ and meta.json; no optimizer, scheduler or RNG) as
+    milestones/iter_NNNNNNN: hard links (the same disk blocks, no copy; the checkpoint's own files stay as they are),
+    built in a .partial directory and renamed when whole, so a milestone directory is always complete. An existing one
+    is kept as it is."""
+    import shutil
+
+    name = f"iter_{it:07d}"
+    dst = os.path.join(milestones, name)
+    if os.path.isdir(dst):
+        return
+    src = os.path.join(root, name)
+    part = dst + ".partial"
+    shutil.rmtree(part, ignore_errors=True)
+    os.makedirs(part)
+    shutil.copytree(os.path.join(src, "model"), os.path.join(part, "model"), copy_function=os.link)
+    if os.path.exists(os.path.join(src, "meta.json")):
+        os.link(os.path.join(src, "meta.json"), os.path.join(part, "meta.json"))
+    os.rename(part, dst)
+    print(f"[flint] milestone {dst} (model only, hard links)", flush=True)
+
+
+def _keep_newest_checkpoints(root: str, keep: int, every: int = 0) -> None:
+    """Delete miles' checkpoints (root/iter_NNNNNNN) but the newest ``keep`` and the one the tracker names. With
+    ``every`` > 0, each checkpoint whose iteration is a multiple of it first leaves its model part in
+    <root>/../milestones/iter_NNNNNNN (_keep_milestone), when it is whole: not the newest one, which miles may still be
+    writing (it writes model/ first, then the optimizer, then the tracker), unless the tracker names it."""
     import re
     import shutil
 
@@ -174,6 +199,12 @@ def _keep_newest_checkpoints(root: str, keep: int) -> None:
     tracker = os.path.join(root, "latest_checkpointed_iteration.txt")
     named = int(open(tracker).read().strip()) if os.path.exists(tracker) else None
     iters = sorted(int(m.group(1)) for x in os.listdir(root) if (m := re.fullmatch(r"iter_(\d{7})", x)))
+    if every > 0:
+        milestones = os.path.join(os.path.dirname(os.path.abspath(root)), "milestones")
+        for it in iters:
+            if it % every == 0 and named is not None and it <= named and \
+                    os.path.isdir(os.path.join(root, f"iter_{it:07d}", "model")):
+                _keep_milestone(root, it, milestones)
     for it in iters[:-keep]:
         if it != named and os.path.isdir(os.path.join(root, f"iter_{it:07d}")):
             shutil.rmtree(os.path.join(root, f"iter_{it:07d}"))
@@ -459,7 +490,7 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
     with open(os.path.join(out, "steps.jsonl"), "a") as f:
         f.write(json.dumps(rec) + "\n")
     print(f"[flint rollout {rollout_id}] {json.dumps(rec)}", flush=True)
-    _keep_newest_checkpoints(os.path.join(out, "actor"), 2)
+    _keep_newest_checkpoints(os.path.join(out, "actor"), 2, int(os.environ.get("MA_RL_KEEP_EVERY", "0") or 0))
     stop = _stop_rule(out, rollout_id)
     if stop and not os.path.exists(os.path.join(out, "stop_request")):
         open(os.path.join(out, "stop_request"), "w").write(f"3 rule: {stop}\n")   # rl/rl_job.sh: checkpoint, then stop
