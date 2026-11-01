@@ -164,6 +164,23 @@ def _stop_rule(out: str, rollout_id: int) -> str | None:
     return None
 
 
+# the trainer's train/* consistency numbers of the last step against run20's maximum over its 20 steps
+# (tmp/rollout_eff/consistency: the gate's tier 4); over a limit, log_rollout warns, it does not stop the run
+CONSISTENCY_LIMITS = {"train/train_rollout_logprob_abs_diff": 0.0099, "train/train_rollout_kl": 3.4e-4,
+                      "train/r3_token_mismatch": 0.146, "train/r3_pick_mismatch": 0.031}
+
+
+def _consistency(out: str) -> dict:
+    """The last training step's consistency numbers and the ones over CONSISTENCY_LIMITS (empty before step 0)."""
+    steps = _train_steps(os.path.join(out, "train.log"))
+    if not steps:
+        return {}
+    last = steps[max(steps)]
+    return {"consistency_step": max(steps),
+            "consistency": {k.split("/")[1]: last[k] for k in CONSISTENCY_LIMITS if k in last},
+            "consistency_over": [k.split("/")[1] for k, lim in CONSISTENCY_LIMITS.items() if last.get(k, 0) > lim]}
+
+
 def _keep_milestone(root: str, it: int, milestones: str) -> None:
     """The model part of root/iter_NNNNNNN (model/ and meta.json; no optimizer, scheduler or RNG) as
     milestones/iter_NNNNNNN: hard links (the same disk blocks, no copy; the checkpoint's own files stay as they are),
@@ -487,6 +504,10 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
                            capture_output=True, text=True)
         open(os.path.join(d, "inspect.txt"), "w").write(r.stdout + r.stderr)
         rec["inspect"] = (r.stdout.strip().splitlines() or ["no output"])[-1]
+    rec |= _consistency(out)
+    if rec.get("consistency_over"):
+        print(f"[flint rollout {rollout_id}] CONSISTENCY WARNING: step {rec['consistency_step']} "
+              f"{ {k: rec['consistency'][k] for k in rec['consistency_over']} } over run20's maximum", flush=True)
     with open(os.path.join(out, "steps.jsonl"), "a") as f:
         f.write(json.dumps(rec) + "\n")
     print(f"[flint rollout {rollout_id}] {json.dumps(rec)}", flush=True)
