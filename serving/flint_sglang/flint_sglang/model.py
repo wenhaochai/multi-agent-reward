@@ -142,13 +142,28 @@ class FlintSparseMoeBlock(Qwen3MoeSparseMoeBlock):
             topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
             return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
-        self.topk = TopK(
-            top_k=config.num_experts_per_tok,
-            renormalize=False,  # the routing function renormalizes
-            use_grouped_topk=False,
-            layer_id=layer_id,
-            custom_routing_function=sigmoid_routing,
-        )
+        if os.environ.get("FLINT_FUSED_SIGMOID_GATE") == "1":
+            # The same routing in one launch: SGLang's fused sigmoid router (moe_fused_gate, one Triton kernel: the
+            # sigmoid of the logits in fp32, the bias added for the choice only, top-k, the bias-free weights
+            # renormalized to sum to one) in place of the ~10 kernels sigmoid_routing launches. Opt-in until it is
+            # checked against sigmoid_routing (rollout_eff/kernels: the engine's log-probs and R3 against the unpatched
+            # engine on real RL sequences).
+            self.topk = TopK(
+                top_k=config.num_experts_per_tok,
+                renormalize=True,
+                use_grouped_topk=False,
+                layer_id=layer_id,
+                scoring_func="sigmoid",
+                correction_bias=self.gate.expert_bias,
+            )
+        else:
+            self.topk = TopK(
+                top_k=config.num_experts_per_tok,
+                renormalize=False,  # the routing function renormalizes
+                use_grouped_topk=False,
+                layer_id=layer_id,
+                custom_routing_function=sigmoid_routing,
+            )
 
         # The routed experts return a partial sum over tensor-parallel ranks, which the layer's FFN boundary
         # completes; the shared expert's output joins that sum unreduced.
