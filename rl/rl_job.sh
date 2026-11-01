@@ -17,9 +17,11 @@
 #   run20     20 colocated RL steps, the actor saved at the end
 # train67 modes (Frontier-CS v1.1's 67 training problems, data/fcs11_train67_agent.jsonl, pre-shuffled with a fixed seed
 # by rl/train67_data.py): P problems per step x G episodes each, one GRPO group per problem, one TP8 engine; usage
-# rl_job.sh train67[_test|_smoke] [P G [STEPS]] [set=NAME] [seed=N] (defaults 4 8, train67 40 steps; set=NAME trains on
-# the problems of data/train67_sets/NAME.txt only, default all 67, the run dirs then hold _NAME; seed=N, default 67: a
-# replicate's data order and RL seeds (T67_SEED below), the run dirs then hold _s<N> after the set name):
+# rl_job.sh train67[_test|_smoke] [P G [STEPS]] [set=NAME] [seed=N] [levers=LIST] (defaults 4 8, train67 40 steps;
+# set=NAME trains on the problems of data/train67_sets/NAME.txt only, default all 67, the run dirs then hold _NAME;
+# seed=N, default 67: a replicate's data order and RL seeds (T67_SEED below), the run dirs then hold _s<N> after the set
+# name; levers=LIST, default none: engine levers, a comma list of tp4 gate graphs arfusion pgraph (rl/rl_inner.sh), the
+# run dirs then hold _k<levers, sorted, joined by ->):
 #   train67_smoke  B = P x G episodes of 4k tokens, 2 steps, no save (~1 h)
 #   train67_test   B episodes of 128k, 2 steps, a full checkpoint after each (host memory at its peak: the end of the
 #                  optimizer step and the save; step time), resumable in runs/train67_test[_NAME]_p<P>g<G>, exit 0
@@ -36,11 +38,12 @@ MODE=${1:-}
 # stop comes 105 min before the end, at 4.25 h); train67_smoke: wq --time 1:45:00
 case "$MODE" in smoke|smoke_tp4|smoke_tp8) LIMIT=4800;; train67_smoke) LIMIT=6000;; base_tp8) LIMIT=8400;; test2) LIMIT=9600;;
   run20|train67) LIMIT=81000;; train67_test) LIMIT=21600;;
-  *) echo "usage: rl_job.sh smoke[_tp4|_tp8]|base_tp8|test2|run20|train67[_test|_smoke] [P G [STEPS]] [set=NAME] [seed=N]"; exit 1;; esac
-# train67: set=NAME and seed=N at any place after the mode; the other arguments are P G STEPS in this order
-T67_SET= T67_SEED= SEED_GIVEN= POS=()
+  *) echo "usage: rl_job.sh smoke[_tp4|_tp8]|base_tp8|test2|run20|train67[_test|_smoke] [P G [STEPS]] [set=NAME] [seed=N] [levers=LIST]"; exit 1;; esac
+# train67: set=NAME, seed=N and levers=LIST at any place after the mode; the other arguments are P G STEPS in this order
+T67_SET= T67_SEED= SEED_GIVEN= T67_LEVERS= LEVERS_GIVEN= POS=()
 for x in "${@:2}"; do
-  case "$x" in set=*) T67_SET=${x#set=};; seed=*) T67_SEED=${x#seed=} SEED_GIVEN=1;; *) POS+=("$x");; esac
+  case "$x" in set=*) T67_SET=${x#set=};; seed=*) T67_SEED=${x#seed=} SEED_GIVEN=1;;
+    levers=*) T67_LEVERS=${x#levers=} LEVERS_GIVEN=1;; *) POS+=("$x");; esac
 done
 T67_P=${POS[0]:-4} T67_G=${POS[1]:-8} T67_STEPS=${POS[2]:-40}
 case "$MODE" in train67*) [[ $T67_P =~ ^[1-9][0-9]*$ && $T67_G =~ ^[1-9][0-9]*$ && $T67_STEPS =~ ^[1-9][0-9]*$ ]] \
@@ -49,8 +52,15 @@ case "$MODE" in train67*) [[ $T67_P =~ ^[1-9][0-9]*$ && $T67_G =~ ^[1-9][0-9]*$ 
   [ -z "$T67_SET" ] || [[ $T67_SET =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || { echo "set=NAME: letters, digits, _ and -: $T67_SET"; exit 1; }
   [ -z "$SEED_GIVEN" ] || { [[ $T67_SEED =~ ^[1-9][0-9]{0,3}$ ]] && [ "$T67_SEED" -ge 67 ]; } \
     || { echo "seed=N: an integer from 67 (the default run) to 9999: $T67_SEED"; exit 1; }
+  if [ -n "$LEVERS_GIVEN" ]; then
+    [[ $T67_LEVERS =~ ^[a-z0-9]+(,[a-z0-9]+)*$ ]] || { echo "levers=LIST: a comma list of tp4 gate graphs arfusion pgraph: $T67_LEVERS"; exit 1; }
+    for l in ${T67_LEVERS//,/ }; do
+      case "$l" in tp4|gate|graphs|arfusion|pgraph) ;; *) echo "levers=LIST: unknown lever $l (tp4 gate graphs arfusion pgraph)"; exit 1;; esac
+    done
+    T67_LEVERS=$(tr , '\n' <<< "$T67_LEVERS" | sort -u | paste -sd, -)
+  fi
   ;;
-  *) [ -z "$T67_SET$SEED_GIVEN" ] || { echo "set=NAME and seed=N are for the train67 modes only, not $MODE"; exit 1; };; esac
+  *) [ -z "$T67_SET$SEED_GIVEN$LEVERS_GIVEN" ] || { echo "set=NAME, seed=N and levers=LIST are for the train67 modes only, not $MODE"; exit 1; };; esac
 # seed=N (default 67: the run as before, byte for byte): the data order (rl/train67_data.py: epoch e is the permutation
 # of random.Random(N + e)) and miles' seeds (rl/rl_inner.sh: --seed 1 + 100 (N - 67), the actor's torch seed and the
 # SGLang engines' base seed, engine i serving with seed + i; --rollout-seed 42 + 100 (N - 67)): 100 apart, so no two
@@ -69,11 +79,13 @@ OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/$JID
 # all 67 problems, nor the reverse; a seed-N replicate never resumes the seed-67 run)
 T67_TAG=${T67_SET:+_$T67_SET}
 [ "$T67_SEED" = 67 ] || T67_TAG=${T67_TAG}_s$T67_SEED
+# levers=LIST: another engine, so its own run dir (a run never resumes on another engine setup)
+[ -z "$T67_LEVERS" ] || T67_TAG=${T67_TAG}_k${T67_LEVERS//,/-}
 [ "$MODE" = train67 ] && OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/train67${T67_TAG}_p${T67_P}g${T67_G}
 [ "$MODE" = train67_test ] && OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/train67_test${T67_TAG}_p${T67_P}g${T67_G}
 RESUMABLE=; case "$MODE" in run20|train67|train67_test) RESUMABLE=1;; esac
 # tests/test_train67_seed.py: the parsed arguments and the run dir only, nothing made or started
-[ -z "${RL_JOB_PRINT_ONLY:-}" ] || { echo "MODE=$MODE P=$T67_P G=$T67_G STEPS=$T67_STEPS SET=$T67_SET SEED=$T67_SEED OUT=$OUT"; exit 0; }
+[ -z "${RL_JOB_PRINT_ONLY:-}" ] || { echo "MODE=$MODE P=$T67_P G=$T67_G STEPS=$T67_STEPS SET=$T67_SET SEED=$T67_SEED OUT=$OUT${T67_LEVERS:+ LEVERS=$T67_LEVERS}"; exit 0; }
 # the planned time stop: one step and a save must fit after it (run20: 43 min a step; train67 at B = 32: up to the
 # 60-min wall cap, ~4 x run20's 4-min train time, sync and save, ~85 min)
 STOP_S=4500; case "$MODE" in train67*) STOP_S=6300;; esac
@@ -169,7 +181,7 @@ start timeout -k 300 "$LIMIT" apptainer exec --pid --nv --contain --cleanenv --w
   --bind /scratch/gpfs/GROUP --bind "$TMPDIR/tmp":/tmp --bind "$TMPDIR/datasets":/root/datasets --bind /proc:/host/proc \
   --bind /dev/shm --env PYTHONNOUSERSITE=1 --env PYTHONDONTWRITEBYTECODE=1 --env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" \
   --env JID="$JID" --env OUT="$OUT" --env PKG="$PKG" --env TMPDIR="$TMPDIR" --env T67_P="$T67_P" --env T67_G="$T67_G" \
-  --env T67_STEPS="$T67_STEPS" --env T67_SEED="$T67_SEED" "$SIF" bash "$REPO/rl/rl_inner.sh" "$MODE"
+  --env T67_STEPS="$T67_STEPS" --env T67_SEED="$T67_SEED" --env T67_LEVERS="$T67_LEVERS" "$SIF" bash "$REPO/rl/rl_inner.sh" "$MODE"
 wait "${STARTED[0]}"
 rc=$?
 echo "[s5] $(date -u +%FT%TZ) container exit $rc"
