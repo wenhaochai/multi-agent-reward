@@ -74,6 +74,10 @@ if os.environ.get("T67"):   # train67 (rl/rl_inner.sh args): P problems x G epis
     # 3,461,035 at TP8 there, so colocated ~2,531,000 (the TP8 log's 3,163,753 scaled by that ratio; an estimate)
     pool = {8: 3163753, 4: 2531000}[tp]
     per_engine = P * G * tp // 8
+    # elastic=1 (T67_ELASTIC): the colocated run plus engine jobs as extra cells (flint.engine_registry), a longer push
+    if os.environ.get("T67_ELASTIC"):
+        want |= {"extra_inference_engine_provider_path": "flint.engine_registry.provider", "update_weights_timeout": 900,
+                 "rollout_external": False, "colocate": True}
     want["kv_fits"] = True
     a.kv_fits = per_engine * 60000 <= 0.9 * pool
     print(f"train67 {mode}: B = {P * G} episodes, {8 // tp} x TP{tp}, KV {per_engine * 60000:,} of {pool:,} tokens per "
@@ -84,6 +88,6 @@ print("parsed:", {k: getattr(a, k, None) for k in ("num_rollout", "rollout_num_g
                                                    "max_tokens_per_gpu", "train_env_vars", "save", "colocate",
                                                    "rollout_batch_size", "n_samples_per_prompt", "global_batch_size",
                                                    "seed", "rollout_seed", "rollout_external_engine_addrs",
-                                                   "update_weight_transfer_mode")})
+                                                   "update_weight_transfer_mode", "extra_inference_engine_provider_path")})
 print("ARGS_FAIL", bad) if bad else print("ARGS_OK", len(want), "settings")
 sys.exit(1 if bad else 0)
