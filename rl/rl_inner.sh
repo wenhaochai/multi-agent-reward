@@ -154,6 +154,27 @@ if [ -n "${T67_ELASTIC:-}" ]; then
   export MA_ENGINE_REGISTRY=$OUT NCCL_SOCKET_IFNAME=eno8303 MASTER_ADDR=$IP no_proxy=127.0.0.1,localhost,$IP MA_AG_RETRY_S=600
   ELASTIC=(--extra-inference-engine-provider-path flint.engine_registry.provider --update-weights-timeout 900)
 fi
+# async=1 (rl/rl_job.sh -> T67_ASYNC, T67_STALE): fully async RL on a split node. miles' async with an FSDP actor needs
+# the engines on GPUs of their own (train_async.py refuses --colocate unless --fully-async, and --fully-async --colocate
+# refuses FSDP), so the actor trains on 4 GPUs (FSDP with CPU offload, as before) and the run's own engine serves 1 x TP4
+# on the other 4 (mem 0.85: the GPUs are its own); with elastic=1 every engine job adds 2 x TP4. The producer
+# (flint.elastic_rollout) keeps MA_ASYNC_SAMPLES_PER_ENGINE (16) episodes per routed engine in flight; each step trains on
+# the first P finished groups; a weight push pauses running requests in place and resumes them on the new weights, so an
+# episode's tokens may come from several weight versions: score centering weights each token by TIS (pi_train /
+# mu_rollout, clipped at 2) instead of none, and --max-weight-staleness T67_STALE (when set) drops a group whose oldest
+# token is more than that many steps old. The engines keep the colocated runs' all-reduce (custom v2 off; miles turns
+# it on for engines that are not colocated), so the async engines serve with production's numerics.
+ASYNC=()
+if [ -n "${T67_ASYNC:-}" ]; then
+  [[ $MODE == train67 || $MODE == train67_test ]] || { echo "[s5] async=1 is for train67 and train67_test"; exit 1; }
+  export MA_RL_ASYNC=1 MA_ASYNC_SAMPLES_PER_ENGINE=${MA_ASYNC_SAMPLES_PER_ENGINE:-16} SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0
+  ENGINE_TP=4 T67_TP=4
+  SERVE[1]=4 SERVE[3]=4
+  ASYNC=(--actor-num-gpus-per-node 4 --sglang-mem-fraction-static 0.85 --fully-async
+    --rollout-function-path flint.elastic_rollout.ElasticFullyAsyncRolloutFn --score-centering-is tis)
+  [ -z "${T67_STALE:-}" ] || ASYNC+=(--max-weight-staleness "$T67_STALE")
+  echo "[s5] async: actor 4 GPUs, own engine 1 x TP4, $MA_ASYNC_SAMPLES_PER_ENGINE episodes per engine in flight, TIS, staleness bound ${T67_STALE:-none}"
+fi
 write_engine_spec() {   # write_engine_spec FILE ARGV...: the spec rl/elastic_engine.sh serves (rl/elastic_engine_argv.py)
   python3 - "$1" "$ENGINE_TP" "$REPO" "$MILES" "$FLINT" "${@:2}" <<'PY'
 import json, os, subprocess, sys
@@ -211,6 +232,7 @@ for x in "${GAME[@]}"; do
 done
 T67_RUN=(--colocate --save "$OUT/actor" --load "$OUT/actor" --save-interval 2 --save-trigger-sentinel "$OUT/save_now")
 T67_TEST=(--colocate --save "$OUT/actor" --load "$OUT/actor" --save-interval 1 --save-trigger-sentinel "$OUT/save_now")
+[ ${#ASYNC[@]} -eq 0 ] || { T67_RUN=("${T67_RUN[@]:1}"); T67_TEST=("${T67_TEST[@]:1}"); }   # async: not colocated
 
 MEMPROBE=(--prompt-data "$OUT/data_p0.jsonl" --input-key prompt --label-key label --metadata-key metadata --num-rollout 2
   --load-debug-rollout-data "$MEMPROBE_DATA/rollout_{rollout_id}.pt" --rollout-temperature 1.0 --rollout-top-p 0.95
@@ -241,6 +263,15 @@ if [ "$MODE" = args ]; then   # off-GPU: miles parses and checks each mode's arg
   ENGINE_TP=$T67_TP write_engine_spec "$OUT/engine_spec.json" "${TRAIN[@]}" "${TRAIN67[@]}" "${SERVE8[@]}" "${GAME67[@]}" \
     "${T67_RUN[@]}" --num-rollout 40 --extra-inference-engine-provider-path flint.engine_registry.provider --update-weights-timeout 900 || exit 1
   python3 "$REPO/rl/elastic_engine_argv.py" "$OUT/engine_spec.json" 172.17.0.1 20040 20000 10 || exit 1
+  echo "== train67 async (split node, fully async) with elastic engines; an engine job's argv from its spec"
+  SERVE4=("${SERVE[@]}"); SERVE4[1]=4; SERVE4[3]=4
+  ASYNC_ARGS=(--actor-num-gpus-per-node 4 --sglang-mem-fraction-static 0.85 --fully-async
+    --rollout-function-path flint.elastic_rollout.ElasticFullyAsyncRolloutFn --score-centering-is tis --max-weight-staleness 4)
+  A=("${TRAIN[@]}" "${TRAIN67[@]}" "${SERVE4[@]}" "${GAME67[@]}" "${T67_RUN[@]:1}" --num-rollout 40 "${ASYNC_ARGS[@]}"
+    --extra-inference-engine-provider-path flint.engine_registry.provider --update-weights-timeout 900)
+  T67_MODE=train67 T67_ASYNC=1 T67_ELASTIC=1 python3 "$REPO/rl/args_check.py" "${A[@]}" || exit 1
+  SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0 ENGINE_TP=4 write_engine_spec "$OUT/engine_spec.json" "${A[@]}" || exit 1
+  python3 "$REPO/rl/elastic_engine_argv.py" "$OUT/engine_spec.json" 172.17.0.1 20040 20000 10 || exit 1
   echo "== train67 schedule (B=$T67_B)"
   python3 "$REPO/rl/schedule_check.py" "$MEMPROBE_DATA/rollout_0.pt" --episodes "$T67_B" --group "$T67_G" \
     "${TRAIN[@]}" "${TRAIN67[@]}" "${MEMPROBE[@]}"
@@ -260,7 +291,9 @@ trap 'ray stop --force >/dev/null 2>&1' EXIT   # this PID namespace's Ray only
 # train.py in the background; once the engines serve (the first rollout request), the served-weights probe runs once
 # on the initial weights (flint.miles_agent.startup_probe): if it fails, train.py is stopped, minutes into the run
 train() {
-  if [ ${#ELASTIC[@]} -gt 0 ]; then   # what the engine jobs serve: this argv, and the colocated engines' serving environment
+  local driver=train.py
+  [ ${#ASYNC[@]} -eq 0 ] || { set -- "$@" "${ASYNC[@]}"; driver=train_async.py; }
+  if [ ${#ELASTIC[@]} -gt 0 ]; then   # what the engine jobs serve: this argv, and the run's own engines' serving environment
     set -- "$@" "${ELASTIC[@]}"
     write_engine_spec "$OUT/engine_spec.json" "$@" || return 1
   fi
@@ -268,7 +301,7 @@ train() {
   local from=$(( $(wc -l < "$OUT/train.log") + 1 ))   # this segment's lines (run20 appends one segment after another)
   tail -n +"$from" -F "$OUT/train.log" > "$OUT/train_segment.log" 2>/dev/null &
   local tl=$!
-  python3 "$MILES/train.py" "$@" >> "$OUT/train.log" 2>&1 &
+  python3 "$MILES/$driver" "$@" >> "$OUT/train.log" 2>&1 &
   local tp=$!
   (
     until grep -q 'POST /v1/chat/completions' "$OUT/train_segment.log" 2>/dev/null; do kill -0 $tp 2>/dev/null || exit; sleep 15; done

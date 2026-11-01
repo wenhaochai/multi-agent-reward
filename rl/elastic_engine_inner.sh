@@ -20,7 +20,7 @@ argv_line=$(grep '^ARGV ' <<< "$out" | cut -d' ' -f2-)
 [ -n "$argv_line" ] || { echo "[engine] no argv: $out"; exit 1; }
 for kv in $env_line; do export "$kv"; done   # miles' engine environment of the colocated run, then the spec's
 echo "[engine] env: $env_line"
-echo "[engine] differs from the run's colocated engine in: $(grep '^DIFF ' <<< "$out" | cut -d' ' -f2-)"
+echo "[engine] differs from the run's own engine in: $(grep '^DIFF ' <<< "$out" | cut -d' ' -f2-)"
 echo "[engine] $(date -u +%FT%TZ) launch: $argv_line"
 [ "${1:-serve}" = argv ] && exit 0
 eval "exec $argv_line"

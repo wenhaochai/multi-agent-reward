@@ -25,6 +25,14 @@ if getattr(a, "rollout_external", False):   # engines in other jobs (rl/rl_inner
              "no_save_optim": False, "save_interval": 2, "load": a.save}
     if not (a.rollout_external_engine_addrs and all(not x.startswith(("127.", "localhost")) for x in a.rollout_external_engine_addrs)):
         want["rollout_external_engine_addrs"] = "routable host:port of every engine"
+elif a.load_debug_rollout_data is None and os.environ.get("T67_ASYNC"):   # train67 async=1: split node, fully async
+    want |= {"colocate": False, "offload_train": False, "offload_rollout": False, "fully_async": True,
+             "rollout_function_path": "flint.elastic_rollout.ElasticFullyAsyncRolloutFn", "score_centering_is": "tis",
+             "actor_num_gpus_per_node": 4, "rollout_num_gpus": 4, "sglang_mem_fraction_static": 0.85,
+             "use_session_server": "v2", "tito_model": "flint", "pause_generation_mode": "in_place",
+             "namespaced_radix_cache": True, "max_tokens_per_gpu": 65536, "rollout_max_response_len": 16384,
+             "custom_rollout_log_function_path": "flint.miles_agent.log_rollout",
+             "rollout_sample_filter_path": "flint.miles_agent.drop_failed_groups"}
 elif a.load_debug_rollout_data is None:   # the colocated RL run
     want |= {"colocate": True, "offload_train": True, "offload_rollout": True, "rollout_num_gpus_per_engine": 2,
              "use_session_server": "v2", "tito_model": "flint", "pause_generation_mode": "in_place",
@@ -44,7 +52,7 @@ if os.environ.get("T67"):   # train67 (rl/rl_inner.sh args): P problems x G epis
     # engine levers (rl/rl_job.sh levers=LIST -> T67_LEVERS): tp4 = 2 x TP4 engines; the flags of graphs, arfusion and
     # pgraph reach SGLang through miles' --sglang-* arguments (gate is an environment variable, not in the argv)
     levers = [x for x in os.environ.get("T67_LEVERS", "").split(",") if x]
-    tp = 4 if "tp4" in levers else 8
+    tp = 4 if "tp4" in levers or os.environ.get("T67_ASYNC") else 8   # async=1: the own engine is 1 x TP4
     if "graphs" in levers:
         want["sglang_cuda_graph_bs_decode"] = list(range(1, 33)) + list(range(40, 257, 8)) + list(range(272, 513, 16))
     if "arfusion" in levers:
@@ -74,10 +82,15 @@ if os.environ.get("T67"):   # train67 (rl/rl_inner.sh args): P problems x G epis
     # 3,461,035 at TP8 there, so colocated ~2,531,000 (the TP8 log's 3,163,753 scaled by that ratio; an estimate)
     pool = {8: 3163753, 4: 2531000}[tp]
     per_engine = P * G * tp // 8
+    if os.environ.get("T67_ASYNC"):   # each engine holds MA_ASYNC_SAMPLES_PER_ENGINE sessions; TP4 at mem 0.85 standalone:
+        # 2,769,185 tokens at 0.72 (w768) scaled by the KV share, (0.85 - w) / (0.72 - w) with ~0.25 of the GPU in
+        # weights (an estimate, checked against the engine log in the first run)
+        pool = int(2769185 * (0.85 - 0.25) / (0.72 - 0.25))
+        per_engine = int(os.environ.get("MA_ASYNC_SAMPLES_PER_ENGINE", "16"))
     # elastic=1 (T67_ELASTIC): the colocated run plus engine jobs as extra cells (flint.engine_registry), a longer push
     if os.environ.get("T67_ELASTIC"):
         want |= {"extra_inference_engine_provider_path": "flint.engine_registry.provider", "update_weights_timeout": 900,
-                 "rollout_external": False, "colocate": True}
+                 "rollout_external": False, "colocate": not os.environ.get("T67_ASYNC")}
     want["kv_fits"] = True
     a.kv_fits = per_engine * 60000 <= 0.9 * pool
     print(f"train67 {mode}: B = {P * G} episodes, {8 // tp} x TP{tp}, KV {per_engine * 60000:,} of {pool:,} tokens per "
