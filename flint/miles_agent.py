@@ -482,10 +482,14 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
             "wall_exceeded": sum(e["exit"] == "WallExceeded" for e in eps),
             "wall_exceeded_S": [e["S"] for e in eps if e["exit"] == "WallExceeded"]}
 
-    # the job's memory now and its peak so far (rl/rl_job.sh samples its cgroup every 10 s into host_mem.txt)
-    mem = [int(x.split()[-1]) for x in open(os.path.join(out, "host_mem.txt")) if len(x.split()) == 3] \
+    # the job's memory now and its peak so far (rl/rl_job.sh samples its cgroup every 10 s into host_mem.txt: time,
+    # node used MiB, cgroup MiB and, since 2026-11-01, the cgroup's non-reclaimable MiB, the part its guard reads)
+    rows = [x.split() for x in open(os.path.join(out, "host_mem.txt"))] \
         if os.path.exists(os.path.join(out, "host_mem.txt")) else []
-    rec |= {"job_mem_gb": round(mem[-1] / 1024, 1) if mem else None, "job_mem_peak_gb": round(max(mem) / 1024, 1) if mem else None}
+    mem = [int(r[2]) for r in rows if len(r) in (3, 4)]
+    nonrec = [int(r[3]) for r in rows if len(r) == 4]
+    rec |= {"job_mem_gb": round(mem[-1] / 1024, 1) if mem else None, "job_mem_peak_gb": round(max(mem) / 1024, 1) if mem else None,
+            "job_nonrec_peak_gb": round(max(nonrec) / 1024, 1) if nonrec else None}
 
     if P:   # in this process, on the samples miles holds anyway; failed episodes are the stop rule's to judge
         summary, problems, lines = _inspect(d, samples)
