@@ -143,6 +143,9 @@ class FlintSparseMoeBlock(Qwen3MoeSparseMoeBlock):
             return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
         if os.environ.get("FLINT_FUSED_SIGMOID_GATE") == "1":
+            if not getattr(FlintSparseMoeBlock, "_fused_gate_logged", False):   # once per process: proof it is on
+                FlintSparseMoeBlock._fused_gate_logged = True
+                logger.info("FLINT_FUSED_SIGMOID_GATE=1: the fused sigmoid router routes every MoE layer")
             # The same routing in one launch: SGLang's fused sigmoid router (moe_fused_gate, one Triton kernel: the
             # sigmoid of the logits in fp32, the bias added for the choice only, top-k, the bias-free weights
             # renormalized to sum to one) in place of the ~10 kernels sigmoid_routing launches. Opt-in until it is
