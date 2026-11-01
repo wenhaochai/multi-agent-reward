@@ -23,7 +23,10 @@
 # name; levers=LIST, default none: engine levers, a comma list of tp4 gate graphs arfusion pgraph moecfg (rl/rl_inner.sh), the
 # run dirs then hold _k<levers, sorted, joined by ->; cmdtimeout=N, default 60: the game's per-command time limit in
 # seconds (MA_AG_TIMEOUT, flint/sandbox.py; a rule of the game, owner 2026-11-01: A/B before any adoption), the run dirs
-# then hold _t<N>):
+# then hold _t<N>; elastic=1: anchored elastic RL (tmp/elastic_rl/anchored.md): the run keeps its colocated engines
+# and adds every engine job (rl/elastic_engine.sh RUN, any number, joining and leaving at any time) as an extra cell
+# from its next weight push on; the trainer writes RUN/trainer.json every 30 s and RUN/engine_spec.json (what the
+# engine jobs serve), and RUN/STOP when the run ends for good; the run dirs then hold _e):
 #   train67_smoke  B = P x G episodes of 4k tokens, 2 steps, no save (~1 h)
 #   train67_test   B episodes of 128k, 2 steps, a full checkpoint after each (host memory at its peak: the end of the
 #                  optimizer step and the save; step time), resumable in runs/train67_test[_NAME]_p<P>g<G>, exit 0
@@ -43,10 +46,11 @@ case "$MODE" in smoke|smoke_tp4|smoke_tp8) LIMIT=4800;; train67_smoke) LIMIT=600
   *) echo "usage: rl_job.sh smoke[_tp4|_tp8]|base_tp8|test2|run20|train67[_test|_smoke] [P G [STEPS]] [set=NAME] [seed=N] [levers=LIST] [cmdtimeout=N]"; exit 1;; esac
 # train67: set=NAME, seed=N, levers=LIST and cmdtimeout=N at any place after the mode; the other arguments are P G STEPS in
 # this order
-T67_SET= T67_SEED= SEED_GIVEN= T67_LEVERS= LEVERS_GIVEN= T67_CMD_TIMEOUT= CMDT_GIVEN= POS=()
+T67_SET= T67_SEED= SEED_GIVEN= T67_LEVERS= LEVERS_GIVEN= T67_CMD_TIMEOUT= CMDT_GIVEN= T67_ELASTIC= ELASTIC_GIVEN= POS=()
 for x in "${@:2}"; do
   case "$x" in set=*) T67_SET=${x#set=};; seed=*) T67_SEED=${x#seed=} SEED_GIVEN=1;;
     levers=*) T67_LEVERS=${x#levers=} LEVERS_GIVEN=1;; cmdtimeout=*) T67_CMD_TIMEOUT=${x#cmdtimeout=} CMDT_GIVEN=1;;
+    elastic=*) T67_ELASTIC=${x#elastic=} ELASTIC_GIVEN=1;;
     *) POS+=("$x");; esac
 done
 T67_P=${POS[0]:-4} T67_G=${POS[1]:-8} T67_STEPS=${POS[2]:-40}
@@ -65,8 +69,9 @@ case "$MODE" in train67*) [[ $T67_P =~ ^[1-9][0-9]*$ && $T67_G =~ ^[1-9][0-9]*$ 
   fi
   [ -z "$CMDT_GIVEN" ] || { [[ $T67_CMD_TIMEOUT =~ ^[1-9][0-9]{0,2}$ ]] && [ "$T67_CMD_TIMEOUT" -ge 5 ] && [ "$T67_CMD_TIMEOUT" -le 600 ]; } \
     || { echo "cmdtimeout=N: seconds per command, 5 to 600 (default 60): $T67_CMD_TIMEOUT"; exit 1; }
+  [ -z "$ELASTIC_GIVEN" ] || [ "$T67_ELASTIC" = 1 ] || { echo "elastic=1 is the only value: $T67_ELASTIC"; exit 1; }
   ;;
-  *) [ -z "$T67_SET$SEED_GIVEN$LEVERS_GIVEN$CMDT_GIVEN" ] || { echo "set=NAME, seed=N, levers=LIST and cmdtimeout=N are for the train67 modes only, not $MODE"; exit 1; };; esac
+  *) [ -z "$T67_SET$SEED_GIVEN$LEVERS_GIVEN$CMDT_GIVEN$ELASTIC_GIVEN" ] || { echo "set=NAME, seed=N, levers=LIST, cmdtimeout=N and elastic=1 are for the train67 modes only, not $MODE"; exit 1; };; esac
 T67_CMD_TIMEOUT=${T67_CMD_TIMEOUT:-60}
 # seed=N (default 67: the run as before, byte for byte): the data order (rl/train67_data.py: epoch e is the permutation
 # of random.Random(N + e)) and miles' seeds (rl/rl_inner.sh: --seed 1 + 100 (N - 67), the actor's torch seed and the
@@ -75,8 +80,8 @@ T67_CMD_TIMEOUT=${T67_CMD_TIMEOUT:-60}
 T67_SEED=${T67_SEED:-67}
 JID=${FETCHED_JOB_ID:-$SLURM_JOB_ID}
 [ -n "$JID" ] || { echo "no job id"; exit 1; }
-REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-train67c
-MILES=/scratch/gpfs/GROUP/USER/project/miles-rollout
+REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic2
+MILES=/scratch/gpfs/GROUP/USER/project/miles-elastic
 SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif
 FLINT=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint
 OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/$JID
@@ -90,25 +95,29 @@ T67_TAG=${T67_SET:+_$T67_SET}
 [ -z "$T67_LEVERS" ] || T67_TAG=${T67_TAG}_k${T67_LEVERS//,/-}
 # cmdtimeout=N other than 60: another game, so its own run dir too
 [ "$T67_CMD_TIMEOUT" = 60 ] || T67_TAG=${T67_TAG}_t$T67_CMD_TIMEOUT
+# elastic=1: engines in other jobs join, so its own run dir too
+[ -z "$T67_ELASTIC" ] || T67_TAG=${T67_TAG}_e
 [ "$MODE" = train67 ] && OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/train67${T67_TAG}_p${T67_P}g${T67_G}
 [ "$MODE" = train67_test ] && OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/train67_test${T67_TAG}_p${T67_P}g${T67_G}
 RESUMABLE=; case "$MODE" in run20|train67|train67_test) RESUMABLE=1;; esac
 # tests/test_train67_seed.py: the parsed arguments and the run dir only, nothing made or started
-[ -z "${RL_JOB_PRINT_ONLY:-}" ] || { echo "MODE=$MODE P=$T67_P G=$T67_G STEPS=$T67_STEPS SET=$T67_SET SEED=$T67_SEED OUT=$OUT${T67_LEVERS:+ LEVERS=$T67_LEVERS}$([ "$T67_CMD_TIMEOUT" = 60 ] || echo " CMDTIMEOUT=$T67_CMD_TIMEOUT")"; exit 0; }
+[ -z "${RL_JOB_PRINT_ONLY:-}" ] || { echo "MODE=$MODE P=$T67_P G=$T67_G STEPS=$T67_STEPS SET=$T67_SET SEED=$T67_SEED OUT=$OUT${T67_LEVERS:+ LEVERS=$T67_LEVERS}$([ "$T67_CMD_TIMEOUT" = 60 ] || echo " CMDTIMEOUT=$T67_CMD_TIMEOUT")${T67_ELASTIC:+ ELASTIC=1}"; exit 0; }
 # the planned time stop: one step and a save must fit after it (run20: 43 min a step; train67 at B = 32: up to the
 # 60-min wall cap, ~4 x run20's 4-min train time, sync and save, ~85 min)
 STOP_S=4500; case "$MODE" in train67*) STOP_S=6300;; esac
 export TMPDIR=/scratch/gpfs/GROUP/USER/tmp/job/$JID
 mkdir -p "$OUT" "$TMPDIR/tmp" "$TMPDIR/datasets"
 rm -f "$OUT/exit_code" "$OUT/stop_request" "$OUT/save_now" "$OUT/train_segment.log"   # this segment's stop state (run20 resumes in the same directory)
+# elastic=1: the trainer owns the run directory; a STOP from an earlier end of the run is void once it runs again
+[ -n "$T67_ELASTIC" ] && rm -f "$OUT/STOP" "$OUT/engine_spec.json"
 FRESH=; [ -e "$OUT/actor/latest_checkpointed_iteration.txt" ] || FRESH=1
 # an interrupted segment's episode traces belong to no rollout of this one
 [ -d "$OUT/traces_live" ] && mv "$OUT/traces_live" "$OUT/traces_live.stale_$(date +%s)"
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 source "$REPO/serving/check/procs.sh"
 source "$REPO/rl/gpu_watch.sh"
-WD= MEM= SMI=
-trap 'stop "${STARTED[@]}"; kill $WD $MEM $SMI 2>/dev/null; rm -rf -- "/scratch/gpfs/GROUP/USER/tmp/job/$JID"' EXIT
+WD= MEM= SMI= HB=
+trap 'stop "${STARTED[@]}"; kill $WD $MEM $SMI $HB 2>/dev/null; rm -rf -- "/scratch/gpfs/GROUP/USER/tmp/job/$JID"' EXIT
 trap 'exit "$(cat "$OUT/exit_code" 2>/dev/null || echo 143)"' TERM INT   # a planned stop leaves its exit code there
 echo "[s5] $(date -u +%FT%TZ) $MODE node=$(hostname) job=$JID gpus=${CUDA_VISIBLE_DEVICES:-}"
 # this segment's end: Slurm's (or a fetching host's) SLURM_JOB_END_TIME, else the time limit of the parent timeout (a
@@ -196,14 +205,30 @@ TRACKER=$OUT/actor/latest_checkpointed_iteration.txt
 MEM=$!
 nvidia-smi -i "$CUDA_VISIBLE_DEVICES" --query-gpu=timestamp,index,memory.used --format=csv,noheader,nounits -l 2 > "$OUT/gpu_mem.csv" 2>/dev/null &
 SMI=$!
+# elastic=1: the node's routable address (miles' weight push to engines in other jobs: Ray, the NCCL master), and the
+# trainer's heartbeat for those jobs (rl/registry.py trainer-beat, every 30 s while this job runs)
+IP=127.0.0.1
+if [ -n "$T67_ELASTIC" ]; then
+  IP=$(ip -4 -o addr show eno8303 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+  [ -n "$IP" ] || IP=$(hostname -i | tr ' ' '\n' | grep -E '^172\.' | head -1)
+  [ -n "$IP" ] || { echo "[s5] elastic: no routable address (eno8303)"; exit 1; }
+  ( T0=$(date +%s); while true; do timeout 60 python3 "$REPO/rl/registry.py" trainer-beat "$OUT" "$JID" "$(hostname)" "$IP" "$T0"; sleep 30; done ) &
+  HB=$!
+  echo "[s5] elastic: trainer at $IP; engine jobs: wq submit --partial $REPO/rl/elastic_engine.sh $OUT"
+fi
 start timeout -k 300 "$LIMIT" apptainer exec --pid --nv --contain --cleanenv --writable-tmpfs \
   --bind /scratch/gpfs/GROUP --bind "$TMPDIR/tmp":/tmp --bind "$TMPDIR/datasets":/root/datasets --bind /proc:/host/proc \
   --bind /dev/shm --env PYTHONNOUSERSITE=1 --env PYTHONDONTWRITEBYTECODE=1 --env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" \
   --env JID="$JID" --env OUT="$OUT" --env PKG="$PKG" --env TMPDIR="$TMPDIR" --env T67_P="$T67_P" --env T67_G="$T67_G" \
-  --env T67_STEPS="$T67_STEPS" --env T67_SEED="$T67_SEED" --env T67_LEVERS="$T67_LEVERS" --env T67_CMD_TIMEOUT="$T67_CMD_TIMEOUT" "$SIF" bash "$REPO/rl/rl_inner.sh" "$MODE"
+  --env T67_STEPS="$T67_STEPS" --env T67_SEED="$T67_SEED" --env T67_LEVERS="$T67_LEVERS" --env T67_CMD_TIMEOUT="$T67_CMD_TIMEOUT" \
+  --env T67_ELASTIC="$T67_ELASTIC" --env IP="$IP" "$SIF" bash "$REPO/rl/rl_inner.sh" "$MODE"
 wait "${STARTED[0]}"
 rc=$?
 echo "[s5] $(date -u +%FT%TZ) container exit $rc"
+# elastic=1: the engine jobs end (exit 0) when the run is over: done, or failed; a stop that wq requeues is not
+if [ -n "$T67_ELASTIC" ]; then
+  case $rc in 98|99|124|143) ;; *) echo "trainer $JID exit $rc ($(date -u +%FT%TZ))" > "$OUT/STOP";; esac
+fi
 python3 - "$OUT" <<'PY'
 import collections, sys
 out = sys.argv[1]

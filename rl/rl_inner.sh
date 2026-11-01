@@ -8,9 +8,9 @@
 set -uo pipefail
 : "${JID:?}" "${OUT:?}" "${PKG:?}" "${TMPDIR:?}"
 MODE=$1
-REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-train67c
+REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic2
 FLINT=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint
-MILES=/scratch/gpfs/GROUP/USER/project/miles-rollout
+MILES=/scratch/gpfs/GROUP/USER/project/miles-elastic
 MEMPROBE_DATA=/scratch/gpfs/GROUP/USER/tmp/flint_s5/memprobe_data   # a recorded batch for the schedule check
 export HOME=$TMPDIR/home TRITON_CACHE_DIR=$TMPDIR/triton TORCHINDUCTOR_CACHE_DIR=$TMPDIR/inductor
 export SGLANG_CACHE_DIR=$TMPDIR/sglang FLASHINFER_WORKSPACE_BASE=$TMPDIR/flashinfer
@@ -140,6 +140,33 @@ if [ -n "${T67_CMD_TIMEOUT:-}" ] && [ "$T67_CMD_TIMEOUT" != 60 ]; then
   export MA_AG_TIMEOUT=$T67_CMD_TIMEOUT
   echo "[s5] game: command time limit $MA_AG_TIMEOUT s (default 60)"
 fi
+# elastic=1 (rl/rl_job.sh -> T67_ELASTIC, IP: the node's eno8303 address): anchored elastic RL (tmp/elastic_rl/anchored.md).
+# The colocated engines stay; engine jobs that register in $OUT/engines (rl/elastic_engine.sh) join as extra cells
+# (flint.engine_registry, miles' --extra-inference-engine-provider-path, branch flint-grpo-elastic), each routed from the
+# next weight push on: IPC to the colocated engines, NCCL broadcast to the others in the same session. Ray and the
+# NCCL master bind the routable address; the push to another node gets 900 s. $OUT/engine_spec.json (below, at the
+# start) is what the engine jobs serve: this argv and the serving environment the colocated engines get.
+ELASTIC=()
+if [ -n "${T67_ELASTIC:-}" ]; then
+  : "${IP:?}"
+  [[ $MODE == train67* ]] || { echo "[s5] elastic=1 is for the train67 modes"; exit 1; }
+  # an agent's request whose engine left is retried for 10 min (flint/chat.py), past the run's withdrawal of the engine
+  export MA_ENGINE_REGISTRY=$OUT NCCL_SOCKET_IFNAME=eno8303 MASTER_ADDR=$IP no_proxy=127.0.0.1,localhost,$IP MA_AG_RETRY_S=600
+  ELASTIC=(--extra-inference-engine-provider-path flint.engine_registry.provider --update-weights-timeout 900)
+fi
+write_engine_spec() {   # write_engine_spec FILE ARGV...: the spec rl/elastic_engine.sh serves (rl/elastic_engine_argv.py)
+  python3 - "$1" "$ENGINE_TP" "$REPO" "$MILES" "$FLINT" "${@:2}" <<'PY'
+import json, os, subprocess, sys
+out, tp, repo, miles, flint, argv = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6:]
+# the serving variables (not this job's cache paths under TMPDIR: an engine job keeps its own)
+env = {k: v for k, v in os.environ.items() if k.startswith(("SGLANG_", "FLASHINFER_", "FLINT_")) and not v.startswith(os.environ["TMPDIR"])}
+head = lambda d: subprocess.run(["git", "-C", d, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+spec = {"tp": tp, "argv": argv, "env": env, "repo": repo, "miles": miles, "flint": flint,
+        "repo_commit": head(repo), "miles_commit": head(miles), "levers": os.environ.get("T67_LEVERS", "")}
+json.dump(spec, open(out + ".tmp", "w"), indent=1); os.replace(out + ".tmp", out)
+print(f"[s5] elastic: {out}: TP{tp}, env {sorted(env)}")
+PY
+}
 # the long game as a miles agent on problem 0 (flint/miles_agent.py), sampling as in the eval; the engines return each
 # token's routed experts, incremental rows per turn (pause mode in_place); an episode the judge could not score takes
 # its group out of the loss (drop_failed_groups) and fails the rollout's check (log_rollout), which ends the run
@@ -207,24 +234,36 @@ if [ "$MODE" = args ]; then   # off-GPU: miles parses and checks each mode's arg
     echo "== $m"
     T67_MODE=$m python3 "$REPO/rl/args_check.py" "${TRAIN[@]}" "${TRAIN67[@]}" "${SERVE8[@]}" "${GAME67[@]}" "${A[@]}" || exit 1
   done
+  echo "== train67 elastic"
+  T67_MODE=train67 T67_ELASTIC=1 python3 "$REPO/rl/args_check.py" "${TRAIN[@]}" "${TRAIN67[@]}" "${SERVE8[@]}" "${GAME67[@]}" \
+    "${T67_RUN[@]}" --num-rollout 40 --extra-inference-engine-provider-path flint.engine_registry.provider --update-weights-timeout 900 || exit 1
+  echo "== train67 elastic: an engine job's argv from the spec (rl/elastic_engine_argv.py, at a made-up address)"
+  ENGINE_TP=$T67_TP write_engine_spec "$OUT/engine_spec.json" "${TRAIN[@]}" "${TRAIN67[@]}" "${SERVE8[@]}" "${GAME67[@]}" \
+    "${T67_RUN[@]}" --num-rollout 40 --extra-inference-engine-provider-path flint.engine_registry.provider --update-weights-timeout 900 || exit 1
+  python3 "$REPO/rl/elastic_engine_argv.py" "$OUT/engine_spec.json" 172.17.0.1 20040 20000 10 || exit 1
   echo "== train67 schedule (B=$T67_B)"
   python3 "$REPO/rl/schedule_check.py" "$MEMPROBE_DATA/rollout_0.pt" --episodes "$T67_B" --group "$T67_G" \
     "${TRAIN[@]}" "${TRAIN67[@]}" "${MEMPROBE[@]}"
   exit
 fi
 
-echo "[s5] $(date -u +%FT%TZ) inner $MODE: $NG GPUs, ray port $P"
-ray start --head --node-ip-address 127.0.0.1 --num-gpus "$NG" --port=$P --dashboard-port=$((P + 1)) \
+RAY_IP=127.0.0.1; [ ${#ELASTIC[@]} -eq 0 ] || RAY_IP=$IP
+echo "[s5] $(date -u +%FT%TZ) inner $MODE: $NG GPUs, ray $RAY_IP:$P"
+ray start --head --node-ip-address "$RAY_IP" --num-gpus "$NG" --port=$P --dashboard-port=$((P + 1)) \
   --dashboard-agent-listen-port=$((P + 2)) --dashboard-agent-grpc-port=$((P + 3)) --metrics-export-port=$((P + 4)) \
   --ray-client-server-port=$((P + 5)) --runtime-env-agent-port=$((P + 6)) --node-manager-port=$((P + 7)) \
   --object-manager-port=$((P + 8)) --include-dashboard=false --disable-usage-stats --temp-dir=/tmp/ray >/dev/null \
   || { echo "[s5] ray start failed"; exit 1; }
-export RAY_ADDRESS=127.0.0.1:$P
+export RAY_ADDRESS=$RAY_IP:$P
 trap 'ray stop --force >/dev/null 2>&1' EXIT   # this PID namespace's Ray only
 
 # train.py in the background; once the engines serve (the first rollout request), the served-weights probe runs once
 # on the initial weights (flint.miles_agent.startup_probe): if it fails, train.py is stopped, minutes into the run
 train() {
+  if [ ${#ELASTIC[@]} -gt 0 ]; then   # what the engine jobs serve: this argv, and the colocated engines' serving environment
+    set -- "$@" "${ELASTIC[@]}"
+    write_engine_spec "$OUT/engine_spec.json" "$@" || return 1
+  fi
   if [ -n "${APPEND:-}" ]; then echo "=== segment $(date -u +%FT%TZ)" >> "$OUT/train.log"; else : > "$OUT/train.log"; fi
   local from=$(( $(wc -l < "$OUT/train.log") + 1 ))   # this segment's lines (run20 appends one segment after another)
   tail -n +"$from" -F "$OUT/train.log" > "$OUT/train_segment.log" 2>/dev/null &

@@ -271,6 +271,25 @@ def _probe(args, ids: list[int], messages: list) -> dict:
     return {"kind": "chat", "top": {x["token"]: x["logprob"] for x in top}, "generate_refused": refused}
 
 
+def _probe_engines(args, ids: list[int]) -> dict[str, list[float]]:
+    """Elastic runs (MA_ENGINE_REGISTRY): the probe's /generate on every engine the router routes to, each by its own
+    URL (the router's probe reaches one engine). After a rollout no request runs, so engines of one serving shape that
+    hold the same weights return the same log-probs; an engine that missed a weight push differs by the size of a step."""
+    import urllib.request
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers", timeout=60) as r:
+        urls = sorted({w["url"].rstrip("/") for w in json.loads(r.read())["workers"]})
+    out = {}
+    body = json.dumps({"input_ids": ids, "sampling_params": {"max_new_tokens": 1, "temperature": 0.0},
+                       "return_logprob": True, "logprob_start_len": 0}).encode()
+    for url in urls:
+        req = urllib.request.Request(f"{url}/generate", data=body, headers={"Content-Type": "application/json"})
+        with opener.open(req, timeout=600) as r:
+            out[url] = [x[0] for x in json.loads(r.read())["meta_info"]["input_token_logprobs"][1:]]
+    return out
+
+
 def startup_probe(out: str, train_log: str, model: str) -> int:
     """Before rollout 0 (rl/rl_inner.sh, once the engines serve): the agents' game settings (each episode writes them)
     against the job's, and the probe on the initial weights, so that either problem ends the run in minutes. The probe sequence is the problem prompt as Flint's chat template renders it, fixed
@@ -428,6 +447,18 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
            "probe_repeat_max_abs": max(_probe_diffs(*probe), default=None)}
     if "generate_refused" in probe[0]:
         rec["probe_generate_refused"] = probe[0]["generate_refused"]
+    if os.environ.get("MA_ENGINE_REGISTRY") and probe[0]["kind"] == "generate":
+        # elastic: every engine against the router's probe engine; mean |diff| over 0.05 (a step moves the probe by
+        # ~0.5) is an engine on other weights, and the run stops before it trains on that engine's samples
+        per = _probe_engines(args, ids)
+        json.dump(per, open(os.path.join(d, "probe_engines.json"), "w"))
+        means = {u: sum(abs(x - y) for x, y in zip(lp, probe[0]["lp"])) / max(len(lp), 1) for u, lp in per.items()}
+        rec |= {"probe_engines": len(per), "probe_engines_mean_abs": means,
+                "probe_engines_max_abs": max((max((abs(x - y) for x, y in zip(lp, probe[0]["lp"])), default=0.0)
+                                              for lp in per.values()), default=None)}
+        stale = {u: m for u, m in means.items() if m > 0.05}
+        if stale:
+            raise RuntimeError(f"engines serve other weights than the probe engine (mean |diff| > 0.05): {stale}")
     prev = os.path.join(out, f"r{rollout_id - 1}", "probe.json")
     if os.path.exists(prev) and json.load(open(prev))[0]["kind"] == probe[0]["kind"]:
         diffs = _probe_diffs(json.load(open(prev))[0], probe[0])

@@ -34,6 +34,7 @@ ACTION_RE = re.compile(r"```mswea_bash_command\s*\n(.*?)\n```", re.DOTALL)
 # "strict" holds the arguments to the schema through the kit's grammar (the eval game). miles records the sampler's
 # candidates for score centering only from unconstrained sampling, so its rollouts set MA_AG_TOOL_STRICT=0.
 STRICT = os.environ.get("MA_AG_TOOL_STRICT", "1") != "0"
+RETRY_S = float(os.environ.get("MA_AG_RETRY_S", "60"))   # how long a failing request is retried (ChatSession)
 BASH_TOOL = {"type": "function", "function": {"name": "bash", "strict": STRICT, "description": "Execute a bash command",
     "parameters": {"type": "object", "properties": {"command": {"type": "string",
     "description": "The bash command to execute"}}, "required": ["command"]}}}
@@ -198,7 +199,7 @@ class ChatSession:
             return "", True
         body = {"model": c.model, "messages": to_api(messages), "max_tokens": min(max_tokens, room),
                 "temperature": c.temperature, "top_p": c.top_p, "top_k": c.top_k, "tools": [BASH_TOOL]}
-        out, attempt, tries, t_req, t0 = None, 0, 0, round(time.time(), 1), time.monotonic()
+        out, attempt, tries, slept, t_req, t0 = None, 0, 0, 0, round(time.time(), 1), time.monotonic()
         while True:
             url = c.route(self.input)
             tries += 1
@@ -222,15 +223,19 @@ class ChatSession:
                 break
             except (aiohttp.ClientError, asyncio.TimeoutError, BadReply) as e:
                 attempt += 1
-                if attempt < 4:
-                    await asyncio.sleep(10 * attempt)
+                # retries 10, 20, 30, 30, ... s apart for MA_AG_RETRY_S in all (default 60: three retries, as before;
+                # elastic RL, rl/rl_inner.sh: 600, so a turn whose engine left reaches another one once miles has
+                # withdrawn it, flint/engine_registry.py)
+                if slept < RETRY_S:
+                    await asyncio.sleep(min(10 * attempt, 30))
+                    slept += min(10 * attempt, 30)
                     continue
-                # ~60 s of failures: a server that also fails /health_generate is down, and the episode goes on elsewhere
+                # RETRY_S of failures: a server that also fails /health_generate is down, and the episode goes on elsewhere
                 if url in c.active and url not in c.down and not await c.healthy(url):
                     c.down.add(url)
                     print(f"server {url} is down after {e!r}: no new episodes start in this run", flush=True)
                 if url in c.down and any(u not in c.down for u in c.urls):
-                    attempt = 0
+                    attempt = slept = 0
                     continue
                 raise HttpAborted(f"{self.name}: {e!r}", url)
             finally:
