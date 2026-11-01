@@ -3,12 +3,12 @@
 # started with the run's environment (Ray's workers, the agent processes among them, take theirs from it), then miles'
 # train.py. miles: our fork (branch flint-grpo of wenhaochai/miles-private, worktree $MILES); the training model is
 # flint_hf from this repository. Usage: rl_inner.sh smoke|test2|run20|train67|train67_test|train67_smoke|args; env JID,
-# OUT, PKG (the built Flint plugin), TMPDIR; train67*: also T67_P, T67_G (rl/rl_job.sh). Mode args: the argument
+# OUT, PKG (the built Flint plugin), TMPDIR; train67*: also T67_P, T67_G, T67_SEED (rl/rl_job.sh). Mode args: the argument
 # checks alone, off GPU (rl/args_all.sh runs them on della-vis1).
 set -uo pipefail
 : "${JID:?}" "${OUT:?}" "${PKG:?}" "${TMPDIR:?}"
 MODE=$1
-REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-train67b
+REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-train67c
 FLINT=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint
 MILES=/scratch/gpfs/GROUP/USER/project/miles-rollout
 MEMPROBE_DATA=/scratch/gpfs/GROUP/USER/tmp/flint_s5/memprobe_data   # a recorded batch for the schedule check
@@ -130,6 +130,15 @@ RUN20=(--colocate --save "$OUT/actor" --load "$OUT/actor" --save-interval 2 --sa
 # (the save is the host-memory peak, so the test meets it after step 1), resumable the same way (wq runs over 3 h are
 # resumable); train67_smoke: 2 steps of 4k, no save.
 TRAIN67=(--rollout-batch-size "$T67_P" --n-samples-per-prompt "$T67_G" --global-batch-size "$T67_B")
+# seed=N (rl/rl_job.sh; the default 67 adds nothing, so the argv stays as it was): --seed 1 + 100 (N - 67) after TRAIN's
+# --seed 1 (miles' parser keeps the last) is the actor's torch seed and the engines' SGLang seed (miles: engine i serves
+# with --seed + i); --rollout-seed 42 + 100 (N - 67) (miles' default 42; it seeds the prompt shuffle and
+# deterministic-inference sampling, both off here). 100 apart: two replicates' engine seeds never meet. The data order
+# follows N in rl/train67_data.py. The game's own randomness (the command order, flint/game.py) is seeded per episode
+# from a random group index (flint/miles_agent.py), not from a run seed.
+T67_SEED=${T67_SEED:-67}
+[[ $T67_SEED =~ ^[1-9][0-9]*$ ]] || { echo "[s5] T67_SEED: $T67_SEED"; exit 1; }
+[ "$T67_SEED" = 67 ] || TRAIN67+=(--seed $((1 + 100 * (T67_SEED - 67))) --rollout-seed $((42 + 100 * (T67_SEED - 67))))
 GAME67=() skip=
 for x in "${GAME[@]}"; do
   if [ -n "$skip" ]; then skip=; elif [ "$x" = --save-debug-rollout-data ]; then skip=1; else GAME67+=("$x"); fi
@@ -149,7 +158,7 @@ if [ "$MODE" = args ]; then   # off-GPU: miles parses and checks each mode's arg
   # recorded 8-episode batch, its episodes repeated as B (rl/schedule_check.py --episodes)
   SERVE8=("${SERVE[@]}"); SERVE8[3]=8
   DATA=$OUT/data_train67.jsonl; GAME[1]=$DATA; GAME67[1]=$DATA
-  export T67=1 T67_P T67_G
+  export T67=1 T67_P T67_G T67_SEED
   for m in train67 train67_test train67_smoke; do
     case $m in
       train67) A=("${T67_RUN[@]}" --num-rollout 40);;
@@ -205,10 +214,10 @@ case "$MODE" in
     echo "[s5] run20 starts from checkpoint: $(cat "$OUT/actor/latest_checkpointed_iteration.txt" 2>/dev/null || echo none)"
     APPEND=1 train "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RUN20[@]}" --num-rollout 20 ;;
   train67)
-    echo "[s5] train67 (P=$T67_P G=$T67_G, ${T67_STEPS:-40} steps) starts from checkpoint: $(cat "$OUT/actor/latest_checkpointed_iteration.txt" 2>/dev/null || echo none)"
+    echo "[s5] train67 (P=$T67_P G=$T67_G, ${T67_STEPS:-40} steps, seed $T67_SEED) starts from checkpoint: $(cat "$OUT/actor/latest_checkpointed_iteration.txt" 2>/dev/null || echo none)"
     APPEND=1 train "${TRAIN[@]}" "${TRAIN67[@]}" "${SERVE[@]}" "${GAME67[@]}" "${T67_RUN[@]}" --num-rollout "${T67_STEPS:-40}" ;;
   train67_test)
-    echo "[s5] train67_test (P=$T67_P G=$T67_G) starts from checkpoint: $(cat "$OUT/actor/latest_checkpointed_iteration.txt" 2>/dev/null || echo none)"
+    echo "[s5] train67_test (P=$T67_P G=$T67_G, seed $T67_SEED) starts from checkpoint: $(cat "$OUT/actor/latest_checkpointed_iteration.txt" 2>/dev/null || echo none)"
     APPEND=1 train "${TRAIN[@]}" "${TRAIN67[@]}" "${SERVE[@]}" "${GAME67[@]}" "${T67_TEST[@]}" --num-rollout 2 ;;
   train67_smoke) train "${TRAIN[@]}" "${TRAIN67[@]}" "${SERVE[@]}" "${GAME67[@]}" --colocate --num-rollout 2 ;;
 esac

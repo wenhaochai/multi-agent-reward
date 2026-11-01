@@ -36,6 +36,10 @@ if os.environ.get("T67"):   # train67 (rl/rl_inner.sh args): P problems x G epis
         want |= {"no_save_optim": False, "save_interval": 1, "load": a.save}
     else:
         want |= {"save": None}
+    # seed=N (rl/rl_job.sh, default 67): miles' --seed 1 + 100 (N - 67) (the actor; engine i serves with seed + i) and
+    # --rollout-seed 42 + 100 (N - 67)
+    n = int(os.environ.get("T67_SEED", "67"))
+    want |= {"seed": 1 + 100 * (n - 67), "rollout_seed": 42 + 100 * (n - 67)}
     # one optimizer step per rollout: miles' step count is rollouts x P x G / global batch
     want["steps_per_rollout"] = 1
     a.steps_per_rollout = a.rollout_batch_size * a.n_samples_per_prompt // a.global_batch_size
@@ -48,6 +52,7 @@ if os.environ.get("T67"):   # train67 (rl/rl_inner.sh args): P problems x G epis
 bad = {k: (getattr(a, k, "<missing>"), v) for k, v in want.items() if getattr(a, k, "<missing>") != v}
 print("parsed:", {k: getattr(a, k, None) for k in ("num_rollout", "rollout_num_gpus", "actor_num_gpus_per_node",
                                                    "max_tokens_per_gpu", "train_env_vars", "save", "colocate",
-                                                   "rollout_batch_size", "n_samples_per_prompt", "global_batch_size")})
+                                                   "rollout_batch_size", "n_samples_per_prompt", "global_batch_size",
+                                                   "seed", "rollout_seed")})
 print("ARGS_FAIL", bad) if bad else print("ARGS_OK", len(want), "settings")
 sys.exit(1 if bad else 0)
