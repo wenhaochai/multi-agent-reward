@@ -85,11 +85,11 @@ shows that new weights reached the engines: the same weights served at TP8 inste
 average (w662 vs w632), as much as one training step does, so it measures MoE routing sensitivity, not update size.
     rl/steps.py <run dir>                                             # the per-step table
 
-RL on the 67 training problems (`rl/rl_job.sh train67*`, branch `rl-train67b`, worktree `mas-rl-train67b`: the job
+RL on the 67 training problems (`rl/rl_job.sh train67*`, branch `rl-train67c`, worktree `mas-rl-train67c`: the job
 scripts run the code of this worktree). Each step uses P problems x G
 episodes (default 4 x 8 = 32 episodes). The episodes run on one TP8 engine colocated with the actor. Each problem is
 one GRPO group. The problems come from `data/fcs11_train67_agent.jsonl` in a fixed order (`rl/train67_data.py`, seed
-67). Problem 112 stays in because its fixed checker is in `flint/checkers/112`. The game settings are run20's, except
+67 by default, `seed=N` below). Problem 112 stays in because its fixed checker is in `flint/checkers/112`. The game settings are run20's, except
 the wall cap: it is 60 min, not 45 min, because 32 episodes share one engine. The stop rules use fractions of the
 episodes in a rollout:
 
@@ -113,11 +113,25 @@ popups of 2026-10-31):
    `steps.jsonl` records `dup_submits` per episode. Reason: in run20 rollout 17 one episode submitted the same
    solution.cpp 124 times in a row and got a positive advantage. run20, base_tp8 and the evals judge every submit.
 
+`seed=N` (any place after the mode, like `set=`; N from 67 to 9999, default 67) makes a replicate. Seed 67 is the run
+as before: the same data file, train.py arguments and run directories. Another N changes:
+
+1. The data order: epoch e is the permutation of `random.Random(N + e)` (each epoch still a permutation of the set, P
+   different problems per step).
+2. miles' seeds: `--seed 1 + 100 (N - 67)` (the actor's torch seed, and the SGLang engines' seed: engine i serves with
+   seed + i) and `--rollout-seed 42 + 100 (N - 67)`. Seed 67: 1 and 42 (miles' default); seed 68: 101 and 142. The
+   seeds are 100 apart, so two replicates never share an engine seed.
+3. The run directory: `_s<N>` after the set name (`runs/train67_signal34_s68_p4g8`), so a replicate never resumes another
+   run.
+
+The job log prints the seeds at the start (`[s5] seed N: ...`).
+
     wq submit --prio 10 --time 1:45:00 --project flint-eval rl/rl_job.sh train67_smoke   # 2 steps x 32 x 4k
     wq submit --partial --prio 10 --time 6:00:00 --project flint-eval rl/rl_job.sh train67_test   # 2 steps x 32 x 128k
     wq submit --partial --time 23:00:00 --project flint-eval rl/rl_job.sh train67 4 8 40   # runs/train67_p4g8
     wq submit --partial --time 23:00:00 --project flint-eval rl/rl_job.sh train67 4 8 40 set=signal34   # runs/train67_signal34_p4g8
-    ssh della-vis1 'cd <this worktree> && nice -n 19 bash rl/args_all.sh [P G] [set=NAME]'   # every mode's argv, the B=32 schedule
+    wq submit --partial --time 23:00:00 --project flint-eval rl/rl_job.sh train67 4 8 80 set=signal34 seed=68   # runs/train67_signal34_s68_p4g8
+    ssh della-vis1 'cd <this worktree> && nice -n 19 bash rl/args_all.sh [P G] [set=NAME] [seed=N]'   # every mode's argv, the B=32 schedule
 
 ## Tests
 
