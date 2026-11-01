@@ -126,7 +126,7 @@ for lever in ${T67_LEVERS//,/ }; do
   esac
 done
 case "$MODE" in train67*) ENGINE_TP=$T67_TP; SERVE[3]=$ENGINE_TP;; esac
-[ -z "$T67_LEVERS" ] || echo "[s5] engine levers: $T67_LEVERS (engine width TP$ENGINE_TP, FLINT_FUSED_SIGMOID_GATE=${FLINT_FUSED_SIGMOID_GATE:-unset})"
+[ -z "$T67_LEVERS" ] || echo "[s5] engine levers: $T67_LEVERS (train67 engines: $((8 / T67_TP)) x TP$T67_TP, FLINT_FUSED_SIGMOID_GATE=${FLINT_FUSED_SIGMOID_GATE:-unset})"
 # the long game as a miles agent on problem 0 (flint/miles_agent.py), sampling as in the eval; the engines return each
 # token's routed experts, incremental rows per turn (pause mode in_place); an episode the judge could not score takes
 # its group out of the loss (drop_failed_groups) and fails the rollout's check (log_rollout), which ends the run
