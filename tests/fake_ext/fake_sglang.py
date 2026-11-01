@@ -1,5 +1,7 @@
-"""A fake SGLang server for tests/dryrun_ext.sh: /health_generate and /health answer 503 for FAKE_LOAD_S seconds
-(loading), then 200; /server_info reports world_size 8; /generate answers 200."""
+"""A fake SGLang server for tests/dryrun_ext.sh and tests/dryrun_elastic.sh: /health_generate and /health answer 503
+for FAKE_LOAD_S seconds (loading), then 200; /server_info reports a world size of the GPUs in CUDA_VISIBLE_DEVICES (8
+when unset); /generate answers 200; /v1/loads reports the number in the file FAKE_RUNNING (0 when unset or missing) as
+running requests."""
 import json
 import os
 import sys
@@ -23,7 +25,14 @@ class H(BaseHTTPRequestHandler):
         if self.path in ("/health", "/health_generate"):
             self._send(200 if ready else 503, {})
         elif self.path == "/server_info":
-            self._send(200, {"internal_states": [{"world_size": 8}]})
+            ws = len([g for g in os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7").split(",") if g])
+            self._send(200, {"internal_states": [{"world_size": ws}]})
+        elif self.path == "/v1/loads":
+            try:
+                n = int(open(os.environ["FAKE_RUNNING"]).read().strip())
+            except (KeyError, OSError, ValueError):
+                n = 0
+            self._send(200, {"loads": [{"dp_rank": 0, "num_running_reqs": n, "num_waiting_reqs": 0}]})
         else:
             self._send(404, {})
 
