@@ -133,6 +133,13 @@ for lever in ${T67_LEVERS//,/ }; do
 done
 case "$MODE" in train67*) ENGINE_TP=$T67_TP; SERVE[3]=$ENGINE_TP;; esac
 [ -z "$T67_LEVERS" ] || echo "[s5] engine levers: $T67_LEVERS (train67 engines: $((8 / T67_TP)) x TP$T67_TP, FLINT_FUSED_SIGMOID_GATE=${FLINT_FUSED_SIGMOID_GATE:-unset}, SGLANG_MOE_CONFIG_DIR=${SGLANG_MOE_CONFIG_DIR:-unset})"
+# cmdtimeout=N (rl/rl_job.sh -> T67_CMD_TIMEOUT; unset or 60: the game as before): the per-command limit in seconds
+# (flint/sandbox.py MA_AG_TIMEOUT, also stated in the instance message), set before `ray start` so every agent has it
+if [ -n "${T67_CMD_TIMEOUT:-}" ] && [ "$T67_CMD_TIMEOUT" != 60 ]; then
+  [[ $T67_CMD_TIMEOUT =~ ^[1-9][0-9]*$ ]] || { echo "[s5] T67_CMD_TIMEOUT: $T67_CMD_TIMEOUT"; exit 1; }
+  export MA_AG_TIMEOUT=$T67_CMD_TIMEOUT
+  echo "[s5] game: command time limit $MA_AG_TIMEOUT s (default 60)"
+fi
 # the long game as a miles agent on problem 0 (flint/miles_agent.py), sampling as in the eval; the engines return each
 # token's routed experts, incremental rows per turn (pause mode in_place); an episode the judge could not score takes
 # its group out of the loss (drop_failed_groups) and fails the rollout's check (log_rollout), which ends the run
