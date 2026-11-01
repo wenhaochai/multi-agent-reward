@@ -279,7 +279,9 @@ def _probe_engines(args, ids: list[int]) -> dict[str, list[float]]:
 
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers", timeout=60) as r:
-        urls = sorted({w["url"].rstrip("/") for w in json.loads(r.read())["workers"]})
+        # sgl-router lists each engine once, or once per dp rank as url@rank (miles' router_worker_base_urls)
+        urls = sorted({w["url"].rstrip("/").rsplit("@", 1)[0] if w["url"].rsplit("@", 1)[-1].isdigit() else w["url"].rstrip("/")
+                       for w in json.loads(r.read())["workers"]})
     out = {}
     body = json.dumps({"input_ids": ids, "sampling_params": {"max_new_tokens": 1, "temperature": 0.0},
                        "return_logprob": True, "logprob_start_len": 0}).encode()

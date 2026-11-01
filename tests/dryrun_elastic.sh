@@ -93,6 +93,17 @@ SLURM_JOB_END_TIME=$(( $(date +%s) + 1200 + 30 )) engine dry970 "$RUN"; wait $BG
 ok "G exit 98 ($rc)" '[ $rc = 98 ]'
 ok "G nothing registered" '[ -z "$(ls "$RUN/engines" 2>/dev/null)" ]'
 
+echo "== H: an operator's leave file: the same clean leave, then 0"
+RUN=$W/h; spec "$RUN" 4; beat "$RUN"; HB=$HBPID
+engine dry980 "$RUN"; EP=$BGPID
+upto 60 'serving "$RUN" dry980'
+touch "$RUN/engines/dry980.leave"
+upto 30 "grep -q leaving '$RUN/engines/dry980.json' 2>/dev/null"
+ok "H record says leaving" 'grep -q leaving "$RUN/engines/dry980.json"'
+wait $EP; rc=$?; kill $HB 2>/dev/null
+ok "H exit 0 ($rc)" '[ $rc = 0 ]'
+ok "H drained" 'grep -q "drained after" "$W/dry980.out"'
+
 echo "${#fails[@]} failed${fails:+: ${fails[*]}}"
 [ ${#fails[@]} = 0 ] && rm -rf -- "$W"
 [ ${#fails[@]} = 0 ]

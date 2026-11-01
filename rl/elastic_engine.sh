@@ -19,6 +19,7 @@
 #            15 min while serving: wq puts the job back, not before 30 min, without counting the run;
 #   exit 99  20 min before the host's end (SLURM_JOB_END_TIME): the record says "leaving", the run withdraws the
 #            engines, they finish their running requests (5-20 min), then the job ends and wq requeues it;
+#   exit 0   also after the same clean leave when RUN/engines/<job>.leave exists (an operator takes the engines away);
 #   exit 1   an engine failed (launch, health, a server process ended, /health failing for 10 min);
 #   exit 143 a signal.
 # Bounds: timeout -s KILL around each container, the GPU watch (rl/gpu_watch.sh: a joining engine waits for the run's
@@ -178,4 +179,5 @@ while sleep "$BEAT" & wait $!; do   # a background sleep, so a TERM is handled a
   [ "$age" -le 90 ] && seen=1
   [ -n "$seen" ] && [ "$age" -gt "$STALE" ] && leave 98 "the trainer's heartbeat is $age s old"
   [ "$(date +%s)" -gt $((END - LEAVE_BEFORE)) ] && leave 99 "$((LEAVE_BEFORE / 60)) min before the host's end"
+  [ -e "$RUN/engines/$JID.leave" ] && leave 0 "asked by $RUN/engines/$JID.leave"
 done
