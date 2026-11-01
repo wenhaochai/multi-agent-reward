@@ -163,4 +163,16 @@ for a in (("train67", "levers="), ("train67", "levers=foo"), ("train67", "levers
           ("train67", "levers=tp4 gate"), ("run20", "levers=tp4"), ("smoke", "levers=gate")):
     rc, out = job(*a)
     check(f"rl_job {' '.join(a)}: refused", rc != 0 and "OUT=" not in out, out)
+# cmdtimeout=N (the game's per-command limit): 60 is the default run; another value gets its own run dir _t<N>
+cmdt = {("train67", "2", "8", "10", "set=signal34", "cmdtimeout=30"):
+            f"SEED=67 OUT={R}/train67_signal34_t30_p2g8 CMDTIMEOUT=30",
+        ("train67", "2", "8", "10", "set=signal34", "cmdtimeout=60"): f"SEED=67 OUT={R}/train67_signal34_p2g8",
+        ("train67", "cmdtimeout=30", "levers=gate", "seed=68"): f"SEED=68 OUT={R}/train67_s68_kgate_t30_p4g8 LEVERS=gate CMDTIMEOUT=30"}
+for a, want in cmdt.items():
+    rc, out = job(*a)
+    check(f"rl_job {' '.join(a)}: {want.split('/')[-1]}", rc == 0 and out.endswith(want), out)
+for a in (("train67", "cmdtimeout=3"), ("train67", "cmdtimeout=abc"), ("train67", "cmdtimeout=0060"), ("train67", "cmdtimeout="),
+          ("train67", "cmdtimeout=601"), ("run20", "cmdtimeout=30")):
+    rc, out = job(*a)
+    check(f"rl_job {' '.join(a)}: refused", rc != 0 and "OUT=" not in out, out)
 done()
