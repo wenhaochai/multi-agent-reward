@@ -3,7 +3,7 @@
 # started with the run's environment (Ray's workers, the agent processes among them, take theirs from it), then miles'
 # train.py. miles: our fork (branch flint-grpo of wenhaochai/miles-private, worktree $MILES); the training model is
 # flint_hf from this repository. Usage: rl_inner.sh smoke|test2|run20|train67|train67_test|train67_smoke|args; env JID,
-# OUT, PKG (the built Flint plugin), TMPDIR; train67*: also T67_P, T67_G, T67_SEED (rl/rl_job.sh). Mode args: the argument
+# OUT, PKG (the built Flint plugin), TMPDIR; train67*: also T67_P, T67_G, T67_SEED, T67_LEVERS (rl/rl_job.sh). Mode args: the argument
 # checks alone, off GPU (rl/args_all.sh runs them on della-vis1).
 set -uo pipefail
 : "${JID:?}" "${OUT:?}" "${PKG:?}" "${TMPDIR:?}"
@@ -106,6 +106,27 @@ SERVE=(--rollout-num-gpus "$NG" --rollout-num-gpus-per-engine "$ENGINE_TP"
   --sglang-attention-backend fa3 --sglang-moe-runner-backend triton --sglang-enable-fp32-lm-head
   --sglang-context-length 262144 --sglang-chunked-prefill-size 4096 --sglang-swa-full-tokens-ratio 0.4
   --sglang-mem-fraction-static 0.72 --sglang-grammar-backend flint)
+# engine levers of the train67 modes (rl/rl_job.sh levers=LIST -> T67_LEVERS; empty or unset: the engine as before,
+# argv byte for byte), each measured in tmp/rollout_eff (engine bench w768, kernels w769, consistency gates T1-T3):
+#   tp4       2 x TP4 engines instead of 1 x TP8 (KV 2.77M tokens per engine vs 3.46M at TP8)
+#   gate      the fused sigmoid router (FLINT_FUSED_SIGMOID_GATE=1, serving/flint_sglang/flint_sglang/model.py)
+#   graphs    a decode CUDA graph at every batch size 1..32 (SGLang's default list pads between 1 2 4 8 12 16 24 32)
+#   arfusion  FlashInfer allreduce fusion (trtllm backend)
+#   pgraph    prefill CUDA graphs (breakable backend)
+# Set before `ray start` below: the engines take Ray's environment.
+T67_LEVERS=${T67_LEVERS:-} T67_TP=8
+for lever in ${T67_LEVERS//,/ }; do
+  case "$lever" in
+    tp4) T67_TP=4;;
+    gate) export FLINT_FUSED_SIGMOID_GATE=1;;
+    graphs) SERVE+=(--sglang-cuda-graph-bs-decode $(seq 1 32) $(seq 40 8 256) $(seq 272 16 512));;
+    arfusion) SERVE+=(--sglang-flashinfer-allreduce-fusion-backend trtllm);;
+    pgraph) SERVE+=(--sglang-cuda-graph-backend-prefill breakable);;
+    *) echo "[s5] unknown engine lever: $lever"; exit 1;;
+  esac
+done
+case "$MODE" in train67*) ENGINE_TP=$T67_TP; SERVE[3]=$ENGINE_TP;; esac
+[ -z "$T67_LEVERS" ] || echo "[s5] engine levers: $T67_LEVERS (engine width TP$ENGINE_TP, FLINT_FUSED_SIGMOID_GATE=${FLINT_FUSED_SIGMOID_GATE:-unset})"
 # the long game as a miles agent on problem 0 (flint/miles_agent.py), sampling as in the eval; the engines return each
 # token's routed experts, incremental rows per turn (pause mode in_place); an episode the judge could not score takes
 # its group out of the loss (drop_failed_groups) and fails the rollout's check (log_rollout), which ends the run
@@ -161,7 +182,7 @@ if [ "$MODE" = args ]; then   # off-GPU: miles parses and checks each mode's arg
   python3 "$REPO/rl/args_check.py" "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RUN20[@]}" --num-rollout 20 || exit 1
   # train67, one argv per mode as the job builds it (TP8 engine), and the schedule of a B-episode step: the
   # recorded 8-episode batch, its episodes repeated as B (rl/schedule_check.py --episodes)
-  SERVE8=("${SERVE[@]}"); SERVE8[3]=8
+  SERVE8=("${SERVE[@]}"); SERVE8[3]=$T67_TP
   DATA=$OUT/data_train67.jsonl; GAME[1]=$DATA; GAME67[1]=$DATA
   export T67=1 T67_P T67_G T67_SEED
   for m in train67 train67_test train67_smoke; do

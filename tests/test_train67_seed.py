@@ -144,4 +144,21 @@ for a in (("train67", "seed=abc"), ("train67", "seed=5"), ("train67", "seed=068"
           ("train67", "seed=10000"), ("run20", "seed=68"), ("smoke", "seed=67")):
     rc, out = job(*a)
     check(f"rl_job {' '.join(a)}: refused", rc != 0 and "OUT=" not in out, out)
+# levers=LIST (engine levers, rl/rl_inner.sh): sorted and deduplicated, their own run dir, no levers = as before
+lev = {("train67", "2", "8", "160", "set=signal34", "levers=tp4,gate"):
+           f"SEED=67 OUT={R}/train67_signal34_kgate-tp4_p2g8 LEVERS=gate,tp4",
+       ("train67_test", "2", "8", "set=signal34", "levers=graphs,gate,tp4,gate"):
+           f"SEED=67 OUT={R}/train67_test_signal34_kgate-graphs-tp4_p2g8 LEVERS=gate,graphs,tp4",
+       ("train67", "seed=68", "levers=tp4"): f"SEED=68 OUT={R}/train67_s68_ktp4_p4g8 LEVERS=tp4",
+       ("train67", "levers=pgraph,arfusion", "2", "8"): f"SEED=67 OUT={R}/train67_karfusion-pgraph_p2g8 LEVERS=arfusion,pgraph"}
+for a, want in lev.items():
+    rc, out = job(*a)
+    check(f"rl_job {' '.join(a)}: {want.split('/')[-1]}", rc == 0 and out.endswith(want), out)
+rc, out = job("train67", "2", "8", "160", "set=signal34")
+check("rl_job without levers: no LEVERS field, the w765 run dir", rc == 0 and "LEVERS" not in out
+      and out.endswith(f"OUT={R}/train67_signal34_p2g8"), out)
+for a in (("train67", "levers="), ("train67", "levers=foo"), ("train67", "levers=tp4,,gate"), ("train67", "levers=TP4"),
+          ("train67", "levers=tp4 gate"), ("run20", "levers=tp4"), ("smoke", "levers=gate")):
+    rc, out = job(*a)
+    check(f"rl_job {' '.join(a)}: refused", rc != 0 and "OUT=" not in out, out)
 done()
