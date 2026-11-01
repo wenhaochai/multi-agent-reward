@@ -153,22 +153,32 @@ fi
 IDLE=45; [[ $MODE == train67* ]] && IDLE=30
 GPU_IDLE_MIN=$IDLE gpu_watch $$ "$OUT/gpu.log" "grep -q 'POST /v1/chat/completions' '$OUT/train_segment.log' 2>/dev/null" 35 &
 WD=$!
-# host memory every 10 s (the node's used MiB, this job's cgroup MiB: what --mem bounds) and the planned stops. A
+# host memory every 10 s (the node's used MiB, this job's cgroup MiB: what --mem bounds, and the cgroup's
+# non-reclaimable MiB: memory.current minus its page cache, memory.stat file - shmem) and the planned stops. The guard
+# reads the non-reclaimable part: the kernel drops clean page cache before the cgroup reaches memory.max (900 GiB on a
+# pilot host), and that cache is not this job's to count: w765 (2026-11-01) was stopped at 875 GiB of memory.current
+# while ~80 GiB of it was clean cache of the mmap-loaded model files (fadvise DONTNEED on w766's node freed 74 GiB);
+# a pilot host's cgroup also keeps the cache of earlier guests, and checkpoint writes add more. A
 # stop request ($OUT/stop_request: "<exit code> <reason>", from here or from flint.miles_agent.log_rollout's rules)
 # asks miles for a checkpoint at its next save point (--save-trigger-sentinel $OUT/save_now); once miles has written it
-# (the sentinel is gone) the job stops with that exit code. Requests: cgroup memory over 860 GB (3: a failure); less
-# than 75 min left of LIMIT (99: wq requeues it, the next segment resumes from the checkpoint); run20's first segment
-# stops after its first checkpoint (99), so the second one proves the resume. Over 875 GB the job stops at once (3).
+# (the sentinel is gone) the job stops with that exit code. Requests: non-reclaimable memory over 860 GiB (3: a
+# failure); less than 75 min left of LIMIT (99: wq requeues it, the next segment resumes from the checkpoint); run20's
+# first segment stops after its first checkpoint (99), so the second one proves the resume. Over 875 GiB the job stops
+# at once (3).
 CG=/sys/fs/cgroup$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup | sed -E 's#(/job_[0-9]+)/.*#\1#')/memory.current   # the job's
+MS=${CG%memory.current}memory.stat
 TRACKER=$OUT/actor/latest_checkpointed_iteration.txt
 ( t0=$SECONDS asked=
   request() { [ -e "$OUT/stop_request" ] || echo "$1" > "$OUT/stop_request"; }
   finish() { echo "$1" | cut -d' ' -f1 > "$OUT/exit_code"; echo "PLANNED_STOP: $1" >&2; kill -TERM $$; }
   while sleep 10; do
-    cg=$(( $(cat "$CG" 2>/dev/null || echo 0) / 1048576 ))
-    echo "$(date +%s) $(free -m | awk '/Mem:/{print $3}') $cg"
-    if [ "$cg" -gt $((875 * 1024)) ]; then finish "3 host memory $cg MiB over 875 GB"; break; fi
-    [ "$cg" -gt $((860 * 1024)) ] && request "3 host memory $cg MiB over 860 GB"
+    cur=$(cat "$CG" 2>/dev/null || echo 0)
+    pc=$(awk '$1 == "file" {f = $2} $1 == "shmem" {s = $2} END {printf "%.0f\n", f - s}' "$MS" 2>/dev/null)   # page cache bytes
+    [[ $pc =~ ^[0-9]+$ ]] || pc=0   # no memory.stat: count everything (as before)
+    cg=$((cur / 1048576)) nr=$(((cur - pc) / 1048576))
+    echo "$(date +%s) $(free -m | awk '/Mem:/{print $3}') $cg $nr"
+    if [ "$nr" -gt $((875 * 1024)) ]; then finish "3 host memory: $nr MiB non-reclaimable (cgroup $cg MiB) over 875 GiB"; break; fi
+    [ "$nr" -gt $((860 * 1024)) ] && request "3 host memory: $nr MiB non-reclaimable (cgroup $cg MiB) over 860 GiB"
     [ -n "$RESUMABLE" ] && [ "$(date +%s)" -gt $((END - STOP_S)) ] && request "99 time: less than $((STOP_S / 60)) min left"
     if [ "$MODE" = run20 ] && [ -n "$FRESH" ] && [ -e "$TRACKER" ]; then finish "99 first segment: checkpoint $(cat "$TRACKER") written, resume next"; break; fi
     if [ -e "$OUT/stop_request" ] && [ -z "$asked" ]; then touch "$OUT/save_now"; asked=1; fi
@@ -193,7 +203,10 @@ for line in open(f"{out}/gpu_mem.csv"):
     p = [x.strip() for x in line.split(",")]
     if len(p) == 3 and p[2].isdigit():
         peak[int(p[1])] = max(peak[int(p[1])], int(p[2]))
-host = max((int(l.split()[-1]) for l in open(f"{out}/host_mem.txt") if len(l.split()) >= 2), default=0)
-print("[s5] peak GPU memory (2 s samples, MiB):", dict(sorted(peak.items())), "| peak job memory (cgroup, 10 s samples, MiB):", host)
+rows = [l.split() for l in open(f"{out}/host_mem.txt")]
+host = max((int(r[2]) for r in rows if len(r) >= 3), default=0)
+nonrec = max((int(r[3]) for r in rows if len(r) >= 4), default=0)
+print("[s5] peak GPU memory (2 s samples, MiB):", dict(sorted(peak.items())), "| peak job memory (10 s samples, MiB):",
+      f"cgroup {host}, non-reclaimable {nonrec}")
 PY
 exit $rc
