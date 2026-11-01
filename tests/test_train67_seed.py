@@ -150,7 +150,9 @@ lev = {("train67", "2", "8", "160", "set=signal34", "levers=tp4,gate"):
        ("train67_test", "2", "8", "set=signal34", "levers=graphs,gate,tp4,gate"):
            f"SEED=67 OUT={R}/train67_test_signal34_kgate-graphs-tp4_p2g8 LEVERS=gate,graphs,tp4",
        ("train67", "seed=68", "levers=tp4"): f"SEED=68 OUT={R}/train67_s68_ktp4_p4g8 LEVERS=tp4",
-       ("train67", "levers=pgraph,arfusion", "2", "8"): f"SEED=67 OUT={R}/train67_karfusion-pgraph_p2g8 LEVERS=arfusion,pgraph"}
+       ("train67", "levers=pgraph,arfusion", "2", "8"): f"SEED=67 OUT={R}/train67_karfusion-pgraph_p2g8 LEVERS=arfusion,pgraph",
+       ("train67_test", "2", "8", "set=signal34", "levers=moecfg,gate"):
+           f"SEED=67 OUT={R}/train67_test_signal34_kgate-moecfg_p2g8 LEVERS=gate,moecfg"}
 for a, want in lev.items():
     rc, out = job(*a)
     check(f"rl_job {' '.join(a)}: {want.split('/')[-1]}", rc == 0 and out.endswith(want), out)

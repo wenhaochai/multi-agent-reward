@@ -20,7 +20,7 @@
 # rl_job.sh train67[_test|_smoke] [P G [STEPS]] [set=NAME] [seed=N] [levers=LIST] (defaults 4 8, train67 40 steps;
 # set=NAME trains on the problems of data/train67_sets/NAME.txt only, default all 67, the run dirs then hold _NAME;
 # seed=N, default 67: a replicate's data order and RL seeds (T67_SEED below), the run dirs then hold _s<N> after the set
-# name; levers=LIST, default none: engine levers, a comma list of tp4 gate graphs arfusion pgraph (rl/rl_inner.sh), the
+# name; levers=LIST, default none: engine levers, a comma list of tp4 gate graphs arfusion pgraph moecfg (rl/rl_inner.sh), the
 # run dirs then hold _k<levers, sorted, joined by ->):
 #   train67_smoke  B = P x G episodes of 4k tokens, 2 steps, no save (~1 h)
 #   train67_test   B episodes of 128k, 2 steps, a full checkpoint after each (host memory at its peak: the end of the
@@ -53,9 +53,9 @@ case "$MODE" in train67*) [[ $T67_P =~ ^[1-9][0-9]*$ && $T67_G =~ ^[1-9][0-9]*$ 
   [ -z "$SEED_GIVEN" ] || { [[ $T67_SEED =~ ^[1-9][0-9]{0,3}$ ]] && [ "$T67_SEED" -ge 67 ]; } \
     || { echo "seed=N: an integer from 67 (the default run) to 9999: $T67_SEED"; exit 1; }
   if [ -n "$LEVERS_GIVEN" ]; then
-    [[ $T67_LEVERS =~ ^[a-z0-9]+(,[a-z0-9]+)*$ ]] || { echo "levers=LIST: a comma list of tp4 gate graphs arfusion pgraph: $T67_LEVERS"; exit 1; }
+    [[ $T67_LEVERS =~ ^[a-z0-9]+(,[a-z0-9]+)*$ ]] || { echo "levers=LIST: a comma list of tp4 gate graphs arfusion pgraph moecfg: $T67_LEVERS"; exit 1; }
     for l in ${T67_LEVERS//,/ }; do
-      case "$l" in tp4|gate|graphs|arfusion|pgraph) ;; *) echo "levers=LIST: unknown lever $l (tp4 gate graphs arfusion pgraph)"; exit 1;; esac
+      case "$l" in tp4|gate|graphs|arfusion|pgraph|moecfg) ;; *) echo "levers=LIST: unknown lever $l (tp4 gate graphs arfusion pgraph moecfg)"; exit 1;; esac
     done
     T67_LEVERS=$(tr , '\n' <<< "$T67_LEVERS" | sort -u | paste -sd, -)
   fi
