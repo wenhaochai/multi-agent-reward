@@ -30,7 +30,27 @@ def _role_ids() -> set:
 
         tok = AutoTokenizer.from_pretrained(FLINT)
         _ROLE_IDS.append({tok.convert_tokens_to_ids(r) for r in ROLES})
+        _ROLE_IDS.append(tok.convert_tokens_to_ids("<|user|>"))
+        eos = json.load(open(os.path.join(FLINT, "generation_config.json")))["eos_token_id"]
+        _ROLE_IDS.append(set(eos if isinstance(eos, list) else [eos]))
     return _ROLE_IDS[0]
+
+
+def _shared_stops(s) -> int:
+    """A completion's last token that is also the next message's first: Flint may end a turn with <|user|> (one of its
+    stop tokens), and when the game answers in the same path (a format error answered with a user message, no trim, no
+    restart) that very token opens the user message, so the sample holds it once, as the user's role token, outside the
+    loss mask: the sequence is the generated one, but that one generated token is not trained (w766 rollout 10,
+    2026-11-01: one such token in 2,048,000 stopped the run). Counted where a trained run ends on a token that is not a
+    stop token and the next token is <|user|>."""
+    _role_ids()
+    user, stops = _ROLE_IDS[1], _ROLE_IDS[2]
+    toks = np.asarray(s.tokens[len(s.tokens) - s.response_length:])
+    mask = np.asarray(s.loss_mask, dtype=bool)
+    if len(mask) < 2:
+        return 0
+    ends = np.nonzero(mask[:-1] & ~mask[1:])[0]   # last position of each trained run that has a next token
+    return int(sum(1 for j in ends if toks[j + 1] == user and int(toks[j]) not in stops))
 
 
 def check(d: str, samples: list) -> tuple[dict, dict, list[str]]:
@@ -92,6 +112,7 @@ def check(d: str, samples: list) -> tuple[dict, dict, list[str]]:
             "trims": sum(1 for x, y in zip(dropped, dropped[1:]) if y > x), "restarts": a.get("restarts"),
             "submissions": len(tr.get("submissions", [])) if tr else None, "format_errors": sum(1 for t in turns if t.get("format_error")),
             "generated": a.get("generated"), "trained_tokens": sum(int(sum(s.loss_mask)) for s in ss),
+            "shared_stop_tokens": sum(_shared_stops(s) for s in ss),
             "response_tokens": sum(s.response_length for s in ss), "tokens": sum(len(s.tokens) for s in ss),
             "trained_role_tokens": trained_roles, "logprob_len_mismatch": lp_bad, "topk": k,
             "topk_errors": topk_errors[:3], "topk_error_count": len(topk_errors),
@@ -111,6 +132,7 @@ def check(d: str, samples: list) -> tuple[dict, dict, list[str]]:
         "all_rewards_equal_S": all(r["trace"] and r["rewards"] == [r["S"]] for r in ok_rows),
         "ok_generated_tokens": sum(r["generated"] or 0 for r in ok_rows),
         "ok_trained_tokens": sum(r["trained_tokens"] for r in ok_rows),
+        "ok_shared_stop_tokens": sum(r["shared_stop_tokens"] for r in ok_rows),
         "trained_role_tokens": sum(r["trained_role_tokens"] for r in rows),
         "topk_error_count": sum(r["topk_error_count"] for r in rows),
         "r3_mb_total": round(sum(r["r3_mb"] for r in rows), 1), "r3_samples": sum(r["r3_samples"] for r in rows),
@@ -135,7 +157,9 @@ def check(d: str, samples: list) -> tuple[dict, dict, list[str]]:
     problems = {"failed episodes": sum(bool(r["failed"]) for r in rows),
                 "judge infra submissions": sum(r["judge_infra_submissions"] or 0 for r in rows),
                 "rewards not S": 0 if summary["all_rewards_equal_S"] else 1,
-                "trained != generated": int(summary["ok_trained_tokens"] != summary["ok_generated_tokens"]),
+                # every generated token is trained once, except a stop token that also opens the next user message
+                "trained != generated": int(summary["ok_trained_tokens"] + summary["ok_shared_stop_tokens"]
+                                            != summary["ok_generated_tokens"]),
                 "top-k errors": summary["topk_error_count"], "R3 ids out of range": summary["r3_moe_out_of_range"]}
     return summary, problems, lines
 
