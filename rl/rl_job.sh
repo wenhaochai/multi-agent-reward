@@ -26,7 +26,9 @@
 # then hold _t<N>; elastic=1: anchored elastic RL (tmp/elastic_rl/anchored.md): the run keeps its colocated engines
 # and adds every engine job (rl/elastic_engine.sh RUN, any number, joining and leaving at any time) as an extra cell
 # from its next weight push on; the trainer writes RUN/trainer.json every 30 s and RUN/engine_spec.json (what the
-# engine jobs serve), and RUN/STOP when the run ends for good; the run dirs then hold _e):
+# engine jobs serve), and RUN/STOP when the run ends for good; the run dirs then hold _e; async=1: fully async RL on a
+# split node (rl/rl_inner.sh: the actor on 4 GPUs, the run's own 1 x TP4 engine on the other 4, train_async.py
+# --fully-async, TIS), stale=N its staleness bound (default none); the run dirs then hold _a, _a<N>):
 #   train67_smoke  B = P x G episodes of 4k tokens, 2 steps, no save (~1 h)
 #   train67_test   B episodes of 128k, 2 steps, a full checkpoint after each (host memory at its peak: the end of the
 #                  optimizer step and the save; step time), resumable in runs/train67_test[_NAME]_p<P>g<G>, exit 0
@@ -46,11 +48,13 @@ case "$MODE" in smoke|smoke_tp4|smoke_tp8) LIMIT=4800;; train67_smoke) LIMIT=600
   *) echo "usage: rl_job.sh smoke[_tp4|_tp8]|base_tp8|test2|run20|train67[_test|_smoke] [P G [STEPS]] [set=NAME] [seed=N] [levers=LIST] [cmdtimeout=N]"; exit 1;; esac
 # train67: set=NAME, seed=N, levers=LIST and cmdtimeout=N at any place after the mode; the other arguments are P G STEPS in
 # this order
-T67_SET= T67_SEED= SEED_GIVEN= T67_LEVERS= LEVERS_GIVEN= T67_CMD_TIMEOUT= CMDT_GIVEN= T67_ELASTIC= ELASTIC_GIVEN= POS=()
+T67_SET= T67_SEED= SEED_GIVEN= T67_LEVERS= LEVERS_GIVEN= T67_CMD_TIMEOUT= CMDT_GIVEN= T67_ELASTIC= ELASTIC_GIVEN=
+T67_ASYNC= ASYNC_GIVEN= T67_STALE= STALE_GIVEN= POS=()
 for x in "${@:2}"; do
   case "$x" in set=*) T67_SET=${x#set=};; seed=*) T67_SEED=${x#seed=} SEED_GIVEN=1;;
     levers=*) T67_LEVERS=${x#levers=} LEVERS_GIVEN=1;; cmdtimeout=*) T67_CMD_TIMEOUT=${x#cmdtimeout=} CMDT_GIVEN=1;;
     elastic=*) T67_ELASTIC=${x#elastic=} ELASTIC_GIVEN=1;;
+    async=*) T67_ASYNC=${x#async=} ASYNC_GIVEN=1;; stale=*) T67_STALE=${x#stale=} STALE_GIVEN=1;;
     *) POS+=("$x");; esac
 done
 T67_P=${POS[0]:-4} T67_G=${POS[1]:-8} T67_STEPS=${POS[2]:-40}
@@ -70,8 +74,12 @@ case "$MODE" in train67*) [[ $T67_P =~ ^[1-9][0-9]*$ && $T67_G =~ ^[1-9][0-9]*$ 
   [ -z "$CMDT_GIVEN" ] || { [[ $T67_CMD_TIMEOUT =~ ^[1-9][0-9]{0,2}$ ]] && [ "$T67_CMD_TIMEOUT" -ge 5 ] && [ "$T67_CMD_TIMEOUT" -le 600 ]; } \
     || { echo "cmdtimeout=N: seconds per command, 5 to 600 (default 60): $T67_CMD_TIMEOUT"; exit 1; }
   [ -z "$ELASTIC_GIVEN" ] || [ "$T67_ELASTIC" = 1 ] || { echo "elastic=1 is the only value: $T67_ELASTIC"; exit 1; }
+  [ -z "$ASYNC_GIVEN" ] || [ "$T67_ASYNC" = 1 ] || { echo "async=1 is the only value: $T67_ASYNC"; exit 1; }
+  [ -z "$ASYNC_GIVEN" ] || [ "$MODE" != train67_smoke ] || { echo "async=1 is for train67 and train67_test"; exit 1; }
+  [ -z "$STALE_GIVEN" ] || { [ -n "$ASYNC_GIVEN" ] && [[ $T67_STALE =~ ^[1-9][0-9]?$ ]]; } \
+    || { echo "stale=N (1-99) goes with async=1: $T67_STALE"; exit 1; }
   ;;
-  *) [ -z "$T67_SET$SEED_GIVEN$LEVERS_GIVEN$CMDT_GIVEN$ELASTIC_GIVEN" ] || { echo "set=NAME, seed=N, levers=LIST, cmdtimeout=N and elastic=1 are for the train67 modes only, not $MODE"; exit 1; };; esac
+  *) [ -z "$T67_SET$SEED_GIVEN$LEVERS_GIVEN$CMDT_GIVEN$ELASTIC_GIVEN$ASYNC_GIVEN$STALE_GIVEN" ] || { echo "set=NAME, seed=N, levers=LIST, cmdtimeout=N, elastic=1, async=1 and stale=N are for the train67 modes only, not $MODE"; exit 1; };; esac
 T67_CMD_TIMEOUT=${T67_CMD_TIMEOUT:-60}
 # seed=N (default 67: the run as before, byte for byte): the data order (rl/train67_data.py: epoch e is the permutation
 # of random.Random(N + e)) and miles' seeds (rl/rl_inner.sh: --seed 1 + 100 (N - 67), the actor's torch seed and the
@@ -97,11 +105,13 @@ T67_TAG=${T67_SET:+_$T67_SET}
 [ "$T67_CMD_TIMEOUT" = 60 ] || T67_TAG=${T67_TAG}_t$T67_CMD_TIMEOUT
 # elastic=1: engines in other jobs join, so its own run dir too
 [ -z "$T67_ELASTIC" ] || T67_TAG=${T67_TAG}_e
+# async=1: another layout and estimator, so its own run dir too (_a, or _a<N> with a staleness bound)
+[ -z "$T67_ASYNC" ] || T67_TAG=${T67_TAG}_a$T67_STALE
 [ "$MODE" = train67 ] && OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/train67${T67_TAG}_p${T67_P}g${T67_G}
 [ "$MODE" = train67_test ] && OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/train67_test${T67_TAG}_p${T67_P}g${T67_G}
 RESUMABLE=; case "$MODE" in run20|train67|train67_test) RESUMABLE=1;; esac
 # tests/test_train67_seed.py: the parsed arguments and the run dir only, nothing made or started
-[ -z "${RL_JOB_PRINT_ONLY:-}" ] || { echo "MODE=$MODE P=$T67_P G=$T67_G STEPS=$T67_STEPS SET=$T67_SET SEED=$T67_SEED OUT=$OUT${T67_LEVERS:+ LEVERS=$T67_LEVERS}$([ "$T67_CMD_TIMEOUT" = 60 ] || echo " CMDTIMEOUT=$T67_CMD_TIMEOUT")${T67_ELASTIC:+ ELASTIC=1}"; exit 0; }
+[ -z "${RL_JOB_PRINT_ONLY:-}" ] || { echo "MODE=$MODE P=$T67_P G=$T67_G STEPS=$T67_STEPS SET=$T67_SET SEED=$T67_SEED OUT=$OUT${T67_LEVERS:+ LEVERS=$T67_LEVERS}$([ "$T67_CMD_TIMEOUT" = 60 ] || echo " CMDTIMEOUT=$T67_CMD_TIMEOUT")${T67_ELASTIC:+ ELASTIC=1}${T67_ASYNC:+ ASYNC=1}${T67_STALE:+ STALE=$T67_STALE}"; exit 0; }
 # the planned time stop: one step and a save must fit after it (run20: 43 min a step; train67 at B = 32: up to the
 # 60-min wall cap, ~4 x run20's 4-min train time, sync and save, ~85 min)
 STOP_S=4500; case "$MODE" in train67*) STOP_S=6300;; esac
@@ -169,7 +179,11 @@ fi
 # 8k episodes 18-28 min and one over 31), so a loaded GPU may idle 45 min (the host is cancelled at 90)
 # train67: 32 episodes keep the one engine busy until the last one ends (up to the 60-min cap): 30 min at 0% is a hang
 IDLE=45; [[ $MODE == train67* ]] && IDLE=30
-GPU_IDLE_MIN=$IDLE gpu_watch $$ "$OUT/gpu.log" "grep -q 'POST /v1/chat/completions' '$OUT/train_segment.log' 2>/dev/null" 35 &
+# async=1: the actor's 4 GPUs wait for the first P groups (up to the 60-min wall cap) before its first step, so idle
+# minutes count from the first step on (GPU_ACTIVE_CMD), with 85 min at 0% in any phase as the outer bound
+ACTIVE= MAXIDLE=
+[ -n "$T67_ASYNC" ] && ACTIVE="grep -q 'perf/train_time' '$OUT/train_segment.log' 2>/dev/null" MAXIDLE=85
+GPU_ACTIVE_CMD=$ACTIVE GPU_IDLE_MAX_MIN=$MAXIDLE GPU_IDLE_MIN=$IDLE gpu_watch $$ "$OUT/gpu.log" "grep -q 'POST /v1/chat/completions' '$OUT/train_segment.log' 2>/dev/null" 35 &
 WD=$!
 # host memory every 10 s (the node's used MiB, this job's cgroup MiB: what --mem bounds, and the cgroup's
 # non-reclaimable MiB: memory.current minus its page cache, memory.stat file - shmem) and the planned stops. The guard
@@ -221,7 +235,8 @@ start timeout -k 300 "$LIMIT" apptainer exec --pid --nv --contain --cleanenv --w
   --bind /dev/shm --env PYTHONNOUSERSITE=1 --env PYTHONDONTWRITEBYTECODE=1 --env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" \
   --env JID="$JID" --env OUT="$OUT" --env PKG="$PKG" --env TMPDIR="$TMPDIR" --env T67_P="$T67_P" --env T67_G="$T67_G" \
   --env T67_STEPS="$T67_STEPS" --env T67_SEED="$T67_SEED" --env T67_LEVERS="$T67_LEVERS" --env T67_CMD_TIMEOUT="$T67_CMD_TIMEOUT" \
-  --env T67_ELASTIC="$T67_ELASTIC" --env IP="$IP" "$SIF" bash "$REPO/rl/rl_inner.sh" "$MODE"
+  --env T67_ELASTIC="$T67_ELASTIC" --env T67_ASYNC="$T67_ASYNC" --env T67_STALE="$T67_STALE" --env IP="$IP" \
+  "$SIF" bash "$REPO/rl/rl_inner.sh" "$MODE"
 wait "${STARTED[0]}"
 rc=$?
 echo "[s5] $(date -u +%FT%TZ) container exit $rc"

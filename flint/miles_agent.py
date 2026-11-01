@@ -436,7 +436,16 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
     if live and os.path.isdir(live):
         if os.path.isdir(os.path.join(d, "traces")):   # this rollout ran before, in a segment that stopped
             os.rename(os.path.join(d, "traces"), os.path.join(d, f"traces.before_{int(os.path.getmtime(os.path.join(d, 'traces')))}"))
-        os.rename(live, os.path.join(d, "traces"))
+        if os.environ.get("MA_RL_ASYNC"):
+            # fully async (rl/rl_inner.sh async=1): the episodes of later batches are still writing there, so only this
+            # batch's episodes move (one agent process per episode writes agent_<pid>.jsonl, flint/game.py trace)
+            os.makedirs(os.path.join(d, "traces"))
+            for pid in sorted({(s.metadata or {}).get("flint_trace_pid") for s in samples} - {None}):
+                f = os.path.join(live, f"agent_{pid}.jsonl")
+                if os.path.exists(f):
+                    os.rename(f, os.path.join(d, "traces", f"agent_{pid}.jsonl"))
+        else:
+            os.rename(live, os.path.join(d, "traces"))
 
     ids_path = os.path.join(out, "probe_ids.json")
     if not os.path.exists(ids_path):
