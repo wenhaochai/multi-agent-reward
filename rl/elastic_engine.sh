@@ -156,7 +156,7 @@ alive() { local p; for p in "${SRV[@]}"; do kill -0 "$p" 2>/dev/null || return 1
 # load: every engine answers /health_generate, reports TP GPUs, and generates one token (up to 40 min: 80 GB of weights)
 for i in $(seq 0 $((N - 1))); do
   until [ "$(http "${URLS[i]}" /health_generate)" = 200 ]; do
-    alive || { echo "[engine] a server ended while loading: $(tail -3 "$RUN/engine_logs/$JID."*.log)"; exit 1; }
+    alive || { echo "[engine] a server ended while loading: $(tail -q -n 3 "$RUN/engine_logs/$JID."*.log)"; exit 1; }
     [ -e "$RUN/STOP" ] && { echo "[engine] $RUN/STOP appeared while loading"; exit 0; }
     [ -n "$WARM" ] && [ -e "$RUN/warmup/leave" ] && { echo "[engine] warm-up: asked to leave while loading ($(cat "$RUN/warmup/leave"))"; exit 0; }
     [ $(( $(date +%s) - T0 )) -gt 2400 ] && { echo "[engine] engine $i not healthy after 40 min"; exit 1; }
@@ -210,7 +210,7 @@ bad=0 seen=
 while sleep "$BEAT" & wait $!; do   # a background sleep, so a TERM is handled at once
   "${REG[@]}" beat "$REGROOT/engines/$JID.json" || "${REG[@]}" register "$REGROOT" "$JID" "$(hostname)" "${SPECS[@]}" \
     --state serving --log "$RUN/engine_logs/$JID.0.log" >/dev/null
-  alive || { echo "[engine] $(date -u +%FT%TZ) a server ended: $(tail -3 "$RUN/engine_logs/$JID."*.log)"; exit 1; }
+  alive || { echo "[engine] $(date -u +%FT%TZ) a server ended: $(tail -q -n 3 "$RUN/engine_logs/$JID."*.log)"; exit 1; }
   ok=1; for u in "${URLS[@]}"; do [ "$(http "$u" /health)" = 200 ] || ok=; done
   if [ -n "$ok" ]; then bad=0; else bad=$((bad + 1)); fi
   [ $((bad * BEAT)) -ge 600 ] && { echo "[engine] $(date -u +%FT%TZ) /health failing for $((bad * BEAT)) s"; exit 1; }

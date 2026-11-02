@@ -231,11 +231,16 @@ class Warmup:
                     self._send_leave("not serving in time")
                     return
                 await asyncio.sleep(self._poll_s)
-            own = [u for u in (self._workers() or []) if u != url]
-            if not own:
-                logger.warning(f"warm-up engine {url}: the router lists no engine to compare it with; sent away")
-                self._send_leave("no engine to compare with")
-                return
+            # the router takes a worker in asynchronously (POST /workers answers before it is listed: w912 read an empty
+            # list right after the first weight push), so the run's own engine may take a moment to show
+            while not (own := [u for u in (self._workers() or []) if u != url]):
+                if self._left:
+                    return
+                if self._clock() - t0 > self._join_s:
+                    logger.warning(f"warm-up engine {url}: the router lists no engine to compare it with; sent away")
+                    self._send_leave("no engine to compare with")
+                    return
+                await asyncio.sleep(self._poll_s)
             a, b = await asyncio.gather(asyncio.to_thread(self._checksums, url), asyncio.to_thread(self._checksums, own[0]))
             keys = set(a) | set(b)
             diff = sorted(k for k in keys if a.get(k) != b.get(k))
