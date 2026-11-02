@@ -172,6 +172,9 @@ ASYNC=()
 if [ -n "${T67_ASYNC:-}" ]; then
   [[ $MODE == train67 || $MODE == train67_test ]] || { echo "[s5] async=1 is for train67 and train67_test"; exit 1; }
   export MA_RL_ASYNC=1 MA_ASYNC_SAMPLES_PER_ENGINE=${MA_ASYNC_SAMPLES_PER_ENGINE:-16} SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0
+  # the warm-up engine of a fresh start (rl/rl_job.sh, flint.elastic_rollout): its files; a turn its leave cuts short
+  # is retried on the run's own engine (flint/chat.py), as an engine job's (elastic=1)
+  export MA_WARMUP_DIR=$OUT/warmup MA_AG_RETRY_S=600
   ENGINE_TP=4 T67_TP=4
   SERVE[1]=4 SERVE[3]=4
   ASYNC=(--actor-num-gpus-per-node 4 --sglang-mem-fraction-static 0.85 --fully-async
@@ -297,8 +300,10 @@ trap 'ray stop --force >/dev/null 2>&1' EXIT   # this PID namespace's Ray only
 train() {
   local driver=train.py
   [ ${#ASYNC[@]} -eq 0 ] || { set -- "$@" "${ASYNC[@]}"; driver=train_async.py; }
-  if [ ${#ELASTIC[@]} -gt 0 ]; then   # what the engine jobs serve: this argv, and the run's own engines' serving environment
-    set -- "$@" "${ELASTIC[@]}"
+  [ ${#ELASTIC[@]} -eq 0 ] || set -- "$@" "${ELASTIC[@]}"
+  # what the engines miles does not launch serve (engine jobs, async's warm-up engine): this argv, and the run's own
+  # engines' serving environment
+  if [ ${#ELASTIC[@]} -gt 0 ] || [ ${#ASYNC[@]} -gt 0 ]; then
     write_engine_spec "$OUT/engine_spec.json" "$@" || return 1
   fi
   if [ -n "${APPEND:-}" ]; then echo "=== segment $(date -u +%FT%TZ)" >> "$OUT/train.log"; else : > "$OUT/train.log"; fi

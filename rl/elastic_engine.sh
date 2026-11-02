@@ -25,38 +25,77 @@
 # Bounds: timeout -s KILL around each container, the GPU watch (rl/gpu_watch.sh: a joining engine waits for the run's
 # next weight push, up to one RL step, so 60 min at 0% with weights loaded; 10 min with nothing loaded), and cleanup of
 # only the process groups this job started (serving/check/procs.sh).
+# EL_WARMUP=1: the warm-up engine of an async run's fresh start (rl/rl_job.sh async=1 starts it in the trainer's own
+# job, on the actor's 4 GPUs, with EL_SPEC_AFTER = the segment's start): one engine of the run's TP on those GPUs,
+# idle until the first step's data is in. It registers in RUN/warmup/engines, never in RUN/engines: miles never pushes
+# weights to it (NCCL cannot place an engine rank on an actor rank's GPU); the run's producer (flint.elastic_rollout)
+# compares its weights with the run's own engine's and routes to it. It needs no trainer heartbeat (it is the trainer's
+# job), serves this segment's spec (RUN/engine_spec.json newer than EL_SPEC_AFTER) with mem_fraction_static 0.72 (the
+# actor keeps up to 7 GiB per GPU: w894's peak 7162 MiB on GPU 0), leaves on RUN/warmup/leave (drain at most 10 min),
+# and when it ends waits until its GPUs hold under 12 GiB and writes RUN/warmup/gone ({"job", "time", "max_gpu_mib"}),
+# which the producer waits for before the first step trains on those GPUs.
 set -uo pipefail
 RUN=${1:?usage: elastic_engine.sh RUN}
 LIMIT=${EL_LIMIT_S:-82800}
 JID=${FETCHED_JOB_ID:-$SLURM_JOB_ID}
 [ -n "$JID" ] || { echo "no job id"; exit 1; }
+WARM=${EL_WARMUP:-}
+REGROOT=$RUN; [ -z "$WARM" ] || REGROOT=$RUN/warmup   # where this job's record and leave file live
 HERE=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic2   # this job's own helpers (registry, GPU watch, procs)
 SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif
 # timings (the EL_* variables only for tests/dryrun_elastic.sh; a wq job runs with the defaults)
 BEAT=${EL_BEAT_S:-30} STALE=${EL_STALE_S:-900} DRAIN_MIN=${EL_DRAIN_MIN_S:-300} DRAIN_MAX=${EL_DRAIN_MAX_S:-1200}
-LEAVE_BEFORE=${EL_LEAVE_BEFORE_S:-1200} MIN_LEFT=${EL_MIN_LEFT_S:-1800}
+LEAVE_BEFORE=${EL_LEAVE_BEFORE_S:-1200} MIN_LEFT=${EL_MIN_LEFT_S:-1800} MEMF=${EL_MEM_FRACTION:-0.85}
+# the warm-up engine reacts to its leave within seconds and drains for at most 10 min (the actor waits for it)
+[ -z "$WARM" ] || { BEAT=${EL_BEAT_S:-5} DRAIN_MIN=${EL_DRAIN_MIN_S:-10} DRAIN_MAX=${EL_DRAIN_MAX_S:-600} MEMF=${EL_MEM_FRACTION:-0.72}; }
 HERE=${EL_HERE:-$HERE} SIF=${EL_SIF:-$SIF}
 REG=(timeout 60 python3 "$HERE/rl/registry.py")   # a scratch stall cannot hold the job
 export TMPDIR=/scratch/gpfs/GROUP/USER/tmp/job/$JID
-[ -e "$RUN/STOP" ] && { echo "[engine] $RUN/STOP exists: the run is over ($(cat "$RUN/STOP"))"; exit 0; }
+[ -z "$WARM" ] && [ -e "$RUN/STOP" ] && { echo "[engine] $RUN/STOP exists: the run is over ($(cat "$RUN/STOP"))"; exit 0; }
 trainer_age() { timeout 30 python3 -c "import json, sys, time; print(int(time.time() - json.load(open(sys.argv[1]))['heartbeat']))" "$RUN/trainer.json" 2>/dev/null || echo 999999; }
-age=$(trainer_age)
-[ "$age" -le 90 ] && [ -s "$RUN/engine_spec.json" ] \
-  || { echo "[engine] no live trainer in $RUN (heartbeat age $age s, spec $(ls "$RUN/engine_spec.json" 2>/dev/null || echo missing)): back to the queue"; exit 98; }
-mkdir -p "$RUN/engines" "$RUN/engine_logs" "$TMPDIR/tmp"
+gpu_mib() {   # the most memory any GPU of this job holds (MiB; empty if nvidia-smi does not answer)
+  timeout 30 nvidia-smi -i "$CUDA_VISIBLE_DEVICES" --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null \
+    | awk -F', *' '$2 + 0 > m {m = $2 + 0} END {if (NR) print m + 0}'
+}
+warm_gone() {   # EL_WARMUP, at the end: wait (up to 3 min) until the GPUs hold under 12 GiB, then RUN/warmup/gone
+  local t0=$SECONDS m=
+  while [ $((SECONDS - t0)) -lt 180 ]; do
+    m=$(gpu_mib)
+    [ -n "$m" ] && [ "$m" -lt 12288 ] && break
+    sleep 3
+  done
+  echo "{\"job\": \"$JID\", \"time\": $(date +%s), \"max_gpu_mib\": \"${m:-unknown}\"}" > "$RUN/warmup/gone.tmp.$$" \
+    && mv "$RUN/warmup/gone.tmp.$$" "$RUN/warmup/gone"
+  echo "[engine] $(date -u +%FT%TZ) warm-up gone: its GPUs hold at most ${m:-unknown} MiB"
+}
+if [ -n "$WARM" ]; then   # this segment's spec, written by rl/rl_inner.sh as the trainer starts
+  : "${EL_SPEC_AFTER:?EL_WARMUP needs EL_SPEC_AFTER, the start time of the segment}"
+  mkdir -p "$RUN/warmup"
+  until [ -s "$RUN/engine_spec.json" ] && [ "$(stat -c %Y "$RUN/engine_spec.json")" -ge "$EL_SPEC_AFTER" ]; do
+    [ -e "$RUN/warmup/leave" ] && { echo "[engine] warm-up: asked to leave before the spec came"; warm_gone; exit 0; }
+    [ $(( $(date +%s) - EL_SPEC_AFTER )) -gt 900 ] && { echo "[engine] warm-up: no spec from this segment after 15 min"; warm_gone; exit 1; }
+    sleep 5
+  done
+else
+  age=$(trainer_age)
+  [ "$age" -le 90 ] && [ -s "$RUN/engine_spec.json" ] \
+    || { echo "[engine] no live trainer in $RUN (heartbeat age $age s, spec $(ls "$RUN/engine_spec.json" 2>/dev/null || echo missing)): back to the queue"; exit 98; }
+fi
+mkdir -p "$REGROOT/engines" "$RUN/engine_logs" "$TMPDIR/tmp"
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY   # the trainer and the engines talk over the cluster network
 source "$HERE/serving/check/procs.sh"
 source "$HERE/rl/gpu_watch.sh"
 WD= SMI=
-trap '"${REG[@]}" deregister "$RUN" "$JID"; stop "${STARTED[@]}"; kill $WD $SMI 2>/dev/null; rm -rf -- "/scratch/gpfs/GROUP/USER/tmp/job/$JID"' EXIT
+trap '"${REG[@]}" deregister "$REGROOT" "$JID"; stop "${STARTED[@]}"; kill $WD $SMI 2>/dev/null; [ -z "$WARM" ] || warm_gone; rm -rf -- "/scratch/gpfs/GROUP/USER/tmp/job/$JID"' EXIT
 trap 'exit 143' TERM INT
 SPEC=$TMPDIR/engine_spec.json
 cp "$RUN/engine_spec.json" "$SPEC"   # this job serves the spec it started with
 read -r TP REPO MILES FLINT < <(python3 -c "import json, sys; s = json.load(open(sys.argv[1])); print(s['tp'], s['repo'], s['miles'], s['flint'])" "$SPEC")
 IFS=, read -r -a DEV <<< "${CUDA_VISIBLE_DEVICES:-}"
-[ "${#DEV[@]}" -eq 8 ] || { echo "[engine] needs 8 GPUs, got CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"; exit 1; }
 case "$TP" in 4|8) ;; *) echo "[engine] the spec's TP is $TP; this job serves TP4 or TP8"; exit 1;; esac
-N=$((8 / TP))
+NG=8; [ -z "$WARM" ] || NG=$TP   # the warm-up engine: one engine on the actor's GPUs
+[ "${#DEV[@]}" -eq "$NG" ] || { echo "[engine] needs $NG GPUs, got CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"; exit 1; }
+N=$((NG / TP))
 JNUM=${JID//[!0-9]/}; JNUM=$((10#${JNUM:-0} % 20))   # engine i of this job serves with the run's seed + 10 + 2 JNUM + i
 IP=$(ip -4 -o addr show eno8303 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
 [ -n "$IP" ] || IP=$(hostname -i | tr ' ' '\n' | grep -E '^172\.' | head -1)
@@ -92,8 +131,8 @@ for i in $(seq 0 $((N - 1))); do
   URLS+=("http://$IP:$((BASE + 50 * i + 40))")
   SPECS+=("${URLS[i]},$TP,$(IFS=:; echo "${DEV[*]:$((i * TP)):$TP}")")
 done
-"${REG[@]}" register "$RUN" "$JID" "$(hostname)" "${SPECS[@]}" --state loading --log "$RUN/engine_logs/$JID.0.log" >/dev/null || exit 1
-GPU_IDLE_MIN=60 gpu_watch $$ "$RUN/engine_logs/$JID.gpu.log" "grep -q '\"serving\"' '$RUN/engines/$JID.json' 2>/dev/null" 40 &
+"${REG[@]}" register "$REGROOT" "$JID" "$(hostname)" "${SPECS[@]}" --state loading --log "$RUN/engine_logs/$JID.0.log" >/dev/null || exit 1
+GPU_IDLE_MIN=60 gpu_watch $$ "$RUN/engine_logs/$JID.gpu.log" "grep -q '\"serving\"' '$REGROOT/engines/$JID.json' 2>/dev/null" 40 &
 WD=$!
 timeout "$LIMIT" nvidia-smi -i "$CUDA_VISIBLE_DEVICES" --query-gpu=timestamp,index,memory.used,utilization.gpu --format=csv,noheader,nounits -l 10 \
   > "$RUN/engine_logs/$JID.gpu_mem.csv" 2>/dev/null &
@@ -103,7 +142,7 @@ for i in $(seq 0 $((N - 1))); do
     --bind /scratch/gpfs/GROUP --bind "$TMPDIR/tmp":/tmp --bind /dev/shm \
     --env PYTHONNOUSERSITE=1 --env PYTHONDONTWRITEBYTECODE=1 --env CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${DEV[*]:$((i * TP)):$TP}")" \
     --env IP="$IP" --env PORT="$((BASE + 50 * i + 40))" --env BASE="$((BASE + 50 * i))" --env SEED_OFFSET="$((10 + 2 * JNUM + i))" \
-    --env PKG="$PKG" --env TMPDIR="$TMPDIR" --env SPEC="$SPEC" --env REPO="$REPO" --env MILES="$MILES" \
+    --env PKG="$PKG" --env TMPDIR="$TMPDIR" --env SPEC="$SPEC" --env REPO="$REPO" --env MILES="$MILES" --env MEM_FRACTION="$MEMF" \
     "$SIF" bash "$REPO/rl/elastic_engine_inner.sh" serve > "$RUN/engine_logs/$JID.$i.log" 2>&1
 done
 SRV=("${STARTED[@]}")
@@ -119,8 +158,9 @@ for i in $(seq 0 $((N - 1))); do
   until [ "$(http "${URLS[i]}" /health_generate)" = 200 ]; do
     alive || { echo "[engine] a server ended while loading: $(tail -3 "$RUN/engine_logs/$JID."*.log)"; exit 1; }
     [ -e "$RUN/STOP" ] && { echo "[engine] $RUN/STOP appeared while loading"; exit 0; }
+    [ -n "$WARM" ] && [ -e "$RUN/warmup/leave" ] && { echo "[engine] warm-up: asked to leave while loading ($(cat "$RUN/warmup/leave"))"; exit 0; }
     [ $(( $(date +%s) - T0 )) -gt 2400 ] && { echo "[engine] engine $i not healthy after 40 min"; exit 1; }
-    "${REG[@]}" beat "$RUN/engines/$JID.json"
+    "${REG[@]}" beat "$REGROOT/engines/$JID.json"
     sleep 10
   done
   ws=$(curl -s --noproxy '*' -m 30 "${URLS[i]}/server_info" | timeout 30 python3 -c 'import json,sys; print(json.load(sys.stdin)["internal_states"][0]["world_size"])' 2>/dev/null)
@@ -128,7 +168,7 @@ for i in $(seq 0 $((N - 1))); do
   code=$(http "${URLS[i]}" /generate '{"input_ids": [1, 2, 3, 4], "sampling_params": {"max_new_tokens": 1, "temperature": 0.0}}' 300)
   [ "$code" = 200 ] || { echo "[engine] engine $i: one-token /generate answered $code"; exit 1; }
 done
-"${REG[@]}" register "$RUN" "$JID" "$(hostname)" "${SPECS[@]}" --state serving --log "$RUN/engine_logs/$JID.0.log" >/dev/null || exit 1
+"${REG[@]}" register "$REGROOT" "$JID" "$(hostname)" "${SPECS[@]}" --state serving --log "$RUN/engine_logs/$JID.0.log" >/dev/null || exit 1
 echo "[engine] $(date -u +%FT%TZ) ${N} engine(s) serving after $(( $(date +%s) - T0 )) s: ${URLS[*]}"
 
 running() {   # the requests running or waiting on this job's engines (SGLang /v1/loads; -1 when unknown)
@@ -151,11 +191,11 @@ leave() {   # leave CODE REASON: the record says leaving (the run withdraws the 
   timeout 60 python3 -c "
 import json, os, sys, time
 f = sys.argv[1]; r = json.load(open(f)); r['leaving'] = time.time()
-t = f + '.tmp'; json.dump(r, open(t, 'w')); os.replace(t, f)" "$RUN/engines/$JID.json"
+t = f + '.tmp'; json.dump(r, open(t, 'w')); os.replace(t, f)" "$REGROOT/engines/$JID.json"
   local t0 n
   t0=$(date +%s)
   while sleep $((BEAT < 15 ? BEAT : 15)); do
-    "${REG[@]}" beat "$RUN/engines/$JID.json" >/dev/null
+    "${REG[@]}" beat "$REGROOT/engines/$JID.json" >/dev/null
     n=$(running)
     [ $(( $(date +%s) - t0 )) -ge "$DRAIN_MIN" ] && [ "$n" = 0 ] && break
     [ $(( $(date +%s) - t0 )) -ge "$DRAIN_MAX" ] && { echo "[engine] $n request(s) still running after $((DRAIN_MAX / 60)) min"; break; }
@@ -168,16 +208,19 @@ t = f + '.tmp'; json.dump(r, open(t, 'w')); os.replace(t, f)" "$RUN/engines/$JID
 # serve: heartbeat every BEAT s; leave on STOP, a stale trainer, a dead or unhealthy server, or the host's end
 bad=0 seen=
 while sleep "$BEAT" & wait $!; do   # a background sleep, so a TERM is handled at once
-  "${REG[@]}" beat "$RUN/engines/$JID.json" || "${REG[@]}" register "$RUN" "$JID" "$(hostname)" "${SPECS[@]}" \
+  "${REG[@]}" beat "$REGROOT/engines/$JID.json" || "${REG[@]}" register "$REGROOT" "$JID" "$(hostname)" "${SPECS[@]}" \
     --state serving --log "$RUN/engine_logs/$JID.0.log" >/dev/null
   alive || { echo "[engine] $(date -u +%FT%TZ) a server ended: $(tail -3 "$RUN/engine_logs/$JID."*.log)"; exit 1; }
   ok=1; for u in "${URLS[@]}"; do [ "$(http "$u" /health)" = 200 ] || ok=; done
   if [ -n "$ok" ]; then bad=0; else bad=$((bad + 1)); fi
   [ $((bad * BEAT)) -ge 600 ] && { echo "[engine] $(date -u +%FT%TZ) /health failing for $((bad * BEAT)) s"; exit 1; }
   [ -e "$RUN/STOP" ] && { echo "[engine] $(date -u +%FT%TZ) $RUN/STOP: $(cat "$RUN/STOP" 2>/dev/null); done"; exit 0; }
-  age=$(trainer_age)
-  [ "$age" -le 90 ] && seen=1
-  [ -n "$seen" ] && [ "$age" -gt "$STALE" ] && leave 98 "the trainer's heartbeat is $age s old"
+  if [ -z "$WARM" ]; then   # the warm-up engine is the trainer's job: it ends with it
+    age=$(trainer_age)
+    [ "$age" -le 90 ] && seen=1
+    [ -n "$seen" ] && [ "$age" -gt "$STALE" ] && leave 98 "the trainer's heartbeat is $age s old"
+  fi
   [ "$(date +%s)" -gt $((END - LEAVE_BEFORE)) ] && leave 99 "$((LEAVE_BEFORE / 60)) min before the host's end"
-  [ -e "$RUN/engines/$JID.leave" ] && leave 0 "asked by $RUN/engines/$JID.leave"
+  [ -e "$REGROOT/engines/$JID.leave" ] && leave 0 "asked by $REGROOT/engines/$JID.leave"
+  [ -n "$WARM" ] && [ -e "$RUN/warmup/leave" ] && leave 0 "the warm-up is over: $(cat "$RUN/warmup/leave")"
 done
