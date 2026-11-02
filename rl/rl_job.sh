@@ -183,9 +183,11 @@ fi
 # train67: 32 episodes keep the one engine busy until the last one ends (up to the 60-min cap): 30 min at 0% is a hang
 IDLE=45; [[ $MODE == train67* ]] && IDLE=30
 # async=1: the actor's 4 GPUs wait for the first P groups (up to the 60-min wall cap) before its first step, so idle
-# minutes count from the first step on (GPU_ACTIVE_CMD), with 85 min at 0% in any phase as the outer bound
+# minutes count from the first step on (GPU_ACTIVE_CMD), with 85 min at 0% in any phase as the outer bound; between
+# steps they wait for the next P groups by design (with one engine about a rollout minus a train step, 30-50 min:
+# rollouts of 30-61 min, train steps of 5-14 min in w786), so a hang is 60 min at 0%, under the host's 90-min cancel
 ACTIVE= MAXIDLE=
-[ -n "$T67_ASYNC" ] && ACTIVE="grep -q 'perf/train_time' '$OUT/train_segment.log' 2>/dev/null" MAXIDLE=85
+[ -n "$T67_ASYNC" ] && ACTIVE="grep -q 'perf/train_time' '$OUT/train_segment.log' 2>/dev/null" MAXIDLE=85 IDLE=60
 GPU_ACTIVE_CMD=$ACTIVE GPU_IDLE_MAX_MIN=$MAXIDLE GPU_IDLE_MIN=$IDLE gpu_watch $$ "$OUT/gpu.log" "grep -q 'POST /v1/chat/completions' '$OUT/train_segment.log' 2>/dev/null" 35 &
 WD=$!
 # host memory every 10 s (the node's used MiB, this job's cgroup MiB: what --mem bounds, and the cgroup's
@@ -249,7 +251,7 @@ start timeout -k 300 "$LIMIT" apptainer exec --pid --nv --contain --cleanenv --w
 if [ -n "$T67_ASYNC" ] && [ -n "$FRESH" ]; then
   IFS=, read -r -a GPUS <<< "${CUDA_VISIBLE_DEVICES:-}"
   mkdir -p "$OUT/warmup" && echo "${JID}w" > "$OUT/warmup/launched"
-  start env EL_WARMUP=1 EL_SPEC_AFTER="$SEG_T0" FETCHED_JOB_ID="${JID}w" CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${GPUS[*]:0:4}")" \
+  start env EL_WARMUP=1 EL_SPEC_AFTER="$((SEG_T0 - 120))" FETCHED_JOB_ID="${JID}w" CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${GPUS[*]:0:4}")" \
     bash "$REPO/rl/elastic_engine.sh" "$OUT" > "$OUT/warmup/engine.log" 2>&1
   echo "[s5] async: warm-up engine ${JID}w on GPUs ${GPUS[*]:0:4} (log $OUT/warmup/engine.log)"
 fi
