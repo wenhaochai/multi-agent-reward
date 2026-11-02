@@ -175,4 +175,15 @@ for a in (("train67", "cmdtimeout=3"), ("train67", "cmdtimeout=abc"), ("train67"
           ("train67", "cmdtimeout=601"), ("run20", "cmdtimeout=30")):
     rc, out = job(*a)
     check(f"rl_job {' '.join(a)}: refused", rc != 0 and "OUT=" not in out, out)
+# wallcap=N (the game's wall cap per episode): 60 is the default run; another value gets its own run dir _wc<N>
+wc = {("train67", "2", "8", "20", "set=signal34", "levers=gate,graphs,tp4", "wallcap=35"):
+          f"SEED=67 OUT={R}/train67_signal34_kgate-graphs-tp4_wc35_p2g8 LEVERS=gate,graphs,tp4 WALLCAP=35",
+      ("train67", "2", "8", "10", "set=signal34", "wallcap=60"): f"SEED=67 OUT={R}/train67_signal34_p2g8"}
+for a, want in wc.items():
+    rc, out = job(*a)
+    check(f"rl_job {' '.join(a)}: {want.split('/')[-1]}", rc == 0 and out.endswith(want), out)
+for a in (("train67", "wallcap=5"), ("train67", "wallcap=61"), ("train67", "wallcap=abc"), ("train67", "wallcap="),
+          ("train67", "wallcap=035"), ("run20", "wallcap=35")):
+    rc, out = job(*a)
+    check(f"rl_job {' '.join(a)}: refused", rc != 0 and "OUT=" not in out, out)
 done()

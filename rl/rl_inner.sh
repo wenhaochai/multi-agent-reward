@@ -8,7 +8,7 @@
 set -uo pipefail
 : "${JID:?}" "${OUT:?}" "${PKG:?}" "${TMPDIR:?}"
 MODE=$1
-REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-train67d
+REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-train67e
 FLINT=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint
 MILES=/scratch/gpfs/GROUP/USER/project/miles-rollout
 MEMPROBE_DATA=/scratch/gpfs/GROUP/USER/tmp/flint_s5/memprobe_data   # a recorded batch for the schedule check
@@ -60,7 +60,14 @@ T67_B=$((T67_P * T67_G))
 case "$MODE" in
   train67*)
     export MA_LG_WALL_MIN=60 MA_RL_P=$T67_P MA_RL_WALL_STOP_FRAC=0.25 MA_RL_MAX_DROPPED_FRAC=0.25 MA_RL_DUMP_EVERY=5 \
-      MA_RL_DATA=$OUT/data_train67.jsonl FCS_RM_NODE_SLOTS=10 FCS_CASE_PROCS=12 MA_LG_DEDUP_SUBMIT=1 ;;
+      MA_RL_DATA=$OUT/data_train67.jsonl FCS_RM_NODE_SLOTS=10 FCS_CASE_PROCS=12 MA_LG_DEDUP_SUBMIT=1
+    # wallcap=N (rl/rl_job.sh -> T67_WALLCAP; unset or 60: the game as before): a shorter cap binds by design (replay of
+    # w808's episodes: 14% of the episodes at 35 min), so its stop rule allows 60% of a rollout's episodes in 2 rollouts
+    if [ -n "${T67_WALLCAP:-}" ] && [ "$T67_WALLCAP" != 60 ]; then
+      [[ $T67_WALLCAP =~ ^[1-9][0-9]*$ ]] || { echo "[s5] T67_WALLCAP: $T67_WALLCAP"; exit 1; }
+      export MA_LG_WALL_MIN=$T67_WALLCAP MA_RL_WALL_STOP_FRAC=0.6
+      echo "[s5] game: wall cap $MA_LG_WALL_MIN min per episode (default 60); wall stop rule at 60% of a rollout"
+    fi ;;
 esac
 # - milestones (train67 only): besides the newest 2 full checkpoints, the model part (DCP model/ and meta.json, ~149 GB;
 #   no optimizer) of every checkpoint iter_k with k % 20 == 0 stays, in $OUT/milestones/iter_k: hard links made by
