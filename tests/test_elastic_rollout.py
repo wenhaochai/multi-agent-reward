@@ -211,6 +211,29 @@ def test_the_warmup_engine_joins_with_equal_weights_and_leaves_at_the_first_step
     asyncio.run(main())
 
 
+def test_the_warmup_engine_waits_for_the_router_to_list_the_own_engine(tmp_path):
+    w, d, calls, changes = _warmup(tmp_path)
+    lists = iter([None, [], [W_URL]])
+    w._workers = lambda: next(lists, [OWN_URL])    # POST /workers answers before the worker is listed
+
+    async def main():
+        w.start()
+        await w._task
+        assert w.url == W_URL and calls == [("version", W_URL, "1"), ("add", W_URL)] and not (d / "leave").exists()
+    asyncio.run(main())
+
+
+def test_a_router_that_never_lists_the_own_engine_sends_the_warmup_engine_away(tmp_path):
+    w, d, calls, changes = _warmup(tmp_path, join_s=0.05)
+    w._workers = lambda: []
+
+    async def main():
+        w.start()
+        await w._task
+        assert w.url is None and calls == [] and (d / "leave").exists()
+    asyncio.run(main())
+
+
 def test_a_warmup_engine_with_other_weights_is_sent_away(tmp_path):
     w, d, calls, changes = _warmup(tmp_path, checksums=lambda url: {"rank0/w": "a1" if url == W_URL else "zz"})
 
