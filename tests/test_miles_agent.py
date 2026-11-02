@@ -5,6 +5,7 @@ a turn cut at its token limit, which the game replays as "(cut off)" (a branch a
 returned reward is the episode's S; drop_failed_groups takes a failed episode's group out of the loss; (c) log_rollout
 moves the traces, probes the served log-probs against a fake router, writes the rollout's line and fails on a failed
 sample check. Runs in miles-v0.1.3.sif (miles' strict matcher): tests/run_all.sh."""
+import os
 import asyncio
 import json
 
@@ -93,6 +94,16 @@ nested = [[[SimpleNamespace(metadata={}, remove_sample=False)],
 MA.drop_failed_groups(None, nested)
 check("filter: episodes as lists of samples", [[[x.remove_sample for x in e] for e in g] for g in nested]
       == [[[True], [True, True]], [[False], [False]]])
+# (2026-11-02) a group with a sample over MA_RL_MAX_SAMPLE_TOKENS leaves the loss whole, as a failed one does
+os.environ["MA_RL_MAX_SAMPLE_TOKENS"] = "10"
+capped = [[[SimpleNamespace(metadata={}, tokens=[0] * 11, remove_sample=False)],
+           [SimpleNamespace(metadata={}, tokens=[0] * 3, remove_sample=False)]],
+          [[SimpleNamespace(metadata={}, tokens=[0] * 10, remove_sample=False)],
+           [SimpleNamespace(metadata={}, tokens=[0] * 4, remove_sample=False)]]]
+MA.drop_failed_groups(None, capped)
+check("filter: a group with a sample over the cap leaves the loss, one at the cap stays",
+      [[[x.remove_sample for x in e] for e in g] for g in capped] == [[[True], [True]], [[False], [False]]])
+del os.environ["MA_RL_MAX_SAMPLE_TOKENS"]
 check("requests: sampling settings as given, tool not strict",
       all(b["temperature"] == 1.0 and b["top_p"] == 0.95 and b["top_k"] == 20 and not b["tools"][0]["function"]["strict"]
           for b in seen))

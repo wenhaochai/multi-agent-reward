@@ -227,12 +227,24 @@ def _keep_newest_checkpoints(root: str, keep: int, every: int = 0) -> None:
             shutil.rmtree(os.path.join(root, f"iter_{it:07d}"))
 
 
+def _sample_cap() -> int:
+    return int(os.environ.get("MA_RL_MAX_SAMPLE_TOKENS", "0") or 0)
+
+
+def _over_cap(samples, cap: int) -> bool:
+    """A sample over MA_RL_MAX_SAMPLE_TOKENS, the actor's memory bound (no context parallelism)."""
+    return cap > 0 and any(len(s.tokens) > cap for s in samples)
+
+
 def drop_failed_groups(args, data) -> None:
-    """miles' sample filter: every sample of a group with a failed episode leaves the loss. A group holds one entry per
-    episode, a list of the episode's samples (one per session-tree leaf)."""
+    """miles' sample filter: every sample of a group with a failed episode leaves the loss, and (2026-11-02) every
+    sample of a group with a sample over MA_RL_MAX_SAMPLE_TOKENS: the 110,000-character context cap assumes ~0.31
+    tokens per history character, and problem 177's history runs at ~0.6 (w793 rollout 3: 78,151 tokens; it used to
+    end the run). A group holds one entry per episode, a list of the episode's samples (one per session-tree leaf)."""
+    cap = _sample_cap()
     for group in data:
         samples = _samples(group)
-        if any((s.metadata or {}).get("flint_failed") for s in samples):
+        if any((s.metadata or {}).get("flint_failed") for s in samples) or _over_cap(samples, cap):
             for s in samples:
                 s.remove_sample = True
 
@@ -412,7 +424,8 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
     (rl/rl_inner.sh). After each rollout, in $MA_RL_OUT/r<rollout_id>/, where miles saved the rollout (rollout.pt):
     - the episodes' traces move in from $MA_AG_TRACE_DIR (the agents append there; the next rollout starts it anew);
     - rl/inspect_rollout.py checks the samples against the traces; a failed check raises, which ends the run, as does
-      a sample over $MA_RL_MAX_SAMPLE_TOKENS (the actor's memory bound), before any training on it;
+      a sample over $MA_RL_MAX_SAMPLE_TOKENS (the actor's memory bound) that stays in the loss, before any training on
+      it (with MA_RL_P, since 2026-11-02, such a sample's group leaves the loss instead, as a failed episode's does);
     - the served log-probs of a fixed sequence (the first 4096 tokens of rollout 0's first sample), twice, show which
       weights the engines serve: they change after a weight update, and the repeat gives the noise floor;
     - one line per rollout goes to $MA_RL_OUT/steps.jsonl: the episodes' rewards (S), submissions and failures, and
@@ -476,8 +489,12 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
         rec |= {"probe_change_mean_abs": sum(diffs) / max(len(diffs), 1), "probe_change_max_abs": max(diffs, default=None)}
 
     first = {}   # one sample per episode: its reward is the episode's S, its metadata the episode's numbers
+    by_ep = {}   # every sample of each episode
     for s in samples:
         first.setdefault((s.metadata or {}).get("flint_session"), s)
+        by_ep.setdefault((s.metadata or {}).get("flint_session"), []).append(s)
+    sample_cap = _sample_cap()   # (not "cap": the trace pass below reuses that name for the turn cap)
+    over_cap = {k for k, ss in by_ep.items() if _over_cap(ss, sample_cap)}   # their groups leave the loss (drop_failed_groups)
     episodes = {k: s.metadata or {} for k, s in first.items()}
     S = [s.reward for s in first.values()]
     rec |= {"episodes": len(episodes), "samples": len(samples), "failed": sum(bool(m.get("flint_failed")) for m in episodes.values()),
@@ -488,12 +505,16 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
             **({"dup_submits": [m.get("fo_lg_dup_submits") for m in episodes.values()]}
                if any("fo_lg_dup_submits" in m for m in episodes.values()) else {}),
             "wall_min_max": max((m.get("fo_lg_wall_min") or 0) for m in episodes.values()),
-            "tokens": sum(len(s.tokens) for s in samples), "max_sample_tokens": max(len(s.tokens) for s in samples)}
+            "tokens": sum(len(s.tokens) for s in samples), "max_sample_tokens": max(len(s.tokens) for s in samples),
+            "over_cap_samples": sum(1 for s in samples if sample_cap and len(s.tokens) > sample_cap),
+            "over_cap_episodes": len(over_cap)}
     if P:   # train67: one GRPO group per problem; a failed episode takes its whole group out of the loss
         groups = {}
         for k, s in first.items():
             groups.setdefault(s.group_index if getattr(s, "group_index", None) is not None else _pid(s.metadata or {}), []).append(k)
-        dropped = [g for g, ks in groups.items() if any(episodes[k].get("flint_failed") for k in ks)]
+        dropped = [g for g, ks in groups.items() if any(episodes[k].get("flint_failed") or k in over_cap for k in ks)]
+        kept = [s for g, ks in groups.items() if g not in dropped for k in ks for s in by_ep.get(k, [])]
+        rec["max_kept_sample_tokens"] = max((len(s.tokens) for s in kept), default=0)
         per = _per_problem({k: (episodes[k], first[k].reward) for k in first})
         rec |= {"problems": list(per), "planned": _planned(out, rollout_id, P), "per_problem": per,
                 "groups": len(groups), "dropped_groups": len(dropped),
@@ -564,7 +585,9 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
         print(f"[flint rollout {rollout_id}] STOP RULE: {stop}", flush=True)
     if r.returncode != 0:
         raise RuntimeError(f"rollout {rollout_id}: the sample check failed ({rec['inspect']}); see {d}/inspect.txt")
-    cap = int(os.environ.get("MA_RL_MAX_SAMPLE_TOKENS", "0"))
-    if cap and rec["max_sample_tokens"] > cap:
-        raise RuntimeError(f"rollout {rollout_id}: a sample of {rec['max_sample_tokens']} tokens is over {cap}")
+    # a sample over the cap ends the run only if its group stays in the loss (no MA_RL_P: no groups); with MA_RL_P its
+    # group left the loss above and counts toward the stop rule's MA_RL_MAX_DROPPED_FRAC
+    biggest = rec.get("max_kept_sample_tokens", rec["max_sample_tokens"])
+    if sample_cap and biggest > sample_cap:
+        raise RuntimeError(f"rollout {rollout_id}: a sample of {biggest} tokens is over {sample_cap}")
     return False
