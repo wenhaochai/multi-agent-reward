@@ -87,6 +87,18 @@ rc0, a0, l0 = argvs(os.path.join(old, "rl", "rl_inner.sh"), None)
 rc1, a1, l1 = argvs(os.path.join(ROOT, "rl", "rl_inner.sh"), None)
 rc2, a2, l2 = argvs(os.path.join(ROOT, "rl", "rl_inner.sh"), 67)
 rc3, a3, l3 = argvs(os.path.join(ROOT, "rl", "rl_inner.sh"), 68)
+# elastic-v2's args mode adds the elastic and async checks (new python3 calls: an engine provider, --fully-async, an
+# engine job's argv from its spec); every call 60e6d34 makes must stay byte-identical, so compare without the new ones
+NEW = ("--extra-inference-engine-provider-path", "--fully-async")
+
+
+def base_only(av):
+    return [a for a in av if not any(x in a for x in NEW) and not any(w.endswith("elastic_engine_argv.py") for w in a)]
+
+
+n_new = len(a1) - len(base_only(a1))
+check("argv: the elastic and async checks add python3 calls (an engine provider or --fully-async)", n_new > 0, n_new)
+a1, a2, a3 = base_only(a1), base_only(a2), base_only(a3)
 check(f"argv: {BASE}'s rl_inner.sh args gives 9 python3 calls (game settings, 4 run20/memprobe, 3 train67, schedule)",
       rc0 == 0 and len(a0) == 9, (rc0, len(a0), l0[-500:]))
 check(f"argv seed unset: every python3 argv byte-identical to {BASE}'s", rc1 == 0 and a1 == a0, l1[-500:])
