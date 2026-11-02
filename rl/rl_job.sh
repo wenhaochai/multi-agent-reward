@@ -28,7 +28,9 @@
 # from its next weight push on; the trainer writes RUN/trainer.json every 30 s and RUN/engine_spec.json (what the
 # engine jobs serve), and RUN/STOP when the run ends for good; the run dirs then hold _e; async=1: fully async RL on a
 # split node (rl/rl_inner.sh: the actor on 4 GPUs, the run's own 1 x TP4 engine on the other 4, train_async.py
-# --fully-async, TIS), stale=N its staleness bound (default none); the run dirs then hold _a, _a<N>):
+# --fully-async, TIS), stale=N its staleness bound (default none); on a fresh start a warm-up engine
+# (rl/elastic_engine.sh EL_WARMUP=1, its files in RUN/warmup) serves on the actor's 4 GPUs until the first step's data
+# is in (flint.elastic_rollout); the run dirs then hold _a, _a<N>):
 #   train67_smoke  B = P x G episodes of 4k tokens, 2 steps, no save (~1 h)
 #   train67_test   B episodes of 128k, 2 steps, a full checkpoint after each (host memory at its peak: the end of the
 #                  optimizer step and the save; step time), resumable in runs/train67_test[_NAME]_p<P>g<G>, exit 0
@@ -127,7 +129,8 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 source "$REPO/serving/check/procs.sh"
 source "$REPO/rl/gpu_watch.sh"
 WD= MEM= SMI= HB=
-trap 'stop "${STARTED[@]}"; kill $WD $MEM $SMI $HB 2>/dev/null; rm -rf -- "/scratch/gpfs/GROUP/USER/tmp/job/$JID"' EXIT
+# (the warm-up engine's own directory too, should it be killed before its own trap ran)
+trap 'stop "${STARTED[@]}"; kill $WD $MEM $SMI $HB 2>/dev/null; rm -rf -- "/scratch/gpfs/GROUP/USER/tmp/job/$JID" "/scratch/gpfs/GROUP/USER/tmp/job/${JID}w"' EXIT
 trap 'exit "$(cat "$OUT/exit_code" 2>/dev/null || echo 143)"' TERM INT   # a planned stop leaves its exit code there
 echo "[s5] $(date -u +%FT%TZ) $MODE node=$(hostname) job=$JID gpus=${CUDA_VISIBLE_DEVICES:-}"
 # this segment's end: Slurm's (or a fetching host's) SLURM_JOB_END_TIME, else the time limit of the parent timeout (a
@@ -230,6 +233,9 @@ if [ -n "$T67_ELASTIC" ]; then
   HB=$!
   echo "[s5] elastic: trainer at $IP; engine jobs: wq submit --partial $REPO/rl/elastic_engine.sh $OUT"
 fi
+# async=1: the warm-up engine's files are this segment's (flint.elastic_rollout reads RUN/warmup/launched)
+[ -z "$T67_ASYNC" ] || rm -rf -- "$OUT/warmup"
+SEG_T0=$(date +%s)
 start timeout -k 300 "$LIMIT" apptainer exec --pid --nv --contain --cleanenv --writable-tmpfs \
   --bind /scratch/gpfs/GROUP --bind "$TMPDIR/tmp":/tmp --bind "$TMPDIR/datasets":/root/datasets --bind /proc:/host/proc \
   --bind /dev/shm --env PYTHONNOUSERSITE=1 --env PYTHONDONTWRITEBYTECODE=1 --env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" \
@@ -237,6 +243,16 @@ start timeout -k 300 "$LIMIT" apptainer exec --pid --nv --contain --cleanenv --w
   --env T67_STEPS="$T67_STEPS" --env T67_SEED="$T67_SEED" --env T67_LEVERS="$T67_LEVERS" --env T67_CMD_TIMEOUT="$T67_CMD_TIMEOUT" \
   --env T67_ELASTIC="$T67_ELASTIC" --env T67_ASYNC="$T67_ASYNC" --env T67_STALE="$T67_STALE" --env IP="$IP" \
   "$SIF" bash "$REPO/rl/rl_inner.sh" "$MODE"
+# async=1 on a fresh start: the warm-up engine on the actor's 4 GPUs (the first 4 of this job's: miles puts the actor
+# there and its own engine on the other 4), loading the base checkpoint while the trainer starts; it ends on its own
+# (RUN/warmup/leave at the first step's data, or a failure) and with this job at the latest (the EXIT trap)
+if [ -n "$T67_ASYNC" ] && [ -n "$FRESH" ]; then
+  IFS=, read -r -a GPUS <<< "${CUDA_VISIBLE_DEVICES:-}"
+  mkdir -p "$OUT/warmup" && echo "${JID}w" > "$OUT/warmup/launched"
+  start env EL_WARMUP=1 EL_SPEC_AFTER="$SEG_T0" FETCHED_JOB_ID="${JID}w" CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${GPUS[*]:0:4}")" \
+    bash "$REPO/rl/elastic_engine.sh" "$OUT" > "$OUT/warmup/engine.log" 2>&1
+  echo "[s5] async: warm-up engine ${JID}w on GPUs ${GPUS[*]:0:4} (log $OUT/warmup/engine.log)"
+fi
 wait "${STARTED[0]}"
 rc=$?
 echo "[s5] $(date -u +%FT%TZ) container exit $rc"

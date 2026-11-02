@@ -104,6 +104,29 @@ wait $EP; rc=$?; kill $HB 2>/dev/null
 ok "H exit 0 ($rc)" '[ $rc = 0 ]'
 ok "H drained" 'grep -q "drained after" "$W/dry980.out"'
 
+echo "== W: the warm-up engine (EL_WARMUP=1): 4 GPUs, no trainer, this segment's spec, RUN/warmup only; leave, gone"
+RUN=$W/w; spec "$RUN" 4; touch -d '1 hour ago' "$RUN/engine_spec.json"; T0W=$(date +%s)
+EL_WARMUP=1 EL_SPEC_AFTER=$T0W CUDA_VISIBLE_DEVICES=0,1,2,3 engine dryw10 "$RUN"; EP=$BGPID
+sleep 4
+ok "W waits for this segment's spec" '[ ! -e "$RUN/warmup/engines/dryw10.json" ] && kill -0 $EP 2>/dev/null'
+spec "$RUN" 4   # rewritten: newer than EL_SPEC_AFTER
+upto 60 'serving "$RUN/warmup" dryw10'
+ok "W one TP4 engine on its 4 GPUs" "python3 -c \"import json; r = json.load(open('$RUN/warmup/engines/dryw10.json')); e = r['engines']; assert len(e) == 1 and e[0]['tp'] == 4 and e[0]['gpus'] == [0, 1, 2, 3], r\""
+ok "W nothing in RUN/engines (miles never sees it)" '[ -z "$(ls "$RUN/engines" 2>/dev/null)" ]'
+ok "W mem_fraction_static 0.72" 'grep -q "mem=0.72" "$RUN/engine_logs/dryw10.0.log"'
+echo "1 the first step's data is in" > "$RUN/warmup/leave"
+wait $EP; rc=$?
+ok "W exit 0 after the leave ($rc)" '[ $rc = 0 ]'
+ok "W drained" 'grep -q "drained after" "$W/dryw10.out"'
+ok "W gone, its GPUs under 12 GiB" "python3 -c \"import json; g = json.load(open('$RUN/warmup/gone')); assert g['job'] == 'dryw10' and int(g['max_gpu_mib']) < 12288, g\""
+ok "W record removed" '[ -z "$(ls "$RUN/warmup/engines")" ]'
+
+echo "== W2: the warm-up engine asked to leave before its spec comes: gone, exit 0"
+RUN=$W/w2; mkdir -p "$RUN/warmup"; echo "1 never needed" > "$RUN/warmup/leave"
+EL_WARMUP=1 EL_SPEC_AFTER=$(date +%s) CUDA_VISIBLE_DEVICES=0,1,2,3 engine dryw20 "$RUN"; wait $BGPID; rc=$?
+ok "W2 exit 0 ($rc)" '[ $rc = 0 ]'
+ok "W2 gone" '[ -s "$RUN/warmup/gone" ]'
+
 echo "${#fails[@]} failed${fails:+: ${fails[*]}}"
 [ ${#fails[@]} = 0 ] && rm -rf -- "$W"
 [ ${#fails[@]} = 0 ]

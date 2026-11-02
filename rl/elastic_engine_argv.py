@@ -8,7 +8,9 @@ The arguments are the run's own engine's (colocated, or on GPUs of its own with 
   base_gpu_id 0                                                       the GPUs are this engine's (CUDA_VISIBLE_DEVICES)
   gated_launch_port None                                              nothing gates the launch (miles' actor does, colocated)
   enable_memory_saver False                                           nothing to release for an actor
-  mem_fraction_static 0.85                                            the whole GPU is the engine's (KV pool size only)
+  mem_fraction_static 0.85                                            the whole GPU is the engine's (KV pool size only);
+                                                                      MEM_FRACTION in the environment instead (the
+                                                                      warm-up engine: 0.72, beside the idle actor)
   random_seed seed + SEED_OFFSET                                      apart from the colocated engines' seed + i
 The environment is miles' engine environment for the run (compute_inference_engine_env_vars: e.g. custom all-reduce
 v2 off at TP > 1 when colocated), then the spec's serving variables (the levers; async=1 turns v2 off), which win.
@@ -17,6 +19,7 @@ Usage: elastic_engine_argv.py SPEC HOST PORT BASE SEED_OFFSET
   BASE: the first of 40 consecutive free ports: nccl BASE, engine-info bootstrap BASE+1, dist-init BASE+8.
 Prints "ENV k=v ...", "DIFF <json: the keys changed from the run's own engine>", "ARGV <shell-quoted argv>"."""
 import json
+import os
 import shlex
 import sys
 
@@ -47,7 +50,7 @@ own = server_kwargs(dist_init_addr="127.0.0.1:1", nccl_port=2, host="127.0.0.1",
 ext = server_kwargs(dist_init_addr=f"{host}:{base + 8}", nccl_port=base, host=host, port=port, base_gpu_id=0,
                     engine_info_bootstrap_port=base + 1, gated_launch_port=None, random_seed=args.seed + seed_offset)
 ext["enable_memory_saver"] = False
-ext["mem_fraction_static"] = 0.85
+ext["mem_fraction_static"] = float(os.environ.get("MEM_FRACTION", "0.85"))
 diff = {k: (own.get(k), ext.get(k)) for k in sorted(set(own) | set(ext)) if own.get(k) != ext.get(k)}
 unexpected = sorted(set(diff) - CHANGED)
 assert not unexpected, f"the engine would differ from the run's own engine in {unexpected}: {diff}"
