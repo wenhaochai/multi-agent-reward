@@ -151,7 +151,11 @@ if [ -n "${T67_ELASTIC:-}" ]; then
   : "${IP:?}"
   [[ $MODE == train67* ]] || { echo "[s5] elastic=1 is for the train67 modes"; exit 1; }
   # an agent's request whose engine left is retried for 10 min (flint/chat.py), past the run's withdrawal of the engine
-  export MA_ENGINE_REGISTRY=$OUT NCCL_SOCKET_IFNAME=eno8303 MASTER_ADDR=$IP no_proxy=127.0.0.1,localhost,$IP MA_AG_RETRY_S=600
+  # the weight push to engines on other nodes: NCCL over TCP on bond0 (100 Gb/s IPoIB; 7.9 GB/s node to node in 4
+  # streams, 2026-11-02), not eno8303 (1 Gb/s: w867 pushed 80 GB in 678 s per step) and not IB verbs (the containers
+  # run --contain, without /dev/infiniband); NET logs show the transport each communicator picked
+  export NCCL_SOCKET_IFNAME=bond0 NCCL_IB_DISABLE=1 NCCL_NSOCKS_PERTHREAD=4 NCCL_SOCKET_NTHREADS=4 NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET
+  export MA_ENGINE_REGISTRY=$OUT MASTER_ADDR=$IP no_proxy=127.0.0.1,localhost,$IP MA_AG_RETRY_S=600
   ELASTIC=(--extra-inference-engine-provider-path flint.engine_registry.provider --update-weights-timeout 900)
 fi
 # async=1 (rl/rl_job.sh -> T67_ASYNC, T67_STALE): fully async RL on a split node. miles' async with an FSDP actor needs

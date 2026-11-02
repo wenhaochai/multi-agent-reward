@@ -12,8 +12,10 @@ mkdir -p "$HOME"
 export PYTHONPATH=$PKG:$REPO:$MILES PYTHONUNBUFFERED=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1
 export no_proxy=127.0.0.1,localhost,$IP
 # the weight push from the trainer's node: NCCL between separate apptainer instances needs cuMem off on both sides
-# (w545); bootstrap over eno8303, IB found by NCCL
-export NCCL_CUMEM_ENABLE=0 NCCL_SOCKET_IFNAME=eno8303
+# (w545)
+# the push itself over TCP on bond0 (100 Gb/s IPoIB), as the trainer's side (rl/rl_inner.sh, elastic=1): eno8303 is
+# 1 Gb/s (w867/w868: 678 s per push) and the container sees no /dev/infiniband
+export NCCL_CUMEM_ENABLE=0 NCCL_SOCKET_IFNAME=bond0 NCCL_IB_DISABLE=1 NCCL_NSOCKS_PERTHREAD=4 NCCL_SOCKET_NTHREADS=4 NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET
 out=$(python3 "$REPO/rl/elastic_engine_argv.py" "$SPEC" "$IP" "$PORT" "$BASE" "$SEED_OFFSET") || { echo "[engine] argv failed"; exit 1; }
 env_line=$(grep '^ENV ' <<< "$out" | cut -d' ' -f2-)
 argv_line=$(grep '^ARGV ' <<< "$out" | cut -d' ' -f2-)
