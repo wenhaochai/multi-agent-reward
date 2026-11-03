@@ -84,9 +84,13 @@ P=$((30000 + (JNUM % 1000) * 16))
 # a step with too few samples to give every rank its micro-batches gets zero-weight padding copies (the fork's schedule).
 # train67 replaces the batch flags (TRAIN67 below); the 64k-token micro-batch is the actor's memory bound per GPU, not
 # a batch size, so it stays: a step of B = 32 has ~4x run20's micro-batches (~32 per rank) and ~4x its train time.
+# malloc=keep (rl/rl_job.sh -> T67_MALLOC): freed memory stays with the rank's glibc: no mmap for large buffers, one arena, no trim below 100 GiB
+TRAIN_ENV='{"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "OMP_NUM_THREADS": "11", "MKL_NUM_THREADS": "11"'
+[ -z "${T67_MALLOC:-}" ] || TRAIN_ENV+=', "MALLOC_ARENA_MAX": "1", "MALLOC_MMAP_MAX_": "0", "MALLOC_TRIM_THRESHOLD_": "107374182400"'
+TRAIN_ENV+='}'
 TRAIN=(--train-backend fsdp --hf-checkpoint "$FLINT" --attn-implementation eager
   --actor-num-nodes 1 --actor-num-gpus-per-node "$NG" --seed 1 --fsdp-cpu-offload
-  --train-env-vars '{"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "OMP_NUM_THREADS": "11", "MKL_NUM_THREADS": "11"}'
+  --train-env-vars "$TRAIN_ENV"
   --advantage-estimator grpo --disable-grpo-std-normalization --kl-coef 0 --entropy-coef 0
   --loss-type score_centering --score-centering-is none --rollout-top-logprobs-num 32
   --optimizer adam --lr 2e-7 --lr-decay-style constant --weight-decay 0.0 --adam-beta1 0.9 --adam-beta2 0.98
@@ -180,7 +184,11 @@ if [ -n "${T67_ASYNC:-}" ]; then
   ASYNC=(--actor-num-gpus-per-node 4 --sglang-mem-fraction-static 0.85 --fully-async
     --rollout-function-path flint.elastic_rollout.ElasticFullyAsyncRolloutFn --score-centering-is tis)
   [ -z "${T67_STALE:-}" ] || ASYNC+=(--max-weight-staleness "$T67_STALE")
-  echo "[s5] async: actor 4 GPUs, own engine 1 x TP4, $MA_ASYNC_SAMPLES_PER_ENGINE episodes per engine in flight, TIS, staleness bound ${T67_STALE:-none}"
+  # stale=N >= 2: the finished-group buffer holds the whole window (miles' default holds 2 P), so that a put never blocks the producer
+  [ "${T67_STALE:-1}" -le 1 ] || ASYNC+=(--async-data-buffer-capacity-factor "$((T67_STALE + 1))")
+  # order=oldest (rl/rl_job.sh -> T67_ORDER): a drain takes the oldest weight version first and waits for an older group when it must (flint.elastic_rollout.OldestFirstDataBuffer)
+  [ -z "${T67_ORDER:-}" ] || ASYNC+=(--custom-async-data-buffer-path flint.elastic_rollout.OldestFirstDataBuffer)
+  echo "[s5] async: actor 4 GPUs, own engine 1 x TP4, $MA_ASYNC_SAMPLES_PER_ENGINE episodes per engine in flight, TIS, staleness bound ${T67_STALE:-none}${T67_ORDER:+, drains $T67_ORDER first}"
 fi
 write_engine_spec() {   # write_engine_spec FILE ARGV...: the spec rl/elastic_engine.sh serves (rl/elastic_engine_argv.py)
   python3 - "$1" "$ENGINE_TP" "$REPO" "$MILES" "$FLINT" "${@:2}" <<'PY'
@@ -274,7 +282,8 @@ if [ "$MODE" = args ]; then   # off-GPU: miles parses and checks each mode's arg
   echo "== train67 async (split node, fully async) with elastic engines; an engine job's argv from its spec"
   SERVE4=("${SERVE[@]}"); SERVE4[1]=4; SERVE4[3]=4
   ASYNC_ARGS=(--actor-num-gpus-per-node 4 --sglang-mem-fraction-static 0.85 --fully-async
-    --rollout-function-path flint.elastic_rollout.ElasticFullyAsyncRolloutFn --score-centering-is tis --max-weight-staleness 4)
+    --rollout-function-path flint.elastic_rollout.ElasticFullyAsyncRolloutFn --score-centering-is tis --max-weight-staleness 4
+    --async-data-buffer-capacity-factor 5 --custom-async-data-buffer-path flint.elastic_rollout.OldestFirstDataBuffer)
   A=("${TRAIN[@]}" "${TRAIN67[@]}" "${SERVE4[@]}" "${GAME67[@]}" "${T67_RUN[@]:1}" --num-rollout 40 "${ASYNC_ARGS[@]}"
     --extra-inference-engine-provider-path flint.engine_registry.provider --update-weights-timeout 900)
   T67_MODE=train67 T67_ASYNC=1 T67_ELASTIC=1 python3 "$REPO/rl/args_check.py" "${A[@]}" || exit 1

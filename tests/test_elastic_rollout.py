@@ -339,3 +339,175 @@ def test_the_first_step_waits_until_the_warmup_engine_is_gone_and_its_gpus_are_f
             assert "40000" in str(e)
         await g
     asyncio.run(high())
+
+
+# OldestFirstDataBuffer: fake groups with one weight-version span, the real miles get and stale filter
+def _group(version, index=0):
+    span = SimpleNamespace(version=str(version), abs_start=0, abs_end=10)
+    sample = SimpleNamespace(all_weight_version_spans=[span], index=index)
+    return SimpleNamespace(group=[sample], prompt_group=[sample], version=version)
+
+
+def _args(s=1, p=2, factor=2.0):
+    return SimpleNamespace(max_weight_staleness=s, rollout_batch_size=p, async_data_buffer_capacity_factor=factor, dynamic_sampling_filter_path=None)
+
+
+def _buffer(cls=None, **kw):
+    cls = cls or er.OldestFirstDataBuffer
+    dropped = []
+    b = cls(SimpleNamespace(args=_args(**kw), unused_handler_fn=lambda group, why: dropped.append((group, why))))
+    b._preput_filter = lambda entry: True     # aborted, missing reward, dynamic filter: miles' own
+    b.dropped = dropped
+    return b
+
+
+def test_a_drain_takes_the_oldest_version_first_not_the_first_finished():
+    async def go():
+        b = _buffer(s=2, p=2, factor=3.0)
+        for v in (5, 3, 4, 3):
+            await b.put(_group(v))
+        got = await b.get(num_groups=2, current_version=5)
+        assert [e.version for e in got] == [3, 3]
+        assert [e.version for e in b._buffer] == [4, 5]
+    asyncio.run(go())
+
+
+def test_a_drain_waits_for_a_group_at_its_last_chance_and_takes_it(monkeypatch):
+    monkeypatch.setattr(er, "DEADLINE_POLL_S", 0.01)
+
+    async def go():
+        b = _buffer(s=1, p=2)
+        await b.put(_group(5)); await b.put(_group(5))
+        running = [4]
+        b.in_flight_versions = lambda: list(running)
+        t = asyncio.ensure_future(b.get(num_groups=2, current_version=5))
+        await asyncio.sleep(0.05)
+        assert not t.done()                      # 2 groups are in, one at version 4 is on its way
+        await b.put(_group(4))                   # the worker's put comes before it takes the group off its list
+        await asyncio.sleep(0.03)
+        assert not t.done()
+        running.clear()
+        got = await asyncio.wait_for(t, 1)
+        assert [e.version for e in got] == [4, 5]
+        assert [e.version for e in b._buffer] == [5]
+        assert b.get_metrics()["rollout/fully_async/deadline_wait_s"] > 0
+    asyncio.run(go())
+
+
+def test_a_group_past_or_before_its_last_chance_holds_no_drain_up(monkeypatch):
+    async def go():
+        b = _buffer(s=1, p=2)
+        await b.put(_group(5)); await b.put(_group(5))
+        b.in_flight_versions = lambda: [3, 5]    # 3 is lost anyway, 5 has another step
+        got = await asyncio.wait_for(b.get(num_groups=2, current_version=5), 1)
+        assert len(got) == 2
+    asyncio.run(go())
+
+
+def test_a_drain_leaves_older_groups_their_places_before_their_last_step(monkeypatch):
+    """s = 2, P = 2, at the drain of version 5: 4 running groups of version 4 have the places of this drain and the next (5 and 6): taking 2 younger finished groups now would leave 4
+    for the 2 places at 6, so this drain waits for 2 of them, though none is at its last chance."""
+    monkeypatch.setattr(er, "DEADLINE_POLL_S", 0.01)
+
+    async def go():
+        b = _buffer(s=2, p=2, factor=3.0)
+        await b.put(_group(5)); await b.put(_group(5))
+        running = [4, 4, 4, 4]
+        b.in_flight_versions = lambda: list(running)
+        t = asyncio.ensure_future(b.get(num_groups=2, current_version=5))
+        await asyncio.sleep(0.05)
+        assert not t.done()
+        await b.put(_group(4)); running.pop()
+        await asyncio.sleep(0.05)
+        assert not t.done()                      # one is in, 3 run: 4 for 2 + 2 places, this drain must take 2
+        await b.put(_group(4)); running.pop()
+        got = await asyncio.wait_for(t, 1)
+        assert [e.version for e in got] == [4, 4]
+    asyncio.run(go())
+
+
+def test_with_slack_a_drain_takes_younger_groups_and_does_not_wait(monkeypatch):
+    async def go():
+        b = _buffer(s=2, p=2, factor=3.0)
+        await b.put(_group(5)); await b.put(_group(5))
+        b.in_flight_versions = lambda: [4, 4]    # 2 older groups, 2 + 2 places left: no need to wait
+        got = await asyncio.wait_for(b.get(num_groups=2, current_version=5), 1)
+        assert [e.version for e in got] == [5, 5]
+    asyncio.run(go())
+
+
+def test_without_a_staleness_bound_nothing_waits():
+    async def go():
+        b = _buffer(s=None, p=2)
+        await b.put(_group(1)); await b.put(_group(0))
+        b.in_flight_versions = lambda: [0, 1, 2]
+        got = await asyncio.wait_for(b.get(num_groups=2, current_version=2), 1)
+        assert [e.version for e in got] == [0, 1]
+    asyncio.run(go())
+
+
+def test_a_buffer_smaller_than_the_window_is_refused():
+    try:
+        _buffer(s=2, p=2, factor=2.0)
+    except AssertionError as e:
+        assert "window" in str(e)
+    else:
+        raise AssertionError("a buffer of 4 groups under a window of 6 was accepted")
+
+
+async def _run_window(cls, s, p, seed, steps=120):
+    """The window rule with random group durations: what the real producer does. Returns (the lags of the groups trained on, the groups dropped as stale)."""
+    import random
+    rng = random.Random(seed)
+    b = _buffer(cls, s=s, p=p, factor=float(s + 1))
+    version, draining, lags, running = 0, True, [], {}
+    b.in_flight_versions = lambda: list(running.values())
+    stop = asyncio.Event()
+
+    async def one(v):
+        await asyncio.sleep(rng.choice([0.001, 0.002, 0.003, 0.02]))
+        return _group(v)
+
+    async def producer():
+        active = set()
+        while not stop.is_set():
+            while len(active) + len(b._buffer) < (s + (1 if draining else 0)) * p:
+                t = asyncio.ensure_future(one(version))
+                running[t] = version
+                active.add(t)
+            if not active:
+                await asyncio.sleep(0.001)
+                continue
+            done, active = await asyncio.wait(active, timeout=0.001, return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                await b.put(t.result())
+                del running[t]
+        for t in active:
+            t.cancel()
+
+    w = asyncio.ensure_future(producer())
+    for _ in range(steps):
+        draining = True
+        got = await b.get(num_groups=p, current_version=version)
+        lags += [version - e.version for e in got]
+        draining = False
+        await asyncio.sleep(0.004)
+        version += 1
+    stop.set()
+    await w
+    return lags, len(b.dropped)
+
+
+def test_under_the_window_no_group_is_ever_dropped(monkeypatch):
+    monkeypatch.setattr(er, "DEADLINE_POLL_S", 0.001)
+    for s, p in ((1, 2), (2, 2), (3, 2), (1, 4), (2, 1), (2, 4), (3, 1)):
+        for seed in range(6):
+            lags, dropped = asyncio.run(_run_window(er.OldestFirstDataBuffer, s, p, seed))
+            assert dropped == 0, (s, p, seed)
+            assert max(lags) <= s
+
+
+def test_miles_fifo_buffer_does_drop_them_in_the_same_loop():
+    """So the test above can fail."""
+    total = sum(asyncio.run(_run_window(er.DefaultDataBuffer, s, 2, seed))[1] for s in (1, 2) for seed in range(3))
+    assert total > 0

@@ -11,6 +11,8 @@
     can be. Engines beyond what the window fills lower the episodes per engine;
   - a wake-up when a drain starts or ends, when the warm-up engine joins or leaves, and every RECHECK_S: a budget or a
     window that grew is used then, not at the next finished episode (an engine that joined used to wait for one);
+  - with OldestFirstDataBuffer (rl/rl_job.sh order=oldest), a drain that takes the oldest weight version first and waits for an older group in flight when it must, so that no
+    group is dropped as stale: the slowest groups used to be (w922: 2 of 16 since inflight=32, problems 309 and 308, each 3-7 min past its last drain);
   - the warm-up engine of a fresh start (MA_WARMUP_DIR; rl/elastic_engine.sh EL_WARMUP=1, which rl/rl_job.sh starts on
     the actor's 4 GPUs, idle until the first step's data is in). It loads the base checkpoint, which only on a fresh
     start is what the first weight push gave the run's own engine; miles never pushes to it (NCCL cannot place an
@@ -31,6 +33,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+from miles.rollout.filter_hub.common_filters import group_weight_version_stats
+from miles.rollout.fully_async_data_buffer import DefaultDataBuffer
 from miles.rollout.fully_async_rollout import FullyAsyncRolloutFn
 
 logger = logging.getLogger(__name__)
@@ -42,6 +46,7 @@ WARMUP_HOLD_S = 300.0      # the first groups wait at most this long for the war
 WARMUP_GPU_MIB = 12288     # the most its GPUs may hold once it is gone (the actor keeps 2-7 GiB on each: w894)
 WARMUP_POLL_S = 5.0
 CHECKSUM_TIMEOUT_S = 600.0
+DEADLINE_POLL_S = 5.0      # a drain waiting for a group looks again at least this often: the worker lists a group as running until just after its put
 
 
 def _opener():
@@ -175,6 +180,67 @@ class PacedScheduler:
         if progress is not None and progress in done:
             return progress.result()
         return set(), set(pendings)
+
+
+class OldestFirstDataBuffer(DefaultDataBuffer):
+    """miles' buffer takes the first P finished groups, so a group that finishes after younger ones can pass its last step and be dropped as stale, and the groups that go are the slow
+    ones. Here each group has a deadline, the earliest deadline goes first, and a drain waits only when it must. A group started at engine version v can be trained on at the steps up to
+    v + s. So at the drain of version c, the groups of version <= v must fit in this drain and the (v + s - c) P places of the later drains up to v + s: this drain takes at least
+    N(<= v) - (v + s - c) P of them. It waits while the finished ones cannot cover that, for the version v of any running group (for v = c - s, the group's last chance: all of them). It then
+    takes the oldest finished groups. The staleness window (at most (s + 1) P groups in flight or finished when a drain starts, s P while a step trains: window_groups) gives N(<= v) <= (v +
+    s - c + 1) P at every drain, so a drain never has to take more than P, and no group is dropped. The wait ends with the group: at most the episode wall cap. The rollout function sets
+    in_flight_versions() -> the engine version at each running group's start. A group the worker has just put counts twice for a moment, which makes a drain wait one more poll."""
+
+    def __init__(self, input):
+        super().__init__(input)
+        s, p = self._args.max_weight_staleness, self._args.rollout_batch_size
+        assert s is None or self._capacity >= (s + 1) * p, (
+            f"the buffer holds {self._capacity} groups and the window {(s + 1) * p}: a blocked put would keep a group from a drain that waits for it")
+        self.in_flight_versions = lambda: ()
+        self._metric_deadline_s = 0.0
+
+    def _missing_for_deadlines(self, current_version) -> int:
+        """How many more finished groups this drain must see before it can leave every running group its place."""
+        s, p = self._args.max_weight_staleness, self._args.rollout_batch_size
+        if s is None or current_version is None:
+            return 0
+        c = current_version
+        running = [v for v in self.in_flight_versions() if v is not None and v + s >= c]
+        finished = [v for v in (group_weight_version_stats(e.group).oldest_version for e in self._buffer) if v is not None and v + s >= c]
+        missing = 0
+        for v in set(running):
+            must = sum(x <= v for x in running + finished) - (v + s - c) * p
+            missing = max(missing, min(must, p) - sum(x <= v for x in finished))
+        return missing
+
+    async def get(self, *, num_groups: int, current_version: int | None = None, **kw):
+        t0 = time.monotonic()
+        n = self._missing_for_deadlines(current_version)
+        if n > 0:
+            logger.info(f"drain at version {current_version}: waiting for {n} older group(s) in flight, which would miss their deadlines")
+        while self._missing_for_deadlines(current_version) > 0:
+            async with self._cond:
+                try:
+                    await asyncio.wait_for(self._cond.wait(), timeout=DEADLINE_POLL_S)
+                except asyncio.TimeoutError:
+                    pass
+        if n > 0:
+            self._metric_deadline_s += time.monotonic() - t0
+            logger.info(f"drain at version {current_version}: the older groups are in after {time.monotonic() - t0:.0f} s")
+        async with self._cond:
+            self._buffer.sort(key=_oldest_version)   # stable: first finished first within a version
+        return await super().get(num_groups=num_groups, current_version=current_version, **kw)
+
+    def get_metrics(self, trainer_model_id: str | None = None) -> dict[str, float]:
+        metrics = super().get_metrics(trainer_model_id)
+        metrics["rollout/fully_async/deadline_wait_s"] = self._metric_deadline_s
+        self._metric_deadline_s = 0.0
+        return metrics
+
+
+def _oldest_version(entry) -> float:
+    v = group_weight_version_stats(entry.group).oldest_version
+    return float("-inf") if v is None else v
 
 
 class Warmup:
@@ -319,6 +385,10 @@ class ElasticFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         if self.args.max_weight_staleness is not None:
             assert self.args.update_weights_interval == 1, "the staleness window counts one weight push per step"
         self._scheduler = PacedScheduler(self._scheduler, self._window_free, self._wake)
+        self._version = None           # the engines' weight version: the last drain's
+        self._started_version = {}     # running group's task -> the engine version at its start
+        if isinstance(self._output, OldestFirstDataBuffer):
+            self._output.in_flight_versions = self._in_flight_versions
         self._warmup = None
         if d := os.environ.get("MA_WARMUP_DIR"):
             from miles.backends.sglang_utils.sglang_api_client import WorkerType
@@ -332,6 +402,17 @@ class ElasticFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                 remove=lambda url: client.remove_worker(url, legacy),
                 checksums=engine_checksums, version=engine_weight_version, set_version=set_engine_weight_version,
                 on_change=self._engines_changed)
+
+    def _submit_one_group(self):
+        task = super()._submit_one_group()
+        self._started_version[task] = self._version
+        return task
+
+    def _in_flight_versions(self) -> list:
+        """Between a push and the next drain a new group counts one version too old, which at worst makes a drain wait for it."""
+        running = {x.task for x in self._running_tasks}
+        self._started_version = {t: v for t, v in self._started_version.items() if t in running}
+        return list(self._started_version.values())
 
     def _engines_changed(self) -> None:
         self._checked = float("-inf")
@@ -359,6 +440,7 @@ class ElasticFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         return None if w is None else w - pending_groups - len(getattr(self._output, "_buffer", ()))
 
     async def _drain(self, input):
+        self._version = input.weight_version
         if self._warmup is not None:
             self._warmup.start()
         self._draining = True

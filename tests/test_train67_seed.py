@@ -205,4 +205,29 @@ for a in (("train67", "inflight=32"), ("train67", "async=1", "inflight=x"), ("tr
           ("train67", "save=0"), ("train67", "async=1", "save=0"), ("run20", "save=0")):
     rc, out = job(*a)
     check(f"rl_job {' '.join(a)}: refused", rc != 0 and "OUT=" not in out, out)
+# malloc=keep: the same run dir (a run can take it at a resume); the training environment gains exactly the three glibc variables
+rc, out = job("train67", "2", "8", "40", "set=signal34", "levers=gate,graphs,tp4", "malloc=keep")
+check("rl_job malloc=keep: the same run dir", rc == 0 and out.endswith(f"OUT={R}/train67_signal34_kgate-graphs-tp4_p2g8 LEVERS=gate,graphs,tp4 MALLOC=keep"), out)
+for a in (("train67", "malloc=x"), ("train67", "malloc="), ("run20", "malloc=keep")):
+    rc, out = job(*a)
+    check(f"rl_job {' '.join(a)}: refused", rc != 0 and "OUT=" not in out, out)
+
+
+def train_env(**env):
+    sh = "".join(l for l in open(os.path.join(ROOT, "rl", "rl_inner.sh")) if l.startswith("TRAIN_ENV") or "T67_MALLOC" in l and l.startswith("["))
+    r = subprocess.run(["bash", "-c", sh + 'printf %s "$TRAIN_ENV"'], capture_output=True, text=True, env={"PATH": os.environ["PATH"], **env})
+    return json.loads(r.stdout)
+
+
+plain = {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "OMP_NUM_THREADS": "11", "MKL_NUM_THREADS": "11"}
+check("rl_inner: no malloc=keep, the environment as before", train_env() == plain)
+check("rl_inner: malloc=keep adds the three glibc variables", train_env(T67_MALLOC="keep") == {**plain, "MALLOC_ARENA_MAX": "1", "MALLOC_MMAP_MAX_": "0", "MALLOC_TRIM_THRESHOLD_": "107374182400"})
+# order=oldest: async only, with a staleness bound; the same run dir (a run can take it at a resume). stale=2 has its own run dir.
+rc, out = job("train67", "2", "8", "40", "set=signal34", "async=1", "stale=1", "elastic=1", "levers=gate,graphs,tp4", "order=oldest")
+check("rl_job order=oldest: the s=1 run dir", rc == 0 and f"OUT={R}/train67_signal34_kgate-graphs-tp4_e_a1_p2g8" in out and "ORDER=oldest" in out, out)
+rc, out = job("train67", "2", "8", "40", "set=signal34", "async=1", "stale=2", "elastic=1", "levers=gate,graphs,tp4", "place=2numa", "inflight=48", "malloc=keep", "order=oldest")
+check("rl_job stale=2 inflight=48: its own run dir", rc == 0 and f"OUT={R}/train67_signal34_kgate-graphs-tp4_e_a2_p2g8" in out and "MALLOC=keep" in out and "ORDER=oldest" in out, out)
+for a in (("train67", "order=oldest"), ("train67", "async=1", "order=oldest"), ("train67", "async=1", "stale=1", "order=x"), ("run20", "order=oldest")):
+    rc, out = job(*a)
+    check(f"rl_job {' '.join(a)}: refused", rc != 0 and "OUT=" not in out, out)
 done()
