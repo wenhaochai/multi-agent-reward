@@ -84,9 +84,10 @@ P=$((30000 + (JNUM % 1000) * 16))
 # a step with too few samples to give every rank its micro-batches gets zero-weight padding copies (the fork's schedule).
 # train67 replaces the batch flags (TRAIN67 below); the 64k-token micro-batch is the actor's memory bound per GPU, not
 # a batch size, so it stays: a step of B = 32 has ~4x run20's micro-batches (~32 per rank) and ~4x its train time.
-# malloc=keep (rl/rl_job.sh -> T67_MALLOC): freed memory stays with the rank's glibc: no mmap for large buffers, one arena, no trim below 100 GiB
+# malloc=keep (rl/rl_job.sh -> T67_MALLOC): from the end of the process's first optimizer step on, large buffers come from glibc's heap and stay there when freed (miles: _keep_freed_memory);
+# one arena, no trim below 100 GiB. Set from the start, MALLOC_MMAP_MAX_=0 left 110 GiB of a checkpoint load on rank 0 (w885) and a peak 75 GiB higher at the first step (w958)
 TRAIN_ENV='{"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "OMP_NUM_THREADS": "11", "MKL_NUM_THREADS": "11"'
-[ -z "${T67_MALLOC:-}" ] || TRAIN_ENV+=', "MALLOC_ARENA_MAX": "1", "MALLOC_MMAP_MAX_": "0", "MALLOC_TRIM_THRESHOLD_": "107374182400"'
+[ -z "${T67_MALLOC:-}" ] || TRAIN_ENV+=', "MALLOC_ARENA_MAX": "1", "MALLOC_TRIM_THRESHOLD_": "107374182400", "MILES_KEEP_FREED_AFTER_FIRST_STEP": "1"'
 TRAIN_ENV+='}'
 TRAIN=(--train-backend fsdp --hf-checkpoint "$FLINT" --attn-implementation eager
   --actor-num-nodes 1 --actor-num-gpus-per-node "$NG" --seed 1 --fsdp-cpu-offload

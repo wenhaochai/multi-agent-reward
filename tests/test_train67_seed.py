@@ -221,7 +221,7 @@ def train_env(**env):
 
 plain = {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "OMP_NUM_THREADS": "11", "MKL_NUM_THREADS": "11"}
 check("rl_inner: no malloc=keep, the environment as before", train_env() == plain)
-check("rl_inner: malloc=keep adds the three glibc variables", train_env(T67_MALLOC="keep") == {**plain, "MALLOC_ARENA_MAX": "1", "MALLOC_MMAP_MAX_": "0", "MALLOC_TRIM_THRESHOLD_": "107374182400"})
+check("rl_inner: malloc=keep adds the glibc variables and the run-time switch", train_env(T67_MALLOC="keep") == {**plain, "MALLOC_ARENA_MAX": "1", "MALLOC_TRIM_THRESHOLD_": "107374182400", "MILES_KEEP_FREED_AFTER_FIRST_STEP": "1"})
 # order=oldest: async only, with a staleness bound; the same run dir (a run can take it at a resume). stale=2 has its own run dir.
 rc, out = job("train67", "2", "8", "40", "set=signal34", "async=1", "stale=1", "elastic=1", "levers=gate,graphs,tp4", "order=oldest")
 check("rl_job order=oldest: the s=1 run dir", rc == 0 and f"OUT={R}/train67_signal34_kgate-graphs-tp4_e_a1_p2g8" in out and "ORDER=oldest" in out, out)
