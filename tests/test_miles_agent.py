@@ -265,4 +265,25 @@ except RuntimeError as e:
 subprocess.run = real_run
 srv.shutdown()
 check("log: a failed sample check ends the run, with an exception Ray can pickle", raised)
+# async, a resumed run: a group restored from the checkpoint has its traces in RUN/traces_live.stale_*; a new segment's PID may
+# equal an old one, so the session decides which file is whose
+with tempfile.TemporaryDirectory() as td:
+    live, old1, old2, dest = (os.path.join(td, n) for n in ("traces_live", "traces_live.stale_100", "traces_live.stale_200", "r7/traces"))
+    for x in (live, old1, old2):
+        os.makedirs(x)
+    def put(where, pid, session):
+        open(os.path.join(where, f"agent_{pid}.jsonl"), "w").write(json.dumps({"base_url": f"http://e/sessions/{session}", "s": session}) + "\n")
+    put(live, 1, "new1")          # a fresh episode of this batch
+    put(old2, 2, "restored2")     # a restored episode, moved away at the segment's start
+    put(old1, 3, "restored3")     # ... at an earlier segment's start
+    put(live, 4, "later4")        # another batch's episode with the PID a restored one had
+    put(old2, 4, "restored4")
+    put(live, 5, "later5")        # another batch's episode, not asked for
+    samples = [SimpleNamespace(metadata={"flint_trace_pid": p, "flint_session": x}) for p, x in
+               ((1, "new1"), (2, "restored2"), (3, "restored3"), (4, "restored4"), (9, "gone9"))] + [SimpleNamespace(metadata=None)]
+    MA._take_async_traces(samples, live, dest, td)
+    got = {f: json.loads(open(os.path.join(dest, f)).readline())["s"] for f in sorted(os.listdir(dest))}
+    check("async traces: fresh, restored from any stale dir, and the session decides on a PID clash",
+          got == {"agent_1.jsonl": "new1", "agent_2.jsonl": "restored2", "agent_3.jsonl": "restored3", "agent_4.jsonl": "restored4"}, got)
+    check("async traces: another batch's files stay live", sorted(os.listdir(live)) == ["agent_4.jsonl", "agent_5.jsonl"], os.listdir(live))
 done()
