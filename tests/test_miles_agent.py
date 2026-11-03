@@ -372,4 +372,13 @@ with tempfile.TemporaryDirectory() as td:
     check("async traces: fresh, restored from any stale dir, and the session decides on a PID clash",
           got == {"agent_1.jsonl": "new1", "agent_2.jsonl": "restored2", "agent_3.jsonl": "restored3", "agent_4.jsonl": "restored4", "agent_6.jsonl": "logged6"}, got)
     check("async traces: another batch's files stay live", sorted(os.listdir(live)) == ["agent_4.jsonl", "agent_5.jsonl"], os.listdir(live))
+    # order=oldest: a restored group that went to rollout r + 1 before a crash may come in rollout r after the resume (the audit of elastic-v7)
+    other = os.path.join(td, "r8", "traces")
+    os.makedirs(other)
+    put(other, 7, "elsewhere7")
+    put(other, 8, "not-this-batch8")
+    dest2 = os.path.join(td, "r9", "traces")
+    os.makedirs(os.path.dirname(dest2))
+    MA._take_async_traces([SimpleNamespace(metadata={"flint_trace_pid": 7, "flint_session": "elsewhere7"})], live, dest2, td)
+    check("async traces: found in another rollout's traces, others stay", os.listdir(dest2) == ["agent_7.jsonl"] and os.listdir(other) == ["agent_8.jsonl"], (os.listdir(dest2), os.listdir(other)))
 done()

@@ -48,7 +48,7 @@ MODE=${1:-}
 case "$MODE" in smoke|smoke_tp4|smoke_tp8) LIMIT=4800;; train67_smoke) LIMIT=6000;; base_tp8) LIMIT=8400;; test2) LIMIT=9600;;
   run20|train67) LIMIT=81000;; train67_test) LIMIT=21600;;
   *) echo "usage: rl_job.sh smoke[_tp4|_tp8]|base_tp8|test2|run20|train67[_test|_smoke] [P G [STEPS]] [set=NAME] [seed=N] [levers=LIST] [cmdtimeout=N]"; exit 1;; esac
-# train67: set=NAME, seed=N, levers=LIST and cmdtimeout=N at any place after the mode; the other arguments are P G STEPS in
+# train67: set=NAME, seed=N, levers=LIST, cmdtimeout=N, malloc=keep and order=oldest at any place after the mode; the other arguments are P G STEPS in
 # this order
 T67_SET= T67_SEED= SEED_GIVEN= T67_LEVERS= LEVERS_GIVEN= T67_CMD_TIMEOUT= CMDT_GIVEN= T67_MALLOC= MALLOC_GIVEN= T67_ELASTIC= ELASTIC_GIVEN=
 T67_ASYNC= ASYNC_GIVEN= T67_STALE= STALE_GIVEN= T67_PLACE= PLACE_GIVEN= T67_NOSAVE= NOSAVE_GIVEN= T67_INFLIGHT= INFLIGHT_GIVEN= T67_ORDER= ORDER_GIVEN= POS=()
@@ -95,7 +95,7 @@ case "$MODE" in train67*) [[ $T67_P =~ ^[1-9][0-9]*$ && $T67_G =~ ^[1-9][0-9]*$ 
   [ -z "$ORDER_GIVEN" ] || { [ -n "$STALE_GIVEN" ] && [ "$T67_ORDER" = oldest ]; } || { echo "order=oldest goes with async=1 and stale=N: $T67_ORDER"; exit 1; }
   [ -z "$INFLIGHT_GIVEN" ] || { [ -n "$ASYNC_GIVEN" ] && [[ $T67_INFLIGHT =~ ^[1-9][0-9]?$ ]]; } || { echo "inflight=N (1-99) goes with async=1: $T67_INFLIGHT"; exit 1; }
   ;;
-  *) [ -z "$T67_SET$SEED_GIVEN$LEVERS_GIVEN$CMDT_GIVEN$MALLOC_GIVEN$ELASTIC_GIVEN$ASYNC_GIVEN$STALE_GIVEN$PLACE_GIVEN$NOSAVE_GIVEN$INFLIGHT_GIVEN$ORDER_GIVEN" ] || { echo "set=NAME, seed=N, levers=LIST, cmdtimeout=N, elastic=1, async=1 and stale=N are for the train67 modes only, not $MODE"; exit 1; };; esac
+  *) [ -z "$T67_SET$SEED_GIVEN$LEVERS_GIVEN$CMDT_GIVEN$MALLOC_GIVEN$ELASTIC_GIVEN$ASYNC_GIVEN$STALE_GIVEN$PLACE_GIVEN$NOSAVE_GIVEN$INFLIGHT_GIVEN$ORDER_GIVEN" ] || { echo "set=NAME, seed=N, levers=LIST, cmdtimeout=N, malloc=keep, order=oldest, elastic=1, async=1 and stale=N are for the train67 modes only, not $MODE"; exit 1; };; esac
 T67_CMD_TIMEOUT=${T67_CMD_TIMEOUT:-60}
 # seed=N (default 67: the run as before, byte for byte): the data order (rl/train67_data.py: epoch e is the permutation
 # of random.Random(N + e)) and miles' seeds (rl/rl_inner.sh: --seed 1 + 100 (N - 67), the actor's torch seed and the
@@ -106,6 +106,9 @@ JID=${FETCHED_JOB_ID:-$SLURM_JOB_ID}
 [ -n "$JID" ] || { echo "no job id"; exit 1; }
 REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic7
 MILES=/scratch/gpfs/GROUP/USER/project/miles-numa2
+# this script is a snapshot in wq, the others are read live: all must name this worktree and this miles, or the run imports another worktree's code (found by the audit of elastic-v7, 2026-11-03)
+grep -qx "REPO=$REPO" "$REPO/rl/rl_inner.sh" && grep -qx "MILES=$MILES" "$REPO/rl/rl_inner.sh" && grep -q "^HERE=$REPO " "$REPO/rl/elastic_engine.sh" \
+  || { echo "[s5] rl_inner.sh or elastic_engine.sh names another repo or miles than this script ($REPO, $MILES)"; exit 1; }
 SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif
 FLINT=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint
 OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/$JID

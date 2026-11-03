@@ -46,7 +46,8 @@ WARMUP_HOLD_S = 300.0      # the first groups wait at most this long for the war
 WARMUP_GPU_MIB = 12288     # the most its GPUs may hold once it is gone (the actor keeps 2-7 GiB on each: w894)
 WARMUP_POLL_S = 5.0
 CHECKSUM_TIMEOUT_S = 600.0
-DEADLINE_POLL_S = 5.0      # a drain waiting for a group looks again at least this often: the worker lists a group as running until just after its put
+DEADLINE_POLL_S = 5.0      # a drain waiting for a group looks again at least this often
+GROUP_GRACE_S = 1200.0     # a drain stops waiting for a running group this long past the episode wall cap (the game checks the cap between rounds, and one hung request may last an hour)
 
 
 def _opener():
@@ -186,10 +187,11 @@ class OldestFirstDataBuffer(DefaultDataBuffer):
     """miles' buffer takes the first P finished groups, so a group that finishes after younger ones can pass its last step and be dropped as stale, and the groups that go are the slow
     ones. Here each group has a deadline, the earliest deadline goes first, and a drain waits only when it must. A group started at engine version v can be trained on at the steps up to
     v + s. So at the drain of version c, the groups of version <= v must fit in this drain and the (v + s - c) P places of the later drains up to v + s: this drain takes at least
-    N(<= v) - (v + s - c) P of them. It waits while the finished ones cannot cover that, for the version v of any running group (for v = c - s, the group's last chance: all of them). It then
-    takes the oldest finished groups. The staleness window (at most (s + 1) P groups in flight or finished when a drain starts, s P while a step trains: window_groups) gives N(<= v) <= (v +
-    s - c + 1) P at every drain, so a drain never has to take more than P, and no group is dropped. The wait ends with the group: at most the episode wall cap. The rollout function sets
-    in_flight_versions() -> the engine version at each running group's start. A group the worker has just put counts twice for a moment, which makes a drain wait one more poll."""
+    N(<= v) - (v + s - c) P of them. It waits while the finished ones cannot cover that, for the version v of any running group (for v = c - s, the group's last chance: all of them), and it
+    then takes the oldest finished groups. The staleness window (at most (s + 1) P groups in flight or finished when a drain starts, s P while a step trains: window_groups) gives N(<= v) <=
+    (v + s - c + 1) P at every drain, so a drain never has to take more than P, and no group is dropped. Version numbers go on across a resume (miles' FSDP actor publishes the restored
+    number since flint-grpo-numa3), so restored groups keep their place. The wait ends with the group, or GROUP_GRACE_S past the wall cap for one that hangs (_in_flight_versions).
+    The rollout function sets in_flight_versions() -> the engine version at each running group's start. Why the poll: a group rejected at its put (aborted, no reward) notifies nobody."""
 
     def __init__(self, input):
         super().__init__(input)
@@ -214,21 +216,27 @@ class OldestFirstDataBuffer(DefaultDataBuffer):
         return missing
 
     async def get(self, *, num_groups: int, current_version: int | None = None, **kw):
-        t0 = time.monotonic()
-        n = self._missing_for_deadlines(current_version)
-        if n > 0:
-            logger.info(f"drain at version {current_version}: waiting for {n} older group(s) in flight, which would miss their deadlines")
-        while self._missing_for_deadlines(current_version) > 0:
-            async with self._cond:
+        held, logged, t0, last = False, False, time.monotonic(), time.monotonic()
+        async with self._cond:
+            while True:
+                self._drop_stale(current_version)
+                missing = self._missing_for_deadlines(current_version)
+                now = time.monotonic()
+                if held:   # the seconds this rule costs: P groups were in, and older ones were on their way
+                    self._metric_deadline_s += now - last
+                last, held = now, missing > 0 and len(self._buffer) >= num_groups
+                if held and not logged:
+                    logged = True
+                    logger.info(f"drain at version {current_version}: {len(self._buffer)} groups are in, waiting for {missing} older group(s) in flight, which would miss their deadlines")
+                if missing <= 0 and len(self._buffer) >= num_groups:
+                    break
                 try:
                     await asyncio.wait_for(self._cond.wait(), timeout=DEADLINE_POLL_S)
                 except asyncio.TimeoutError:
                     pass
-        if n > 0:
-            self._metric_deadline_s += time.monotonic() - t0
-            logger.info(f"drain at version {current_version}: the older groups are in after {time.monotonic() - t0:.0f} s")
-        async with self._cond:
             self._buffer.sort(key=_oldest_version)   # stable: first finished first within a version
+        if logged:
+            logger.info(f"drain at version {current_version}: the older groups are in after {time.monotonic() - t0:.0f} s")
         return await super().get(num_groups=num_groups, current_version=current_version, **kw)
 
     def get_metrics(self, trainer_model_id: str | None = None) -> dict[str, float]:
@@ -386,8 +394,10 @@ class ElasticFullyAsyncRolloutFn(FullyAsyncRolloutFn):
             assert self.args.update_weights_interval == 1, "the staleness window counts one weight push per step"
         self._scheduler = PacedScheduler(self._scheduler, self._window_free, self._wake)
         self._version = None           # the engines' weight version: the last drain's
-        self._started_version = {}     # running group's task -> the engine version at its start
-        if isinstance(self._output, OldestFirstDataBuffer):
+        self._started = {}             # order=oldest: a running group's task -> (the engine version at its start, the time)
+        self._group_limit_s = float(os.environ.get("MA_LG_WALL_MIN", "60")) * 60 + GROUP_GRACE_S
+        self._deadlines = isinstance(self._output, OldestFirstDataBuffer)
+        if self._deadlines:
             self._output.in_flight_versions = self._in_flight_versions
         self._warmup = None
         if d := os.environ.get("MA_WARMUP_DIR"):
@@ -405,14 +415,27 @@ class ElasticFullyAsyncRolloutFn(FullyAsyncRolloutFn):
 
     def _submit_one_group(self):
         task = super()._submit_one_group()
-        self._started_version[task] = self._version
+        if self._deadlines:
+            self._started[task] = (self._version, time.monotonic())
         return task
 
     def _in_flight_versions(self) -> list:
-        """Between a push and the next drain a new group counts one version too old, which at worst makes a drain wait for it."""
+        """The engine versions at the running groups' starts. Between a push and the next drain a new group counts one version too old, which at worst makes a drain wait for it. A group past
+        the wall cap by GROUP_GRACE_S no longer counts: it hangs, and training goes on."""
         running = {x.task for x in self._running_tasks}
-        self._started_version = {t: v for t, v in self._started_version.items() if t in running}
-        return list(self._started_version.values())
+        now, out = time.monotonic(), []
+        for task in list(self._started):
+            if task not in running:
+                del self._started[task]
+                continue
+            version, t0 = self._started[task]
+            if now - t0 <= self._group_limit_s:
+                out.append(version)
+            else:
+                if t0 > float("-inf"):
+                    logger.warning(f"a group of version {version} has run {(now - t0) / 60:.0f} min: drains no longer wait for it")
+                self._started[task] = (version, float("-inf"))
+        return out
 
     def _engines_changed(self) -> None:
         self._checked = float("-inf")

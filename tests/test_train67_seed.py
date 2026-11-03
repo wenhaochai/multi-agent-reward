@@ -230,4 +230,11 @@ check("rl_job stale=2 inflight=48: its own run dir", rc == 0 and f"OUT={R}/train
 for a in (("train67", "order=oldest"), ("train67", "async=1", "order=oldest"), ("train67", "async=1", "stale=1", "order=x"), ("run20", "order=oldest")):
     rc, out = job(*a)
     check(f"rl_job {' '.join(a)}: refused", rc != 0 and "OUT=" not in out, out)
+# one repo everywhere: rl_job.sh is a snapshot in wq and the others are read live; another worktree's name means another worktree's code at run time (elastic-v7's audit)
+import re  # noqa: E402
+_src = {n: open(os.path.join(ROOT, "rl", n)).read() for n in ("rl_job.sh", "rl_inner.sh", "elastic_engine.sh") if os.path.exists(os.path.join(ROOT, "rl", n))}
+_names = {n: re.findall(r"^(?:REPO|HERE)=(\S+)", t, re.M) for n, t in _src.items()}
+check("scripts: every script names this worktree", all(v and v[0] == os.path.realpath(ROOT) for v in _names.values()), _names)
+_miles = {n: re.findall(r"^MILES=(\S+)", _src[n], re.M) for n in ("rl_job.sh", "rl_inner.sh")}
+check("scripts: rl_job.sh and rl_inner.sh name one miles", _miles["rl_job.sh"] == _miles["rl_inner.sh"] and _miles["rl_job.sh"], _miles)
 done()
