@@ -51,12 +51,13 @@ case "$MODE" in smoke|smoke_tp4|smoke_tp8) LIMIT=4800;; train67_smoke) LIMIT=600
 # train67: set=NAME, seed=N, levers=LIST and cmdtimeout=N at any place after the mode; the other arguments are P G STEPS in
 # this order
 T67_SET= T67_SEED= SEED_GIVEN= T67_LEVERS= LEVERS_GIVEN= T67_CMD_TIMEOUT= CMDT_GIVEN= T67_ELASTIC= ELASTIC_GIVEN=
-T67_ASYNC= ASYNC_GIVEN= T67_STALE= STALE_GIVEN= POS=()
+T67_ASYNC= ASYNC_GIVEN= T67_STALE= STALE_GIVEN= T67_PLACE= PLACE_GIVEN= T67_NOSAVE= NOSAVE_GIVEN= POS=()
 for x in "${@:2}"; do
   case "$x" in set=*) T67_SET=${x#set=};; seed=*) T67_SEED=${x#seed=} SEED_GIVEN=1;;
     levers=*) T67_LEVERS=${x#levers=} LEVERS_GIVEN=1;; cmdtimeout=*) T67_CMD_TIMEOUT=${x#cmdtimeout=} CMDT_GIVEN=1;;
     elastic=*) T67_ELASTIC=${x#elastic=} ELASTIC_GIVEN=1;;
     async=*) T67_ASYNC=${x#async=} ASYNC_GIVEN=1;; stale=*) T67_STALE=${x#stale=} STALE_GIVEN=1;;
+    place=*) T67_PLACE=${x#place=} PLACE_GIVEN=1;; save=0) T67_NOSAVE=1 NOSAVE_GIVEN=1;;
     *) POS+=("$x");; esac
 done
 T67_P=${POS[0]:-4} T67_G=${POS[1]:-8} T67_STEPS=${POS[2]:-40}
@@ -80,8 +81,10 @@ case "$MODE" in train67*) [[ $T67_P =~ ^[1-9][0-9]*$ && $T67_G =~ ^[1-9][0-9]*$ 
   [ -z "$ASYNC_GIVEN" ] || [ "$MODE" != train67_smoke ] || { echo "async=1 is for train67 and train67_test"; exit 1; }
   [ -z "$STALE_GIVEN" ] || { [ -n "$ASYNC_GIVEN" ] && [[ $T67_STALE =~ ^[1-9][0-9]?$ ]]; } \
     || { echo "stale=N (1-99) goes with async=1: $T67_STALE"; exit 1; }
+  [ -z "$PLACE_GIVEN" ] || { [ -n "$ASYNC_GIVEN" ] && [ "$T67_PLACE" = 2numa ]; } || { echo "place=2numa goes with async=1: $T67_PLACE"; exit 1; }
+  [ -z "$NOSAVE_GIVEN" ] || [ "$MODE" = train67_test ] || { echo "save=0 is for train67_test"; exit 1; }
   ;;
-  *) [ -z "$T67_SET$SEED_GIVEN$LEVERS_GIVEN$CMDT_GIVEN$ELASTIC_GIVEN$ASYNC_GIVEN$STALE_GIVEN" ] || { echo "set=NAME, seed=N, levers=LIST, cmdtimeout=N, elastic=1, async=1 and stale=N are for the train67 modes only, not $MODE"; exit 1; };; esac
+  *) [ -z "$T67_SET$SEED_GIVEN$LEVERS_GIVEN$CMDT_GIVEN$ELASTIC_GIVEN$ASYNC_GIVEN$STALE_GIVEN$PLACE_GIVEN$NOSAVE_GIVEN" ] || { echo "set=NAME, seed=N, levers=LIST, cmdtimeout=N, elastic=1, async=1 and stale=N are for the train67 modes only, not $MODE"; exit 1; };; esac
 T67_CMD_TIMEOUT=${T67_CMD_TIMEOUT:-60}
 # seed=N (default 67: the run as before, byte for byte): the data order (rl/train67_data.py: epoch e is the permutation
 # of random.Random(N + e)) and miles' seeds (rl/rl_inner.sh: --seed 1 + 100 (N - 67), the actor's torch seed and the
@@ -90,8 +93,8 @@ T67_CMD_TIMEOUT=${T67_CMD_TIMEOUT:-60}
 T67_SEED=${T67_SEED:-67}
 JID=${FETCHED_JOB_ID:-$SLURM_JOB_ID}
 [ -n "$JID" ] || { echo "no job id"; exit 1; }
-REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic2
-MILES=/scratch/gpfs/GROUP/USER/project/miles-elastic
+REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic3
+MILES=/scratch/gpfs/GROUP/USER/project/miles-numa
 SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif
 FLINT=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint
 OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/$JID
@@ -113,7 +116,7 @@ T67_TAG=${T67_SET:+_$T67_SET}
 [ "$MODE" = train67_test ] && OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/train67_test${T67_TAG}_p${T67_P}g${T67_G}
 RESUMABLE=; case "$MODE" in run20|train67|train67_test) RESUMABLE=1;; esac
 # tests/test_train67_seed.py: the parsed arguments and the run dir only, nothing made or started
-[ -z "${RL_JOB_PRINT_ONLY:-}" ] || { echo "MODE=$MODE P=$T67_P G=$T67_G STEPS=$T67_STEPS SET=$T67_SET SEED=$T67_SEED OUT=$OUT${T67_LEVERS:+ LEVERS=$T67_LEVERS}$([ "$T67_CMD_TIMEOUT" = 60 ] || echo " CMDTIMEOUT=$T67_CMD_TIMEOUT")${T67_ELASTIC:+ ELASTIC=1}${T67_ASYNC:+ ASYNC=1}${T67_STALE:+ STALE=$T67_STALE}"; exit 0; }
+[ -z "${RL_JOB_PRINT_ONLY:-}" ] || { echo "MODE=$MODE P=$T67_P G=$T67_G STEPS=$T67_STEPS SET=$T67_SET SEED=$T67_SEED OUT=$OUT${T67_LEVERS:+ LEVERS=$T67_LEVERS}$([ "$T67_CMD_TIMEOUT" = 60 ] || echo " CMDTIMEOUT=$T67_CMD_TIMEOUT")${T67_PLACE:+ PLACE=$T67_PLACE}${T67_NOSAVE:+ NOSAVE=1}${T67_ELASTIC:+ ELASTIC=1}${T67_ASYNC:+ ASYNC=1}${T67_STALE:+ STALE=$T67_STALE}"; exit 0; }
 # the planned time stop: one step and a save must fit after it (run20: 43 min a step; train67 at B = 32: up to the
 # 60-min wall cap, ~4 x run20's 4-min train time, sync and save, ~85 min)
 STOP_S=4500; case "$MODE" in train67*) STOP_S=6300;; esac
@@ -241,6 +244,16 @@ if [ -n "$T67_ELASTIC" ]; then
   HB=$!
   echo "[s5] elastic: trainer at $IP; engine jobs: wq submit --partial $REPO/rl/elastic_engine.sh $OUT"
 fi
+# place=2numa: which GPUs the actor takes (miles MILES_GPU_ORDER, rl/gpu_order.py): 2 per NUMA node, so its host memory fits; the run's own engine gets the rest
+GPU_ORDER=
+if [ -n "$T67_PLACE" ]; then
+  if GPU_ORDER=$(timeout 90 python3 "$REPO/rl/gpu_order.py" "${CUDA_VISIBLE_DEVICES:-}"); then
+    echo "[s5] place=2numa: GPU order $GPU_ORDER (the actor takes the first 4)"
+  else
+    GPU_ORDER=
+    echo "[s5] place=2numa: this node's GPUs are not 4 + 4 on two NUMA nodes: the actor takes the first 4 of ${CUDA_VISIBLE_DEVICES:-}"
+  fi
+fi
 # async=1: the warm-up engine's files are this segment's (flint.elastic_rollout reads RUN/warmup/launched)
 [ -z "$T67_ASYNC" ] || rm -rf -- "$OUT/warmup"
 SEG_T0=$(date +%s)
@@ -249,13 +262,13 @@ start timeout -k 300 "$LIMIT" apptainer exec --pid --nv --contain --cleanenv --w
   --bind /dev/shm --env PYTHONNOUSERSITE=1 --env PYTHONDONTWRITEBYTECODE=1 --env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" \
   --env JID="$JID" --env OUT="$OUT" --env PKG="$PKG" --env TMPDIR="$TMPDIR" --env T67_P="$T67_P" --env T67_G="$T67_G" \
   --env T67_STEPS="$T67_STEPS" --env T67_SEED="$T67_SEED" --env T67_LEVERS="$T67_LEVERS" --env T67_CMD_TIMEOUT="$T67_CMD_TIMEOUT" \
-  --env T67_ELASTIC="$T67_ELASTIC" --env T67_ASYNC="$T67_ASYNC" --env T67_STALE="$T67_STALE" --env IP="$IP" \
+  --env T67_ELASTIC="$T67_ELASTIC" --env T67_ASYNC="$T67_ASYNC" --env T67_STALE="$T67_STALE" --env IP="$IP" --env MILES_GPU_ORDER="$GPU_ORDER" --env T67_NOSAVE="$T67_NOSAVE" \
   "$SIF" bash "$REPO/rl/rl_inner.sh" "$MODE"
-# async=1 on a fresh start: the warm-up engine on the actor's 4 GPUs (the first 4 of this job's: miles puts the actor
-# there and its own engine on the other 4), loading the base checkpoint while the trainer starts; it ends on its own
+# async=1 on a fresh start: the warm-up engine on the actor's 4 GPUs (the first 4 of this job's, or of GPU_ORDER: miles puts the
+# actor there and its own engine on the other 4), loading the base checkpoint while the trainer starts; it ends on its own
 # (RUN/warmup/leave at the first step's data, or a failure) and with this job at the latest (the EXIT trap)
 if [ -n "$T67_ASYNC" ] && [ -n "$FRESH" ]; then
-  IFS=, read -r -a GPUS <<< "${CUDA_VISIBLE_DEVICES:-}"
+  IFS=, read -r -a GPUS <<< "${GPU_ORDER:-${CUDA_VISIBLE_DEVICES:-}}"
   mkdir -p "$OUT/warmup" && echo "${JID}w" > "$OUT/warmup/launched"
   start env EL_WARMUP=1 EL_SPEC_AFTER="$((SEG_T0 - 120))" FETCHED_JOB_ID="${JID}w" CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${GPUS[*]:0:4}")" \
     bash "$REPO/rl/elastic_engine.sh" "$OUT" > "$OUT/warmup/engine.log" 2>&1
