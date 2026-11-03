@@ -64,7 +64,7 @@ case "$MODE" in train67*) [[ $T67_P =~ ^[1-9][0-9]*$ && $T67_G =~ ^[1-9][0-9]*$ 
     done
     T67_LEVERS=$(tr , '\n' <<< "$T67_LEVERS" | sort -u | paste -sd, -)
   fi
-  # malloc=keep: the actor ranks' glibc keeps freed memory, so each micro-batch's gradient buffers reuse the last ones instead of new zeroed pages
+  # malloc=keep: from its first optimizer step's end on, an actor rank's glibc keeps freed memory, so each micro-batch's buffers reuse the last ones instead of new zeroed pages
   # (w958, 4 ranks, the same two recorded rollouts: 47% more tokens/s; loss, KL and log-prob gap equal in every printed digit). The run dir does not change.
   [ -z "$MALLOC_GIVEN" ] || [ "$T67_MALLOC" = keep ] || { echo "malloc=keep is the only value: $T67_MALLOC"; exit 1; }
   [ -z "$CMDT_GIVEN" ] || { [[ $T67_CMD_TIMEOUT =~ ^[1-9][0-9]{0,2}$ ]] && [ "$T67_CMD_TIMEOUT" -ge 5 ] && [ "$T67_CMD_TIMEOUT" -le 600 ]; } \
@@ -79,8 +79,10 @@ T67_CMD_TIMEOUT=${T67_CMD_TIMEOUT:-60}
 T67_SEED=${T67_SEED:-67}
 JID=${FETCHED_JOB_ID:-$SLURM_JOB_ID}
 [ -n "$JID" ] || { echo "no job id"; exit 1; }
-REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-train67f
-MILES=/scratch/gpfs/GROUP/USER/project/miles-rollout
+REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-train67h
+MILES=/scratch/gpfs/GROUP/USER/project/miles-rollout2
+# this script is a snapshot in wq, rl_inner.sh is read live: both must name this worktree and this miles, or the run imports other code (found by the audit of elastic-v7, 2026-11-03)
+grep -qx "REPO=$REPO" "$REPO/rl/rl_inner.sh" && grep -qx "MILES=$MILES" "$REPO/rl/rl_inner.sh" || { echo "[s5] rl_inner.sh names another repo or miles than this script ($REPO, $MILES)"; exit 1; }
 SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif
 FLINT=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint
 OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/$JID

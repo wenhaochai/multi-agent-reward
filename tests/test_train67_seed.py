@@ -191,5 +191,12 @@ def train_env(**env):
 
 plain = {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "OMP_NUM_THREADS": "11", "MKL_NUM_THREADS": "11"}
 check("rl_inner: no malloc=keep, the environment as before", train_env() == plain)
-check("rl_inner: malloc=keep adds the three glibc variables", train_env(T67_MALLOC="keep") == {**plain, "MALLOC_ARENA_MAX": "1", "MALLOC_MMAP_MAX_": "0", "MALLOC_TRIM_THRESHOLD_": "107374182400"})
+check("rl_inner: malloc=keep adds the glibc variables and the run-time switch", train_env(T67_MALLOC="keep") == {**plain, "MALLOC_ARENA_MAX": "1", "MALLOC_TRIM_THRESHOLD_": "107374182400", "MILES_KEEP_FREED_AFTER_FIRST_STEP": "1"})
+# one repo everywhere: rl_job.sh is a snapshot in wq, rl_inner.sh is read live; another worktree's name means another worktree's code at run time (elastic-v7's audit)
+import re  # noqa: E402
+_src = {n: open(os.path.join(ROOT, "rl", n)).read() for n in ("rl_job.sh", "rl_inner.sh")}
+_names = {n: re.findall(r"^REPO=(\S+)", t, re.M) for n, t in _src.items()}
+check("scripts: rl_job.sh and rl_inner.sh name this worktree", all(v and v[0] == os.path.realpath(ROOT) for v in _names.values()), _names)
+_miles = {n: re.findall(r"^MILES=(\S+)", t, re.M) for n, t in _src.items()}
+check("scripts: rl_job.sh and rl_inner.sh name one miles", _miles["rl_job.sh"] == _miles["rl_inner.sh"] and _miles["rl_job.sh"], _miles)
 done()
