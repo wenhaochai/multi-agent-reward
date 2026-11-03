@@ -50,15 +50,17 @@ case "$MODE" in smoke|smoke_tp4|smoke_tp8) LIMIT=4800;; train67_smoke) LIMIT=600
   *) echo "usage: rl_job.sh smoke[_tp4|_tp8]|base_tp8|test2|run20|train67[_test|_smoke] [P G [STEPS]] [set=NAME] [seed=N] [levers=LIST] [cmdtimeout=N]"; exit 1;; esac
 # train67: set=NAME, seed=N, levers=LIST and cmdtimeout=N at any place after the mode; the other arguments are P G STEPS in
 # this order
-T67_SET= T67_SEED= SEED_GIVEN= T67_LEVERS= LEVERS_GIVEN= T67_CMD_TIMEOUT= CMDT_GIVEN= T67_ELASTIC= ELASTIC_GIVEN=
-T67_ASYNC= ASYNC_GIVEN= T67_STALE= STALE_GIVEN= T67_PLACE= PLACE_GIVEN= T67_NOSAVE= NOSAVE_GIVEN= T67_INFLIGHT= INFLIGHT_GIVEN= POS=()
+T67_SET= T67_SEED= SEED_GIVEN= T67_LEVERS= LEVERS_GIVEN= T67_CMD_TIMEOUT= CMDT_GIVEN= T67_MALLOC= MALLOC_GIVEN= T67_ELASTIC= ELASTIC_GIVEN=
+T67_ASYNC= ASYNC_GIVEN= T67_STALE= STALE_GIVEN= T67_PLACE= PLACE_GIVEN= T67_NOSAVE= NOSAVE_GIVEN= T67_INFLIGHT= INFLIGHT_GIVEN= T67_ORDER= ORDER_GIVEN= POS=()
 for x in "${@:2}"; do
   case "$x" in set=*) T67_SET=${x#set=};; seed=*) T67_SEED=${x#seed=} SEED_GIVEN=1;;
     levers=*) T67_LEVERS=${x#levers=} LEVERS_GIVEN=1;; cmdtimeout=*) T67_CMD_TIMEOUT=${x#cmdtimeout=} CMDT_GIVEN=1;;
+    malloc=*) T67_MALLOC=${x#malloc=} MALLOC_GIVEN=1;;
     elastic=*) T67_ELASTIC=${x#elastic=} ELASTIC_GIVEN=1;;
     async=*) T67_ASYNC=${x#async=} ASYNC_GIVEN=1;; stale=*) T67_STALE=${x#stale=} STALE_GIVEN=1;;
     place=*) T67_PLACE=${x#place=} PLACE_GIVEN=1;; save=0) T67_NOSAVE=1 NOSAVE_GIVEN=1;;
     inflight=*) T67_INFLIGHT=${x#inflight=} INFLIGHT_GIVEN=1;;
+    order=*) T67_ORDER=${x#order=} ORDER_GIVEN=1;;
     *) POS+=("$x");; esac
 done
 T67_P=${POS[0]:-4} T67_G=${POS[1]:-8} T67_STEPS=${POS[2]:-40}
@@ -75,6 +77,9 @@ case "$MODE" in train67*) [[ $T67_P =~ ^[1-9][0-9]*$ && $T67_G =~ ^[1-9][0-9]*$ 
     done
     T67_LEVERS=$(tr , '\n' <<< "$T67_LEVERS" | sort -u | paste -sd, -)
   fi
+  # malloc=keep: the actor ranks' glibc keeps freed memory, so each micro-batch's gradient buffers reuse the last ones instead of new zeroed pages
+  # (w958, 4 ranks, the same two recorded rollouts: 47% more tokens/s; loss, KL and log-prob gap equal in every printed digit). The run dir does not change.
+  [ -z "$MALLOC_GIVEN" ] || [ "$T67_MALLOC" = keep ] || { echo "malloc=keep is the only value: $T67_MALLOC"; exit 1; }
   [ -z "$CMDT_GIVEN" ] || { [[ $T67_CMD_TIMEOUT =~ ^[1-9][0-9]{0,2}$ ]] && [ "$T67_CMD_TIMEOUT" -ge 5 ] && [ "$T67_CMD_TIMEOUT" -le 600 ]; } \
     || { echo "cmdtimeout=N: seconds per command, 5 to 600 (default 60): $T67_CMD_TIMEOUT"; exit 1; }
   [ -z "$ELASTIC_GIVEN" ] || [ "$T67_ELASTIC" = 1 ] || { echo "elastic=1 is the only value: $T67_ELASTIC"; exit 1; }
@@ -86,9 +91,11 @@ case "$MODE" in train67*) [[ $T67_P =~ ^[1-9][0-9]*$ && $T67_G =~ ^[1-9][0-9]*$ 
   [ -z "$NOSAVE_GIVEN" ] || [ "$MODE" = train67_test ] || { echo "save=0 is for train67_test"; exit 1; }
   # inflight=N: episodes in flight per routed engine (default 16). With one engine, 16 are 2 groups, so after each step the actor waits for those 2 to finish (w922: up to 33 min at 0%); 2 P groups keep
   # half of them nearly done when a step ends, and the staleness window still bounds them.
+  # order=oldest: a drain takes the oldest weight version first and waits for an older group in flight when it must, so no group is dropped as stale. Not in the run dir: a run can take it at a resume.
+  [ -z "$ORDER_GIVEN" ] || { [ -n "$STALE_GIVEN" ] && [ "$T67_ORDER" = oldest ]; } || { echo "order=oldest goes with async=1 and stale=N: $T67_ORDER"; exit 1; }
   [ -z "$INFLIGHT_GIVEN" ] || { [ -n "$ASYNC_GIVEN" ] && [[ $T67_INFLIGHT =~ ^[1-9][0-9]?$ ]]; } || { echo "inflight=N (1-99) goes with async=1: $T67_INFLIGHT"; exit 1; }
   ;;
-  *) [ -z "$T67_SET$SEED_GIVEN$LEVERS_GIVEN$CMDT_GIVEN$ELASTIC_GIVEN$ASYNC_GIVEN$STALE_GIVEN$PLACE_GIVEN$NOSAVE_GIVEN$INFLIGHT_GIVEN" ] || { echo "set=NAME, seed=N, levers=LIST, cmdtimeout=N, elastic=1, async=1 and stale=N are for the train67 modes only, not $MODE"; exit 1; };; esac
+  *) [ -z "$T67_SET$SEED_GIVEN$LEVERS_GIVEN$CMDT_GIVEN$MALLOC_GIVEN$ELASTIC_GIVEN$ASYNC_GIVEN$STALE_GIVEN$PLACE_GIVEN$NOSAVE_GIVEN$INFLIGHT_GIVEN$ORDER_GIVEN" ] || { echo "set=NAME, seed=N, levers=LIST, cmdtimeout=N, elastic=1, async=1 and stale=N are for the train67 modes only, not $MODE"; exit 1; };; esac
 T67_CMD_TIMEOUT=${T67_CMD_TIMEOUT:-60}
 # seed=N (default 67: the run as before, byte for byte): the data order (rl/train67_data.py: epoch e is the permutation
 # of random.Random(N + e)) and miles' seeds (rl/rl_inner.sh: --seed 1 + 100 (N - 67), the actor's torch seed and the
@@ -97,7 +104,7 @@ T67_CMD_TIMEOUT=${T67_CMD_TIMEOUT:-60}
 T67_SEED=${T67_SEED:-67}
 JID=${FETCHED_JOB_ID:-$SLURM_JOB_ID}
 [ -n "$JID" ] || { echo "no job id"; exit 1; }
-REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic6
+REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic7
 MILES=/scratch/gpfs/GROUP/USER/project/miles-numa2
 SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif
 FLINT=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint
@@ -120,7 +127,7 @@ T67_TAG=${T67_SET:+_$T67_SET}
 [ "$MODE" = train67_test ] && OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/train67_test${T67_TAG}_p${T67_P}g${T67_G}
 RESUMABLE=; case "$MODE" in run20|train67|train67_test) RESUMABLE=1;; esac
 # tests/test_train67_seed.py: the parsed arguments and the run dir only, nothing made or started
-[ -z "${RL_JOB_PRINT_ONLY:-}" ] || { echo "MODE=$MODE P=$T67_P G=$T67_G STEPS=$T67_STEPS SET=$T67_SET SEED=$T67_SEED OUT=$OUT${T67_LEVERS:+ LEVERS=$T67_LEVERS}$([ "$T67_CMD_TIMEOUT" = 60 ] || echo " CMDTIMEOUT=$T67_CMD_TIMEOUT")${T67_PLACE:+ PLACE=$T67_PLACE}${T67_NOSAVE:+ NOSAVE=1}${T67_INFLIGHT:+ INFLIGHT=$T67_INFLIGHT}${T67_ELASTIC:+ ELASTIC=1}${T67_ASYNC:+ ASYNC=1}${T67_STALE:+ STALE=$T67_STALE}"; exit 0; }
+[ -z "${RL_JOB_PRINT_ONLY:-}" ] || { echo "MODE=$MODE P=$T67_P G=$T67_G STEPS=$T67_STEPS SET=$T67_SET SEED=$T67_SEED OUT=$OUT${T67_LEVERS:+ LEVERS=$T67_LEVERS}${T67_MALLOC:+ MALLOC=$T67_MALLOC}${T67_ORDER:+ ORDER=$T67_ORDER}$([ "$T67_CMD_TIMEOUT" = 60 ] || echo " CMDTIMEOUT=$T67_CMD_TIMEOUT")${T67_PLACE:+ PLACE=$T67_PLACE}${T67_NOSAVE:+ NOSAVE=1}${T67_INFLIGHT:+ INFLIGHT=$T67_INFLIGHT}${T67_ELASTIC:+ ELASTIC=1}${T67_ASYNC:+ ASYNC=1}${T67_STALE:+ STALE=$T67_STALE}"; exit 0; }
 # the planned time stop: one step and a save must fit after it (run20: 43 min a step; train67 at B = 32: up to the
 # 60-min wall cap, ~4 x run20's 4-min train time, sync and save, ~85 min)
 STOP_S=4500; case "$MODE" in train67*) STOP_S=6300;; esac
@@ -265,7 +272,7 @@ start timeout -k 300 "$LIMIT" apptainer exec --pid --nv --contain --cleanenv --w
   --bind /scratch/gpfs/GROUP --bind "$TMPDIR/tmp":/tmp --bind "$TMPDIR/datasets":/root/datasets --bind /proc:/host/proc \
   --bind /dev/shm --env PYTHONNOUSERSITE=1 --env PYTHONDONTWRITEBYTECODE=1 --env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" \
   --env JID="$JID" --env OUT="$OUT" --env PKG="$PKG" --env TMPDIR="$TMPDIR" --env T67_P="$T67_P" --env T67_G="$T67_G" \
-  --env T67_STEPS="$T67_STEPS" --env T67_SEED="$T67_SEED" --env T67_LEVERS="$T67_LEVERS" --env T67_CMD_TIMEOUT="$T67_CMD_TIMEOUT" \
+  --env T67_STEPS="$T67_STEPS" --env T67_SEED="$T67_SEED" --env T67_LEVERS="$T67_LEVERS" --env T67_CMD_TIMEOUT="$T67_CMD_TIMEOUT" --env T67_MALLOC="$T67_MALLOC" --env T67_ORDER="$T67_ORDER" \
   --env T67_ELASTIC="$T67_ELASTIC" --env T67_ASYNC="$T67_ASYNC" --env T67_STALE="$T67_STALE" --env IP="$IP" --env MILES_GPU_ORDER="$GPU_ORDER" --env T67_NOSAVE="$T67_NOSAVE" --env MA_ASYNC_SAMPLES_PER_ENGINE="$T67_INFLIGHT" \
   "$SIF" bash "$REPO/rl/rl_inner.sh" "$MODE"
 # async=1: the warm-up engine on the actor's 4 GPUs (the first 4 of this job's, or of GPU_ORDER: miles puts the actor there and its own engine on the other 4), loading the

@@ -33,6 +33,10 @@ elif a.load_debug_rollout_data is None and os.environ.get("T67_ASYNC"):   # trai
              "namespaced_radix_cache": True, "max_tokens_per_gpu": 65536, "rollout_max_response_len": 16384,
              "custom_rollout_log_function_path": "flint.miles_agent.log_rollout",
              "rollout_sample_filter_path": "flint.miles_agent.drop_failed_groups"}
+    if a.custom_async_data_buffer_path is not None:   # order=oldest: the buffer holds the whole window, or a blocked put could hold up a drain that waits for its last-chance group
+        want["custom_async_data_buffer_path"] = "flint.elastic_rollout.OldestFirstDataBuffer"
+        if a.async_data_buffer_capacity_factor < (a.max_weight_staleness or 1) + 1:
+            want["async_data_buffer_capacity_factor"] = (a.max_weight_staleness or 1) + 1
 elif a.load_debug_rollout_data is None:   # the colocated RL run
     want |= {"colocate": True, "offload_train": True, "offload_rollout": True, "rollout_num_gpus_per_engine": 2,
              "use_session_server": "v2", "tito_model": "flint", "pause_generation_mode": "in_place",
