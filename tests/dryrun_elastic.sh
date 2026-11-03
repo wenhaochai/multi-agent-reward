@@ -127,6 +127,37 @@ EL_WARMUP=1 EL_SPEC_AFTER=$(date +%s) CUDA_VISIBLE_DEVICES=0,1,2,3 engine dryw20
 ok "W2 exit 0 ($rc)" '[ $rc = 0 ]'
 ok "W2 gone" '[ -s "$RUN/warmup/gone" ]'
 
+echo "== W3: the warm-up engine of a resume: exports the checkpoint's weights and serves from them; leave, gone"
+RUN=$W/w3; spec "$RUN" 4; T0W=$(date +%s)
+EL_WARMUP=1 EL_SPEC_AFTER=$((T0W - 60)) EL_WARM_CKPT=/nonexistent/iter/model FAKE_EXPORT=ok CUDA_VISIBLE_DEVICES=0,1,4,5 engine dryw30 "$RUN"; EP=$BGPID
+upto 60 'serving "$RUN/warmup" dryw30'
+ok "W3 serves from the export" 'grep -q "model=.*dryw30/warm_weights" "$RUN/engine_logs/dryw30.0.log"'
+ok "W3 said so" 'grep -q "export_ckpt" "$W/dryw30.out"'
+ok "W3 the engine alive after the export ended" 'kill -0 $EP 2>/dev/null && serving "$RUN/warmup" dryw30'
+echo "1 the first step's data is in" > "$RUN/warmup/leave"
+wait $EP; rc=$?
+ok "W3 exit 0 after the leave ($rc)" '[ $rc = 0 ]'
+ok "W3 gone" '[ -s "$RUN/warmup/gone" ]'
+
+echo "== W4: the export fails: exit 1, gone, so the run goes on without this engine"
+RUN=$W/w4; spec "$RUN" 4
+EL_WARMUP=1 EL_SPEC_AFTER=$(($(date +%s) - 60)) EL_WARM_CKPT=/nonexistent/iter/model FAKE_EXPORT=fail CUDA_VISIBLE_DEVICES=0,1,4,5 engine dryw40 "$RUN"; wait $BGPID; rc=$?
+ok "W4 exit 1 ($rc)" '[ $rc = 1 ]'
+ok "W4 gone" '[ -s "$RUN/warmup/gone" ]'
+ok "W4 the reason in its log" 'grep -q "export boom" "$W/dryw40.out"'
+ok "W4 no record left" '[ -z "$(ls "$RUN/warmup/engines" 2>/dev/null)" ]'
+
+echo "== W5: asked to leave during a slow export: out within seconds, gone, nothing left running"
+RUN=$W/w5; spec "$RUN" 4
+EL_WARMUP=1 EL_SPEC_AFTER=$(($(date +%s) - 60)) EL_WARM_CKPT=/nonexistent/iter/model FAKE_EXPORT=slow CUDA_VISIBLE_DEVICES=0,1,4,5 engine dryw50 "$RUN"; EP=$BGPID
+upto 30 "grep -q exporting '$W/dryw50.out'"
+sleep 2
+T1=$(date +%s); echo "1 the first step's data is in" > "$RUN/warmup/leave"
+wait $EP; rc=$?; T2=$(date +%s)
+ok "W5 exit 0 ($rc) in $((T2 - T1)) s" '[ $rc = 0 ] && [ $((T2 - T1)) -lt 20 ]'
+ok "W5 gone" '[ -s "$RUN/warmup/gone" ]'
+ok "W5 no export left" '! pgrep -f "sleep 100" -u "$USER" > /dev/null || ! pgrep -f "dryw50" -u "$USER" > /dev/null'
+
 echo "${#fails[@]} failed${fails:+: ${fails[*]}}"
 [ ${#fails[@]} = 0 ] && rm -rf -- "$W"
 [ ${#fails[@]} = 0 ]

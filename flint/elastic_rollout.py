@@ -179,7 +179,7 @@ class PacedScheduler:
 class Warmup:
     """The warm-up engine of a fresh start (module docstring). Its files under DIR (rl/rl_job.sh, rl/elastic_engine.sh
     EL_WARMUP=1):
-      launched            the warm-up job's id, written when rl/rl_job.sh starts it (fresh starts only)
+      launched            the warm-up job's id, written when rl/rl_job.sh starts it
       engines/<job>.json  its record (rl/registry.py: "loading", then "serving" with the engine's url)
       leave               written here: the engine leaves (finishes its running requests, at most 10 min) and ends
       gone                written by the engine job once it has ended and its GPUs are free: {"job", "time", "max_gpu_mib"}
