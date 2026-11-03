@@ -137,6 +137,12 @@ elif d=$(tr '\0' '\n' < /proc/$PPID/cmdline 2>/dev/null | grep -xE '[0-9]+s' | t
   [ $(( $(date +%s) + d )) -lt "$END" ] && END=$(( $(date +%s) + d )); SRC="parent timeout ${d}s"
 fi
 echo "[s5] segment end $(date -d @"$END" +%FT%T) ($((END - $(date +%s))) s left; from $SRC); planned stop $((STOP_S / 60)) min before it"
+# a segment too short for one step and a save starts nothing (a fetching host may offer a resumable job as little as 30
+# min, 2026-11-02: w922 got 72 min): 98 puts the job back in the queue, not before 30 min, without counting the run
+if [ "$MODE" = train67 ] && [ $((END - $(date +%s))) -lt "$STOP_S" ]; then
+  echo "[s5] $((END - $(date +%s))) s left, under the $STOP_S s a step and a save need: too short for one step, back to the queue"
+  exit 98
+fi
 echo "mas-rl $(git -C "$REPO" rev-parse --short HEAD) dirty=$(git -C "$REPO" status --porcelain -uno | wc -l)" \
   "miles $(git -C "$MILES" rev-parse --short HEAD) dirty=$(git -C "$MILES" status --porcelain -uno | wc -l)" | tee "$OUT/code"
 python3 - "$FLINT" <<'PY' || exit 1
