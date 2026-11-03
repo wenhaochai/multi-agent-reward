@@ -187,4 +187,19 @@ for a in (("train67", "cmdtimeout=3"), ("train67", "cmdtimeout=abc"), ("train67"
           ("train67", "cmdtimeout=601"), ("run20", "cmdtimeout=30")):
     rc, out = job(*a)
     check(f"rl_job {' '.join(a)}: refused", rc != 0 and "OUT=" not in out, out)
+# place=2numa (async only; the run dir stays the same, so a run can change placement at a resume), save=0 (train67_test only)
+async_tag = f"{R}/train67_signal34_kgate-graphs-tp4_e_a1_p2g8"
+place = {("train67", "2", "8", "40", "set=signal34", "async=1", "stale=1", "elastic=1", "levers=gate,graphs,tp4", "place=2numa"):
+             f"SEED=67 OUT={async_tag} LEVERS=gate,graphs,tp4 PLACE=2numa ELASTIC=1 ASYNC=1 STALE=1",
+         ("train67", "2", "8", "40", "set=signal34", "async=1", "stale=1", "elastic=1", "levers=gate,graphs,tp4"):
+             f"SEED=67 OUT={async_tag} LEVERS=gate,graphs,tp4 ELASTIC=1 ASYNC=1 STALE=1",
+         ("train67_test", "1", "2", "set=signal34", "async=1", "stale=1", "elastic=1", "levers=gate,graphs,tp4", "place=2numa", "save=0"):
+             f"SEED=67 OUT={R}/train67_test_signal34_kgate-graphs-tp4_e_a1_p1g2 LEVERS=gate,graphs,tp4 PLACE=2numa NOSAVE=1 ELASTIC=1 ASYNC=1 STALE=1"}
+for a, want in place.items():
+    rc, out = job(*a)
+    check(f"rl_job {' '.join(a)}: {want.split('/')[-1]}", rc == 0 and out.endswith(want), out)
+for a in (("train67", "place=2numa"), ("train67", "async=1", "place=x"), ("train67", "async=1", "place="), ("run20", "place=2numa"),
+          ("train67", "save=0"), ("train67", "async=1", "save=0"), ("run20", "save=0")):
+    rc, out = job(*a)
+    check(f"rl_job {' '.join(a)}: refused", rc != 0 and "OUT=" not in out, out)
 done()

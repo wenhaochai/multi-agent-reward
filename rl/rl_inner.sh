@@ -8,9 +8,9 @@
 set -uo pipefail
 : "${JID:?}" "${OUT:?}" "${PKG:?}" "${TMPDIR:?}"
 MODE=$1
-REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic2
+REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic3
 FLINT=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint
-MILES=/scratch/gpfs/GROUP/USER/project/miles-elastic
+MILES=/scratch/gpfs/GROUP/USER/project/miles-numa
 MEMPROBE_DATA=/scratch/gpfs/GROUP/USER/tmp/flint_s5/memprobe_data   # a recorded batch for the schedule check
 export HOME=$TMPDIR/home TRITON_CACHE_DIR=$TMPDIR/triton TORCHINDUCTOR_CACHE_DIR=$TMPDIR/inductor
 export SGLANG_CACHE_DIR=$TMPDIR/sglang FLASHINFER_WORKSPACE_BASE=$TMPDIR/flashinfer
@@ -239,6 +239,7 @@ for x in "${GAME[@]}"; do
 done
 T67_RUN=(--colocate --save "$OUT/actor" --load "$OUT/actor" --save-interval 2 --save-trigger-sentinel "$OUT/save_now")
 T67_TEST=(--colocate --save "$OUT/actor" --load "$OUT/actor" --save-interval 1 --save-trigger-sentinel "$OUT/save_now")
+[ -z "${T67_NOSAVE:-}" ] || T67_TEST=(--colocate)   # rl_job.sh train67_test save=0: a placement test needs no checkpoints (2 x 480 GiB)
 [ ${#ASYNC[@]} -eq 0 ] || { T67_RUN=("${T67_RUN[@]:1}"); T67_TEST=("${T67_TEST[@]:1}"); }   # async: not colocated
 
 MEMPROBE=(--prompt-data "$OUT/data_p0.jsonl" --input-key prompt --label-key label --metadata-key metadata --num-rollout 2

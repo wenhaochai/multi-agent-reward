@@ -41,7 +41,7 @@ JID=${FETCHED_JOB_ID:-$SLURM_JOB_ID}
 [ -n "$JID" ] || { echo "no job id"; exit 1; }
 WARM=${EL_WARMUP:-}
 REGROOT=$RUN; [ -z "$WARM" ] || REGROOT=$RUN/warmup   # where this job's record and leave file live
-HERE=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic2   # this job's own helpers (registry, GPU watch, procs)
+HERE=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic3   # this job's own helpers (registry, GPU watch, procs)
 SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif
 # timings (the EL_* variables only for tests/dryrun_elastic.sh; a wq job runs with the defaults)
 BEAT=${EL_BEAT_S:-30} STALE=${EL_STALE_S:-900} DRAIN_MIN=${EL_DRAIN_MIN_S:-300} DRAIN_MAX=${EL_DRAIN_MAX_S:-1200}
