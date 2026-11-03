@@ -128,10 +128,11 @@ def _train_steps(train_log: str) -> dict[int, dict]:
 def _take_async_traces(samples, live: str, dest: str, out: str) -> None:
     """Move this batch's episode traces (agent_<pid>.jsonl, one per episode) from the live directory into ``dest``.
     A group that finished before a checkpoint comes back from it when the run resumes, and its traces are then in
-    RUN/traces_live.stale_* (rl/rl_job.sh moves the live directory away at a segment's start; w922, rollout 7), or, if the
-    rollout was logged once before the run stopped, in this rollout's traces.before_* (log_rollout renames them; w922,
-    rollout 10). A new segment numbers its PIDs afresh, so a file counts only if it holds the episode's session; a live
-    file that holds no session id is taken as before."""
+    RUN/traces_live.stale_* (rl/rl_job.sh moves the live directory away at a segment's start; w922, rollout 7), or, if a
+    rollout took it before the run stopped, in that rollout's traces or traces.before_* (log_rollout renames them; w922,
+    rollout 10). That may be another rollout: a drain takes a restored group where its deadline puts it (order=oldest).
+    A new segment numbers its PIDs afresh, so a file counts only if it holds the episode's session; a live file that
+    holds no session id is taken as before."""
     os.makedirs(dest)
     want = {}
     for s in samples:
@@ -140,6 +141,7 @@ def _take_async_traces(samples, live: str, dest: str, out: str) -> None:
             want.setdefault(m["flint_trace_pid"], m.get("flint_session"))
     stale = sorted(glob.glob(os.path.join(out, "traces_live.stale_*")), reverse=True)
     stale += sorted(glob.glob(os.path.join(os.path.dirname(dest), "traces.before_*")), reverse=True)
+    stale += [x for x in sorted(glob.glob(os.path.join(out, "r[0-9]*", "traces*")), reverse=True) if x not in stale and x != dest]
     for pid, session in sorted(want.items()):
         name = f"agent_{pid}.jsonl"
         for src in (live, *stale):

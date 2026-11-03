@@ -511,3 +511,155 @@ def test_miles_fifo_buffer_does_drop_them_in_the_same_loop():
     """So the test above can fail."""
     total = sum(asyncio.run(_run_window(er.DefaultDataBuffer, s, 2, seed))[1] for s in (1, 2) for seed in range(3))
     assert total > 0
+
+
+# The real ElasticFullyAsyncRolloutFn, miles' worker loop and drain, real Sample objects (from the audit's harness); only generate_and_rm_group and GenerateState are fakes. 1 simulated min = MIN s.
+MIN = 0.002
+
+
+class _Engine:
+    def __init__(self, seed, hang=None):
+        import random
+        self.rng, self.version, self.hang = random.Random(seed), 1, hang
+
+    async def generate(self, state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        from miles.utils.types import Sample, WeightVersionSpan, WeightVersionsPerCall
+        if self.hang == group[0].group_index:
+            await asyncio.Event().wait()
+
+        async def one(sample, d):
+            await asyncio.sleep(0.5 * MIN)
+            first = self.version
+            await asyncio.sleep(d * MIN)
+            spans = [WeightVersionSpan(version=str(v), abs_start=j, abs_end=j + 1) for j, v in enumerate(range(first, self.version + 1))]
+            sample.weight_versions = [WeightVersionsPerCall(spans=spans)]
+            sample.status, sample.reward, sample.metadata = Sample.Status.COMPLETED, 1.0, {}
+            if sample_done_callback is not None:
+                sample_done_callback()
+
+        await asyncio.gather(*[one(x, min(60.0, max(10.0, self.rng.lognormvariate(3.35, 0.45)))) for x in group])
+        return group
+
+
+class _Data:
+    def __init__(self):
+        self.n = 0
+
+    def get_samples(self, k):
+        from miles.utils.types import Sample
+        self.n += 1
+        return [[Sample(group_index=self.n, index=self.n * 100 + i, prompt="p", label="l") for i in range(8)]]
+
+
+def _producer(monkeypatch, engine, s=2, p=2, order=True, per_engine=None):
+    from argparse import Namespace
+    import miles.rollout.fully_async_rollout as fa
+    from miles.rollout.base_types import RolloutFnConstructorInput
+    from miles.rollout.inference_rollout.inference_rollout_common import GenerateState
+
+    class State(GenerateState):
+        def __init__(self, args):
+            self.args, self.sampling_params, self.aborted = args, {}, False
+            self.generate_fn_semaphore, self.generate_function = asyncio.Semaphore(4096), None
+
+    monkeypatch.setattr(fa, "GenerateState", State)
+    monkeypatch.setattr(fa, "generate_and_rm_group", engine.generate)
+    monkeypatch.setattr(er, "routed_engines", lambda ip, port, timeout=2.0: 1)
+    monkeypatch.setattr(er, "DEADLINE_POLL_S", 0.002)
+    monkeypatch.setenv("MA_ASYNC_SAMPLES_PER_ENGINE", str(per_engine or (s + 1) * p * 8))
+    a = Namespace(rollout_global_dataset=True, debug_rollout_only=False, debug_skip_weight_update=False, rollout_batch_size=p, n_samples_per_prompt=8, max_weight_staleness=s,
+                  async_max_concurrent_samples=None, async_data_buffer_capacity_factor=float(s + 1), async_unused_samples_handler="drop",
+                  custom_async_data_buffer_path="flint.elastic_rollout.OldestFirstDataBuffer" if order else None, enable_sample_ownership_checker=False,
+                  custom_async_data_buffer_path_per_model=None, megatron_config=None, rollout_submission_granularity=None, dynamic_sampling_filter_path=None, reward_key=None,
+                  rollout_sample_filter_path=None, buffer_filter_path=None, sglang_router_ip="127.0.0.1", sglang_router_port=1, sglang_router_request_timeout_secs=14400, eval_num_gpus=0,
+                  namespaced_radix_cache=True, update_weights_interval=1)
+    return er.ElasticFullyAsyncRolloutFn(RolloutFnConstructorInput(args=a, data_source=_Data()))
+
+
+async def _train(fn, engine, steps):
+    from miles.rollout.base_types import RolloutFnTrainInput
+    from miles.rollout.filter_hub.common_filters import group_weight_version_stats
+    lags, stale = [], 0
+    for r in range(steps):
+        out = await fn(RolloutFnTrainInput(rollout_id=r, weight_version=engine.version))
+        stale += out.metrics["rollout/fully_async/stale_groups_filtered"]
+        lags += [engine.version - group_weight_version_stats(g).oldest_version for g in out.samples]
+        await asyncio.sleep(engine.rng.uniform(5, 14) * MIN)
+        engine.version += 1
+        await asyncio.sleep(MIN)
+    return lags, stale, fn
+
+
+async def _stop(fn):
+    fn._worker_error_cancel_targets.clear()
+    await fn.dispose()
+    for x in list(fn._running_tasks):
+        x.task.cancel()
+
+
+def test_the_real_producer_drops_no_group_under_the_window(monkeypatch):
+    for s, p in ((1, 2), (2, 2), (2, 1), (3, 2)):
+        for seed in range(2):
+            async def go():
+                e = _Engine(seed)
+                fn = _producer(monkeypatch, e, s, p)
+                assert isinstance(fn._output, er.OldestFirstDataBuffer) and fn._output.in_flight_versions == fn._in_flight_versions
+                lags, stale, fn = await _train(fn, e, 40)
+                assert len(fn._started) <= (s + 1) * p      # finished tasks leave
+                await _stop(fn)
+                return lags, stale
+            lags, stale = asyncio.run(go())
+            assert stale == 0, (s, p, seed)
+            assert max(lags) <= s and min(lags) >= 0, (s, p, seed, lags)
+
+
+def test_miles_buffer_drops_groups_in_the_same_loop(monkeypatch):
+    """So the test above can fail; a producer without the rule behaves like this one."""
+    total = 0
+    for seed in range(4):
+        async def go():
+            e = _Engine(seed)
+            fn = _producer(monkeypatch, e, 2, 2, order=False)
+            assert not fn._deadlines
+            _, stale, fn = await _train(fn, e, 40)
+            assert fn._started == {}     # nothing is kept for a rule that is off: a finished task holds its samples
+            await _stop(fn)
+            return stale
+        total += asyncio.run(go())
+    assert total > 0
+
+
+def test_a_hung_group_holds_drains_only_until_the_limit(monkeypatch):
+    monkeypatch.setenv("MA_LG_WALL_MIN", "0")
+    monkeypatch.setattr(er, "GROUP_GRACE_S", 0.3)
+
+    async def go():
+        e = _Engine(1, hang=1)       # group 1 starts at version 1 and never ends
+        fn = _producer(monkeypatch, e, 2, 2)
+        lags, stale, fn = await asyncio.wait_for(_train(fn, e, 6), 30)
+        await _stop(fn)
+        return lags
+    assert len(asyncio.run(go())) == 12
+
+
+def test_a_failed_worker_cancels_the_drain_that_waits(monkeypatch):
+    class Bad(_Engine):
+        async def generate(self, state, group, sampling_params, evaluation=False, sample_done_callback=None):
+            if group[0].group_index == 7:      # while the drain of version 3 waits for group 1, at its last chance
+                while self.version < 3:
+                    await asyncio.sleep(MIN)
+                await asyncio.sleep(2 * MIN)
+                raise RuntimeError("the group raised")
+            return await super().generate(state, group, sampling_params, evaluation, sample_done_callback)
+
+    async def go():
+        e = Bad(1, hang=1)
+        fn = _producer(monkeypatch, e, 2, 2)
+        try:
+            await asyncio.wait_for(_train(fn, e, 30), 30)
+            return "went on"
+        except asyncio.CancelledError:
+            return "cancelled"
+        finally:
+            await _stop(fn)
+    assert asyncio.run(go()) == "cancelled"
