@@ -137,6 +137,16 @@ rm -f "$OUT/exit_code" "$OUT/stop_request" "$OUT/save_now" "$OUT/train_segment.l
 # elastic=1: the trainer owns the run directory; a STOP from an earlier end of the run is void once it runs again
 [ -n "$T67_ELASTIC" ] && rm -f "$OUT/STOP" "$OUT/engine_spec.json"
 FRESH=; [ -e "$OUT/actor/latest_checkpointed_iteration.txt" ] || FRESH=1
+# a new run adds up to ~1.35 TiB of checkpoints: under 2 TiB free on the scratch fileset it goes back to the queue (98:
+# wq requeues it, not before 30 min, without counting the run), since a full fileset fails every session's checkpoint
+if [ -n "$FRESH" ] && [ "$MODE" = train67 ]; then
+  FREE_GIB=$(df -BG --output=avail /scratch/gpfs/GROUP 2>/dev/null | tail -1 | tr -dc 0-9)
+  if [ -n "$FREE_GIB" ] && [ "$FREE_GIB" -lt "${RL_MIN_FREE_GIB:-2048}" ]; then
+    echo "[s5] new run, $FREE_GIB GiB free on scratch (under ${RL_MIN_FREE_GIB:-2048}): back to the queue"
+    rm -rf -- "/scratch/gpfs/GROUP/USER/tmp/job/$JID"
+    exit 98
+  fi
+fi
 # an interrupted segment's episode traces belong to no rollout of this one
 [ -d "$OUT/traces_live" ] && mv "$OUT/traces_live" "$OUT/traces_live.stale_$(date +%s)"
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
