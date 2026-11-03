@@ -12,6 +12,8 @@ The arguments are the run's own engine's (colocated, or on GPUs of its own with 
                                                                       MEM_FRACTION in the environment instead (the
                                                                       warm-up engine: 0.72, beside the idle actor)
   random_seed seed + SEED_OFFSET                                      apart from the colocated engines' seed + i
+  model_path                                                          MODEL_PATH in the environment, if set (the warm-up engine of a resume: the
+                                                                      checkpoint's weights, rl/export_ckpt.py); the tokenizer stays the base's
 The environment is miles' engine environment for the run (compute_inference_engine_env_vars: e.g. custom all-reduce
 v2 off at TP > 1 when colocated), then the spec's serving variables (the levers; async=1 turns v2 off), which win.
 
@@ -29,7 +31,7 @@ from miles.ray.specs.inference import compute_inference_engine_env_vars
 from miles.utils.arguments import parse_args
 
 CHANGED = {"host", "port", "nccl_port", "dist_init_addr", "engine_info_bootstrap_port", "base_gpu_id",
-           "gated_launch_port", "enable_memory_saver", "mem_fraction_static", "random_seed"}
+           "gated_launch_port", "enable_memory_saver", "mem_fraction_static", "random_seed", "model_path"}
 
 spec_path, host, port, base, seed_offset = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
 assert not host.startswith("127.") and host != "localhost", f"an engine of another job must bind a routable address, got {host}"
@@ -51,6 +53,8 @@ ext = server_kwargs(dist_init_addr=f"{host}:{base + 8}", nccl_port=base, host=ho
                     engine_info_bootstrap_port=base + 1, gated_launch_port=None, random_seed=args.seed + seed_offset)
 ext["enable_memory_saver"] = False
 ext["mem_fraction_static"] = float(os.environ.get("MEM_FRACTION", "0.85"))
+if os.environ.get("MODEL_PATH"):
+    ext["model_path"] = os.environ["MODEL_PATH"]
 diff = {k: (own.get(k), ext.get(k)) for k in sorted(set(own) | set(ext)) if own.get(k) != ext.get(k)}
 unexpected = sorted(set(diff) - CHANGED)
 assert not unexpected, f"the engine would differ from the run's own engine in {unexpected}: {diff}"

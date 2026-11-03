@@ -34,6 +34,9 @@
 # actor keeps up to 7 GiB per GPU: w894's peak 7162 MiB on GPU 0), leaves on RUN/warmup/leave (drain at most 10 min),
 # and when it ends waits until its GPUs hold under 12 GiB and writes RUN/warmup/gone ({"job", "time", "max_gpu_mib"}),
 # which the producer waits for before the first step trains on those GPUs.
+# EL_WARM_CKPT=MODEL_DIR (a resume: rl/rl_job.sh, the checkpoint's model directory): the base checkpoint would be the wrong weights, so this job first exports the
+# checkpoint's weights (rl/export_ckpt.py) and serves from them; the producer's tensor-by-tensor check is the same. If the export fails the job ends as any failed warm-up:
+# RUN/warmup/gone is written and the run goes on without this engine.
 set -uo pipefail
 RUN=${1:?usage: elastic_engine.sh RUN}
 LIMIT=${EL_LIMIT_S:-82800}
@@ -41,7 +44,7 @@ JID=${FETCHED_JOB_ID:-$SLURM_JOB_ID}
 [ -n "$JID" ] || { echo "no job id"; exit 1; }
 WARM=${EL_WARMUP:-}
 REGROOT=$RUN; [ -z "$WARM" ] || REGROOT=$RUN/warmup   # where this job's record and leave file live
-HERE=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic3   # this job's own helpers (registry, GPU watch, procs)
+HERE=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic4   # this job's own helpers (registry, GPU watch, procs)
 SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif
 # timings (the EL_* variables only for tests/dryrun_elastic.sh; a wq job runs with the defaults)
 BEAT=${EL_BEAT_S:-30} STALE=${EL_STALE_S:-900} DRAIN_MIN=${EL_DRAIN_MIN_S:-300} DRAIN_MAX=${EL_DRAIN_MAX_S:-1200}
@@ -126,6 +129,22 @@ echo "[engine] serving code: mas-rl $(git -C "$REPO" rev-parse --short HEAD) mil
 [ $((END - T0)) -gt $((LEAVE_BEFORE + MIN_LEFT)) ] || { echo "[engine] under $(((LEAVE_BEFORE + MIN_LEFT) / 60)) min left on this host: back to the queue"; exit 98; }
 PKG=$TMPDIR/flint_pkg
 timeout 900 bash "$REPO/serving/build_flint_sglang.sh" "$PKG" || { echo "[engine] plugin build failed"; exit 1; }
+MODEL_PATH=
+if [ -n "$WARM" ] && [ -n "${EL_WARM_CKPT:-}" ]; then
+  MODEL_PATH=$TMPDIR/warm_weights
+  echo "[engine] $(date -u +%FT%TZ) warm-up: exporting the checkpoint's weights from $EL_WARM_CKPT"
+  start timeout -s KILL 1500 apptainer exec --contain --cleanenv --bind /scratch/gpfs/GROUP --bind "$TMPDIR/tmp":/tmp --env PYTHONNOUSERSITE=1 --env PYTHONDONTWRITEBYTECODE=1 \
+    --env CUDA_VISIBLE_DEVICES= --env OMP_NUM_THREADS=8 "$SIF" /opt/sglang/bin/python3 "$HERE/rl/export_ckpt.py" "$EL_WARM_CKPT" "$FLINT" "$MODEL_PATH" > "$RUN/engine_logs/$JID.export.log" 2>&1
+  X=${STARTED[-1]}
+  while kill -0 "$X" 2>/dev/null; do   # the first step must not wait for an export it no longer needs
+    [ -e "$RUN/warmup/leave" ] && { echo "[engine] warm-up: asked to leave while exporting"; exit 0; }
+    sleep 3
+  done
+  wait "$X"; rc=$?
+  STARTED=()   # it has ended, and the server list below must hold the servers only
+  [ "$rc" = 0 ] || { echo "[engine] warm-up: the export failed (exit $rc): $(tail -q -n 3 "$RUN/engine_logs/$JID.export.log" | cut -c1-300)"; exit 1; }
+  echo "[engine] $(date -u +%FT%TZ) warm-up: $(grep -a export_ckpt "$RUN/engine_logs/$JID.export.log" | tail -1)"
+fi
 URLS=() SPECS=()
 for i in $(seq 0 $((N - 1))); do
   URLS+=("http://$IP:$((BASE + 50 * i + 40))")
@@ -142,7 +161,7 @@ for i in $(seq 0 $((N - 1))); do
     --bind /scratch/gpfs/GROUP --bind "$TMPDIR/tmp":/tmp --bind /dev/shm \
     --env PYTHONNOUSERSITE=1 --env PYTHONDONTWRITEBYTECODE=1 --env CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${DEV[*]:$((i * TP)):$TP}")" \
     --env IP="$IP" --env PORT="$((BASE + 50 * i + 40))" --env BASE="$((BASE + 50 * i))" --env SEED_OFFSET="$((10 + 2 * JNUM + i))" \
-    --env PKG="$PKG" --env TMPDIR="$TMPDIR" --env SPEC="$SPEC" --env REPO="$REPO" --env MILES="$MILES" --env MEM_FRACTION="$MEMF" \
+    --env PKG="$PKG" --env TMPDIR="$TMPDIR" --env SPEC="$SPEC" --env REPO="$REPO" --env MILES="$MILES" --env MEM_FRACTION="$MEMF" --env MODEL_PATH="$MODEL_PATH" \
     "$SIF" bash "$REPO/rl/elastic_engine_inner.sh" serve > "$RUN/engine_logs/$JID.$i.log" 2>&1
 done
 SRV=("${STARTED[@]}")

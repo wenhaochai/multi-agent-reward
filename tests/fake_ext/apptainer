@@ -14,8 +14,16 @@ if [[ "$*" == *"pip install"* ]]; then
   mkdir -p "$t/flint" && touch "$t/flint/__init__.py" && cp "$D/miles_agent_stub.py" "$t/flint/miles_agent.py"; exit
 fi
 [ "$1" = python3 ] && [ "$2" = -c ] && [[ "$3" == *entry_points* ]] && { echo "flint-sglang fake installed"; exit 0; }
+if [[ "$*" == *export_ckpt.py* ]]; then   # FAKE_EXPORT: ok, fail or slow
+  out=${*: -1}
+  case ${FAKE_EXPORT:-ok} in
+    ok) mkdir -p "$out" && echo '{}' > "$out/model.safetensors.index.json" && echo '[export_ckpt] {"tensors": 1}'; exit 0;;
+    fail) echo "export boom"; exit 3;;
+    slow) exec sleep 100;;
+  esac
+fi
 if [[ "$*" == *engine_inner.sh* ]]; then
-  echo "fake engine: NCCL_CUMEM_ENABLE (set by engine_inner.sh, not here) ip=$IP port=$PORT base=$BASE mem=${MEM_FRACTION:-unset}" >&2
+  echo "fake engine: NCCL_CUMEM_ENABLE (set by engine_inner.sh, not here) ip=$IP port=$PORT base=$BASE mem=${MEM_FRACTION:-unset} model=${MODEL_PATH:-base}" >&2
   exec python3 "$D/fake_sglang.py" "$IP" "$PORT"
 fi
 PATH=$D/inner:$PATH exec "$@"

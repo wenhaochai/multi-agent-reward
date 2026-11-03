@@ -93,7 +93,7 @@ T67_CMD_TIMEOUT=${T67_CMD_TIMEOUT:-60}
 T67_SEED=${T67_SEED:-67}
 JID=${FETCHED_JOB_ID:-$SLURM_JOB_ID}
 [ -n "$JID" ] || { echo "no job id"; exit 1; }
-REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic3
+REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic4
 MILES=/scratch/gpfs/GROUP/USER/project/miles-numa
 SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif
 FLINT=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint
@@ -264,15 +264,20 @@ start timeout -k 300 "$LIMIT" apptainer exec --pid --nv --contain --cleanenv --w
   --env T67_STEPS="$T67_STEPS" --env T67_SEED="$T67_SEED" --env T67_LEVERS="$T67_LEVERS" --env T67_CMD_TIMEOUT="$T67_CMD_TIMEOUT" \
   --env T67_ELASTIC="$T67_ELASTIC" --env T67_ASYNC="$T67_ASYNC" --env T67_STALE="$T67_STALE" --env IP="$IP" --env MILES_GPU_ORDER="$GPU_ORDER" --env T67_NOSAVE="$T67_NOSAVE" \
   "$SIF" bash "$REPO/rl/rl_inner.sh" "$MODE"
-# async=1 on a fresh start: the warm-up engine on the actor's 4 GPUs (the first 4 of this job's, or of GPU_ORDER: miles puts the
-# actor there and its own engine on the other 4), loading the base checkpoint while the trainer starts; it ends on its own
-# (RUN/warmup/leave at the first step's data, or a failure) and with this job at the latest (the EXIT trap)
-if [ -n "$T67_ASYNC" ] && [ -n "$FRESH" ]; then
+# async=1: the warm-up engine on the actor's 4 GPUs (the first 4 of this job's, or of GPU_ORDER: miles puts the actor there and its own engine on the other 4), loading the
+# base checkpoint on a fresh start and the checkpoint's weights at a resume while the trainer starts; it ends on its own (RUN/warmup/leave at the first step's data, or a
+# failure) and with this job at the latest (the EXIT trap). So the actor's GPUs serve during the first wait, which is up to one rollout (the 60-min wall cap) and passed CSES's 30 min.
+WARM_CKPT=
+if [ -n "$T67_ASYNC" ] && [ -z "$FRESH" ] && [ -z "$T67_NOSAVE" ]; then
+  WARM_CKPT="$OUT/actor/iter_$(printf %07d "$(cat "$OUT/actor/latest_checkpointed_iteration.txt" 2>/dev/null || echo 0)")/model"
+  [ -d "$WARM_CKPT" ] || { echo "[s5] async: no checkpoint at $WARM_CKPT: no warm-up engine at this resume"; WARM_CKPT=; }
+fi
+if [ -n "$T67_ASYNC" ] && { [ -n "$FRESH" ] || [ -n "$WARM_CKPT" ]; }; then
   IFS=, read -r -a GPUS <<< "${GPU_ORDER:-${CUDA_VISIBLE_DEVICES:-}}"
   mkdir -p "$OUT/warmup" && echo "${JID}w" > "$OUT/warmup/launched"
-  start env EL_WARMUP=1 EL_SPEC_AFTER="$((SEG_T0 - 120))" FETCHED_JOB_ID="${JID}w" CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${GPUS[*]:0:4}")" \
+  start env EL_WARMUP=1 EL_SPEC_AFTER="$((SEG_T0 - 120))" EL_WARM_CKPT="$WARM_CKPT" FETCHED_JOB_ID="${JID}w" CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${GPUS[*]:0:4}")" \
     bash "$REPO/rl/elastic_engine.sh" "$OUT" > "$OUT/warmup/engine.log" 2>&1
-  echo "[s5] async: warm-up engine ${JID}w on GPUs ${GPUS[*]:0:4} (log $OUT/warmup/engine.log)"
+  echo "[s5] async: warm-up engine ${JID}w on GPUs ${GPUS[*]:0:4}${WARM_CKPT:+, from $WARM_CKPT} (log $OUT/warmup/engine.log)"
 fi
 wait "${STARTED[0]}"
 rc=$?
