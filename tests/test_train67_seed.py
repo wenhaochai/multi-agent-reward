@@ -198,7 +198,10 @@ place = {("train67", "2", "8", "40", "set=signal34", "async=1", "stale=1", "elas
 for a, want in place.items():
     rc, out = job(*a)
     check(f"rl_job {' '.join(a)}: {want.split('/')[-1]}", rc == 0 and out.endswith(want), out)
-for a in (("train67", "place=2numa"), ("train67", "async=1", "place=x"), ("train67", "async=1", "place="), ("run20", "place=2numa"),
+rc, out = job("train67", "2", "8", "40", "set=signal34", "async=1", "stale=1", "elastic=1", "levers=gate,graphs,tp4", "place=2numa", "inflight=32")
+check("rl_job inflight=32: the same run dir", rc == 0 and out.endswith(f"SEED=67 OUT={async_tag} LEVERS=gate,graphs,tp4 PLACE=2numa INFLIGHT=32 ELASTIC=1 ASYNC=1 STALE=1"), out)
+for a in (("train67", "inflight=32"), ("train67", "async=1", "inflight=x"), ("train67", "async=1", "inflight=0"), ("train67", "async=1", "inflight="), ("run20", "inflight=32"),
+          ("train67", "place=2numa"), ("train67", "async=1", "place=x"), ("train67", "async=1", "place="), ("run20", "place=2numa"),
           ("train67", "save=0"), ("train67", "async=1", "save=0"), ("run20", "save=0")):
     rc, out = job(*a)
     check(f"rl_job {' '.join(a)}: refused", rc != 0 and "OUT=" not in out, out)
