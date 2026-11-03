@@ -249,7 +249,10 @@ def _run_command(command: str, work: str, harness: bool = False, reap: bool = Fa
 
 
 # ---- the harness's git, under the command sandbox ---------------------------------------------------------------------
-def run_git(work: str, args: list, env: dict, timeout: float = 60, read: tuple = ()) -> subprocess.CompletedProcess:
+GIT_TIMEOUT_S = 600   # a file-system stall lasts minutes (2026-11-03 04:16-04:30: git add up to 150 s), and at 60 s it aborted 10 episodes and stopped two runs
+
+
+def run_git(work: str, args: list, env: dict, timeout: float = GIT_TIMEOUT_S, read: tuple = ()) -> subprocess.CompletedProcess:
     """git <args> in an episode's repo for the harness (repo.git), in a case worker and under the agents'
     sandbox: config the agents wrote into .git (filter.*.clean, gpg.program, core.pager, ...) then runs with their rights
     only, not the trainer's (audit 2026-10-24); `read`: paths it may also read (another agent's repository, team.git).
