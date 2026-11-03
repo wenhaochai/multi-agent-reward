@@ -23,6 +23,7 @@ On a match the recorded tokens stay authoritative, so a sample holds exactly the
 drop_failed_groups (--rollout-sample-filter-path flint.miles_agent.drop_failed_groups): an episode whose score cannot be
 trusted (a submission the judge could not judge after its retries, or an episode that could not go on) has no reward;
 its whole group leaves the loss, so it biases no group mean either."""
+import glob
 import json
 import os
 import random
@@ -122,6 +123,32 @@ def _train_steps(train_log: str) -> dict[int, dict]:
             except (ValueError, SyntaxError):
                 pass
     return steps
+
+
+def _take_async_traces(samples, live: str, dest: str, out: str) -> None:
+    """Move this batch's episode traces (agent_<pid>.jsonl, one per episode) from the live directory into ``dest``.
+    A group that finished before a checkpoint comes back from it when the run resumes, and its traces are then in
+    RUN/traces_live.stale_* (rl/rl_job.sh moves the live directory away at a segment's start; w922, rollout 7). A new
+    segment numbers its PIDs afresh, so a file counts only if it holds the episode's session; a live file that holds
+    no session id is taken as before."""
+    os.makedirs(dest)
+    want = {}
+    for s in samples:
+        m = s.metadata or {}
+        if m.get("flint_trace_pid") is not None:
+            want.setdefault(m["flint_trace_pid"], m.get("flint_session"))
+    stale = sorted(glob.glob(os.path.join(out, "traces_live.stale_*")), reverse=True)
+    for pid, session in sorted(want.items()):
+        name = f"agent_{pid}.jsonl"
+        for src in (live, *stale):
+            f = os.path.join(src, name)
+            if os.path.exists(f) and (not session or session in open(f, errors="replace").read()):
+                os.rename(f, os.path.join(dest, name))
+                break
+        else:
+            f = os.path.join(live, name)
+            if os.path.exists(f) and "/sessions/" not in open(f, errors="replace").read():
+                os.rename(f, os.path.join(dest, name))
 
 
 def _stop_rule(out: str, rollout_id: int) -> str | None:
@@ -452,11 +479,7 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
         if os.environ.get("MA_RL_ASYNC"):
             # fully async (rl/rl_inner.sh async=1): the episodes of later batches are still writing there, so only this
             # batch's episodes move (one agent process per episode writes agent_<pid>.jsonl, flint/game.py trace)
-            os.makedirs(os.path.join(d, "traces"))
-            for pid in sorted({(s.metadata or {}).get("flint_trace_pid") for s in samples} - {None}):
-                f = os.path.join(live, f"agent_{pid}.jsonl")
-                if os.path.exists(f):
-                    os.rename(f, os.path.join(d, "traces", f"agent_{pid}.jsonl"))
+            _take_async_traces(samples, live, os.path.join(d, "traces"), out)
         else:
             os.rename(live, os.path.join(d, "traces"))
 
