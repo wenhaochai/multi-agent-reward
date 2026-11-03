@@ -211,6 +211,60 @@ def test_the_warmup_engine_joins_with_equal_weights_and_leaves_at_the_first_step
     asyncio.run(main())
 
 
+def test_the_first_groups_wait_for_the_warmup_engine_at_most_the_hold(tmp_path):
+    now = [100.0]
+    w, d, calls, changes = _warmup(tmp_path / "a", clock=lambda: now[0], hold_s=300.0, serving=False)
+    assert w.holding()                         # before the first drain too
+    w._hold_until = None
+
+    async def main():
+        w.start()
+        assert w.holding()
+        now[0] += 299
+        assert w.holding()
+        now[0] += 2
+        assert not w.holding(), "the hold ends"
+        w._task.cancel()
+    asyncio.run(main())
+
+    # it joined: no more hold
+    w, d, calls, changes = _warmup(tmp_path / "b")
+
+    async def joined():
+        w.start()
+        assert w.holding()
+        await w._task
+        assert w.url == W_URL and not w.holding()
+    asyncio.run(joined())
+
+    # no warm-up job, one that was sent away, one that ended, one released
+    w, d, calls, changes = _warmup(tmp_path / "c", launched=False)
+    assert not w.holding()
+    w, d, calls, changes = _warmup(tmp_path / "d", serving=False)
+    (d / "leave").write_text("1 sent away")
+    assert not w.holding()
+    w, d, calls, changes = _warmup(tmp_path / "e", serving=False)
+    (d / "gone").write_text("{}")
+    assert not w.holding()
+    w, d, calls, changes = _warmup(tmp_path / "f", serving=False)
+    w._left = True
+    assert not w.holding()
+
+
+def test_a_holding_warmup_closes_the_window(tmp_path):
+    w, d, calls, changes = _warmup(tmp_path, serving=False)
+    p = er.ElasticFullyAsyncRolloutFn.__new__(er.ElasticFullyAsyncRolloutFn)
+    p.args = SimpleNamespace(max_weight_staleness=1, rollout_batch_size=2)
+    p._output = SimpleNamespace(_buffer=[])
+    p._draining = True
+    p._warmup = w
+    assert p._window_free(0) == 0
+    w._left = True
+    assert p._window_free(0) == 4
+    p._warmup = None
+    assert p._window_free(0) == 4
+
+
 def test_the_warmup_engine_waits_for_the_router_to_list_the_own_engine(tmp_path):
     w, d, calls, changes = _warmup(tmp_path)
     lists = iter([None, [], [W_URL]])

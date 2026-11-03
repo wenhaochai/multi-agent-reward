@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 RECHECK_S = 60.0
 WARMUP_JOIN_S = 1800.0     # the warm-up engine serves within 30 min of the first drain, or it is sent away
 WARMUP_GONE_S = 900.0      # ... and is gone within 15 min of its leave (a drain of at most 10 min, then its GPUs)
+WARMUP_HOLD_S = 300.0      # the first groups wait at most this long for the warm-up engine, since a session stays on the engine it starts on
 WARMUP_GPU_MIB = 12288     # the most its GPUs may hold once it is gone (the actor keeps 2-7 GiB on each: w894)
 WARMUP_POLL_S = 5.0
 CHECKSUM_TIMEOUT_S = 600.0
@@ -177,7 +178,7 @@ class PacedScheduler:
 
 
 class Warmup:
-    """The warm-up engine of a fresh start (module docstring). Its files under DIR (rl/rl_job.sh, rl/elastic_engine.sh
+    """The warm-up engine of a fresh start or a resume (module docstring). Its files under DIR (rl/rl_job.sh, rl/elastic_engine.sh
     EL_WARMUP=1):
       launched            the warm-up job's id, written when rl/rl_job.sh starts it
       engines/<job>.json  its record (rl/registry.py: "loading", then "serving" with the engine's url)
@@ -189,12 +190,13 @@ class Warmup:
 
     def __init__(self, directory, *, workers, add, remove, checksums, version, set_version, on_change,
                  clock=time.monotonic, join_s: float = WARMUP_JOIN_S, gone_s: float = WARMUP_GONE_S,
-                 poll_s: float = WARMUP_POLL_S):
+                 poll_s: float = WARMUP_POLL_S, hold_s: float = WARMUP_HOLD_S):
         self.dir = Path(directory)
         self._workers, self._add, self._remove = workers, add, remove
         self._checksums, self._version, self._set_version = checksums, version, set_version
         self._on_change, self._clock = on_change, clock
-        self._join_s, self._gone_s, self._poll_s = join_s, gone_s, poll_s
+        self._join_s, self._gone_s, self._poll_s, self._hold_s = join_s, gone_s, poll_s, hold_s
+        self._hold_until: float | None = None
         self.url: str | None = None
         self._left = False
         self._lock = asyncio.Lock()
@@ -203,7 +205,18 @@ class Warmup:
     def launched(self) -> bool:
         return (self.dir / "launched").exists()
 
+    def holding(self) -> bool:
+        """Should the first groups wait for this engine? A session stays on the engine it starts on (sgl-router's manual policy), so a group started before the engine joins never
+        uses it: w922's 32 episodes started 19 s before it. True while the engine may still join, at most hold_s from start(); False once it joined, left, was sent away or ended."""
+        if self._left or self.url is not None or not self.launched():
+            return False
+        if (self.dir / "leave").exists() or (self.dir / "gone").exists():
+            return False
+        return self._hold_until is None or self._clock() < self._hold_until
+
     def start(self) -> None:
+        if self._hold_until is None:
+            self._hold_until = self._clock() + self._hold_s
         if self._task is None and not self._left and self.launched():
             self._task = asyncio.ensure_future(self._join())
 
@@ -339,6 +352,9 @@ class ElasticFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         return budget
 
     def _window_free(self, pending_groups: int) -> int | None:
+        warmup = getattr(self, "_warmup", None)
+        if warmup is not None and warmup.holding():
+            return 0   # the join wakes the producer (_engines_changed); the end of the hold, its recheck
         w = window_groups(self.args.max_weight_staleness, self.args.rollout_batch_size, self._draining)
         return None if w is None else w - pending_groups - len(getattr(self._output, "_buffer", ()))
 
