@@ -295,6 +295,9 @@ def _post(args, path: str, body: dict) -> tuple[int, object]:
         return e.code, e.read().decode(errors="replace")[:2000]
 
 
+PROBE_TRIES = 8   # reads at most, per engine and for the router's probe, for two in a row that agree
+
+
 def _probe(args, ids: list[int], messages: list) -> dict:
     """What the engines serve now: the log-probs of ``ids`` (each token given the ones before it, /generate), or, if
     /generate refuses the request, the top-20 log-probs of the first greedy token after ``messages``
@@ -312,10 +315,25 @@ def _probe(args, ids: list[int], messages: list) -> dict:
     return {"kind": "chat", "top": {x["token"]: x["logprob"] for x in top}, "generate_refused": refused}
 
 
-def _probe_engines(args, ids: list[int]) -> dict[str, list[float]]:
+def _steady(read, tries: int = PROBE_TRIES) -> list:
+    """Reads until two in a row agree to the bit; the last two reads, whether they agree or not (at most ``tries`` reads). A probe is deterministic for fixed weights only when its prefill
+    runs alone. An async run has other requests at probe time, and a prefill batched with another request's gives other numbers on the same weights: w922's rollout 17, a read in a batch of
+    2, mean |diff| 0.49, max 12.2, while the next read equalled the engine's to the bit. The probe's tokens are a user prompt, where changing one bf16 rounding moves a log-prob by about 0.8
+    (ledger, the flint_hf parity), about as much as a training step moves them."""
+    a = read()
+    b = read()
+    for _ in range(tries - 2):
+        if max(_probe_diffs(a, b), default=0.0) == 0.0:
+            break
+        a, b = b, read()
+    return [a, b]
+
+
+def _probe_engines(args, ids: list[int]) -> tuple[dict[str, list[float]], list[str]]:
     """Elastic runs (MA_ENGINE_REGISTRY): the probe's /generate on every engine the router routes to, each by its own
-    URL (the router's probe reaches one engine). After a rollout no request runs, so engines of one serving shape that
-    hold the same weights return the same log-probs; an engine that missed a weight push differs by the size of a step."""
+    URL (the router's probe reaches one engine), as steady reads (_steady): engines of one serving shape that hold the
+    same weights return the same log-probs; an engine that missed a weight push differs by the size of a step. Also
+    the engines whose reads never agreed, which show nothing either way."""
     import urllib.request
 
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -323,14 +341,21 @@ def _probe_engines(args, ids: list[int]) -> dict[str, list[float]]:
         # sgl-router lists each engine once, or once per dp rank as url@rank (miles' router_worker_base_urls)
         urls = sorted({w["url"].rstrip("/").rsplit("@", 1)[0] if w["url"].rsplit("@", 1)[-1].isdigit() else w["url"].rstrip("/")
                        for w in json.loads(r.read())["workers"]})
-    out = {}
+    out, unsteady = {}, []
     body = json.dumps({"input_ids": ids, "sampling_params": {"max_new_tokens": 1, "temperature": 0.0},
                        "return_logprob": True, "logprob_start_len": 0}).encode()
-    for url in urls:
+
+    def read(url):
         req = urllib.request.Request(f"{url}/generate", data=body, headers={"Content-Type": "application/json"})
         with opener.open(req, timeout=600) as r:
-            out[url] = [x[0] for x in json.loads(r.read())["meta_info"]["input_token_logprobs"][1:]]
-    return out
+            return {"kind": "generate", "lp": [x[0] for x in json.loads(r.read())["meta_info"]["input_token_logprobs"][1:]]}
+
+    for url in urls:
+        a, b = _steady(lambda: read(url))
+        out[url] = b["lp"]
+        if max(_probe_diffs(a, b), default=0.0) != 0.0:
+            unsteady.append(url)
+    return out, unsteady
 
 
 def startup_probe(out: str, train_log: str, model: str) -> int:
@@ -490,7 +515,7 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
         json.dump([int(t) for t in samples[0].tokens[:4096]], open(ids_path, "w"))
     ids = json.load(open(ids_path))
     messages = json.loads(open(_data_file(out)).readline())["prompt"]
-    probe = [_probe(args, ids, messages), _probe(args, ids, messages)]
+    probe = _steady(lambda: _probe(args, ids, messages))
     json.dump(probe, open(os.path.join(d, "probe.json"), "w"))
     rec = {"rollout_id": rollout_id, "rollout_s": round(rollout_time, 1), "probe_kind": probe[0]["kind"],
            "probe_repeat_max_abs": max(_probe_diffs(*probe), default=None)}
@@ -498,15 +523,20 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
         rec["probe_generate_refused"] = probe[0]["generate_refused"]
     if os.environ.get("MA_ENGINE_REGISTRY") and probe[0]["kind"] == "generate":
         # elastic: every engine against the router's probe engine; mean |diff| over 0.05 (a step moves the probe by
-        # ~0.5) is an engine on other weights, and the run stops before it trains on that engine's samples
-        per = _probe_engines(args, ids)
+        # ~0.5) between steady reads is an engine on other weights, and the run stops before it trains on that engine's samples
+        per, unsteady = _probe_engines(args, ids)
+        if max(_probe_diffs(*probe), default=0.0) != 0.0:
+            unsteady = unsteady + ["router"]
         json.dump(per, open(os.path.join(d, "probe_engines.json"), "w"))
         means = {u: sum(abs(x - y) for x, y in zip(lp, probe[0]["lp"])) / max(len(lp), 1) for u, lp in per.items()}
         rec |= {"probe_engines": len(per), "probe_engines_mean_abs": means,
                 "probe_engines_max_abs": max((max((abs(x - y) for x, y in zip(lp, probe[0]["lp"])), default=0.0)
                                               for lp in per.values()), default=None)}
         stale = {u: m for u, m in means.items() if m > 0.05}
-        if stale:
+        if unsteady:   # reads that never agreed show nothing either way; the next rollout's probe looks again
+            rec["probe_unsteady"] = unsteady
+            print(f"[flint rollout {rollout_id}] CONSISTENCY WARNING: no two probe reads in a row agreed in {PROBE_TRIES} on {unsteady}", flush=True)
+        elif stale:
             raise RuntimeError(f"engines serve other weights than the probe engine (mean |diff| > 0.05): {stale}")
     prev = os.path.join(out, f"r{rollout_id - 1}", "probe.json")
     if os.path.exists(prev) and json.load(open(prev))[0]["kind"] == probe[0]["kind"]:

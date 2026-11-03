@@ -225,6 +225,89 @@ rc = MA.startup_probe(out_dir, log, FLINT)
 ids = json.load(open(os.path.join(out_dir, "probe_ids.json")))
 check("startup probe: works, the templated prompt, written for log_rollout", rc == 0 and len(probes) == 2
       and probes[0]["input_ids"] == ids and len(ids) >= 3, (rc, len(ids)))
+# _steady: a read batched with another request's prefill differs on the same weights (w922's rollout 17): two in a row must agree
+def _reads(*vals):
+    it, n = iter(vals), []
+    def read():
+        n.append(1)
+        return {"kind": "generate", "lp": [next(it)]}
+    return read, n
+read, n = _reads(1.0, 1.0, 9.0)
+check("steady: the first two reads agree, no more reads", [x["lp"] for x in MA._steady(read)] == [[1.0], [1.0]] and len(n) == 2)
+read, n = _reads(1.5, 1.0, 1.0, 9.0)
+check("steady: the odd first read is passed over", [x["lp"] for x in MA._steady(read)] == [[1.0], [1.0]] and len(n) == 3)
+read, n = _reads(*[float(i) for i in range(20)])
+r = MA._steady(read)
+check("steady: reads that never agree stop at the limit and show it", len(n) == MA.PROBE_TRIES and r[0]["lp"] != r[1]["lp"], (len(n), r))
+# the engines' probe through the log: an odd read passes, an engine on other weights stops the run, and reads that never agree show nothing either way
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: E402
+import threading  # noqa: E402
+engine = {}
+
+
+class _Fake(BaseHTTPRequestHandler):
+    calls = {"router": 0, "direct": 0}
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def do_GET(self):
+        self._send({"workers": [{"url": f"http://127.0.0.1:{self.server.server_port}/direct@0"}]})
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers["Content-Length"]))
+        who = "direct" if self.path.startswith("/direct") else "router"
+        k = _Fake.calls[who]
+        _Fake.calls[who] += 1
+        v = engine[who](k)
+        self._send({"meta_info": {"input_token_logprobs": [[0.0], [v], [v]]}})
+
+
+fsrv = ThreadingHTTPServer(("127.0.0.1", 0), _Fake)
+threading.Thread(target=fsrv.serve_forever, daemon=True).start()
+fargs = SimpleNamespace(sglang_router_ip="127.0.0.1", sglang_router_port=fsrv.server_port)
+engine["router"], engine["direct"] = (lambda k: 1.0), (lambda k: 1.5 if k == 0 else 1.0)
+per, uns = MA._probe_engines(fargs, [1, 2, 3])
+check("engines: an odd read beside other requests is passed over", list(per.values()) == [[1.0, 1.0]] and uns == [], (per, uns))
+_Fake.calls.update(router=0, direct=0)
+engine["direct"] = lambda k: float(k)
+per, uns = MA._probe_engines(fargs, [1, 2, 3])
+check("engines: reads that never agree are named", len(uns) == 1 and _Fake.calls["direct"] == MA.PROBE_TRIES, (uns, _Fake.calls))
+
+
+def _log_engines(rid, router, direct):
+    """log_rollout with the engines' check on the fake router: the error's text, or None; and the rollout's line."""
+    _Fake.calls.update(router=0, direct=0)
+    engine["router"], engine["direct"] = router, direct
+    os.makedirs(os.environ["MA_AG_TRACE_DIR"])
+    open(os.path.join(os.environ["MA_AG_TRACE_DIR"], "agent_1.jsonl"), "w").write(json.dumps(
+        {"S": 0.5, "submissions": [{}, {}], "agents": [{"restarts": 1, "turns": [{"cut": False, "dropped": 0, "prompt_tokens": 10}]}]}) + "\n")
+    os.environ["MA_ENGINE_REGISTRY"] = out_dir
+    try:
+        MA.log_rollout(rid, fargs, smp, {}, 12.0)
+        return None, [json.loads(x) for x in open(os.path.join(out_dir, "steps.jsonl"))][-1]
+    except RuntimeError as e:
+        import shutil
+        shutil.rmtree(os.environ["MA_AG_TRACE_DIR"], ignore_errors=True)
+        return str(e), None
+    finally:
+        del os.environ["MA_ENGINE_REGISTRY"]
+
+
+err, line = _log_engines(10, lambda k: 1.5 if k == 0 else 1.0, lambda k: 1.0)
+check("log: the router's odd first read does not stop the run (w922's rollout 17)", err is None and line["probe_repeat_max_abs"] == 0.0 and line["probe_engines_mean_abs"] and "probe_unsteady" not in line, (err, line))
+err, line = _log_engines(11, lambda k: 1.0, lambda k: 1.5)
+check("log: an engine that steadily differs stops the run", "other weights" in (err or ""), err)
+err, line = _log_engines(12, lambda k: 1.0, lambda k: 1.5 + k)
+check("log: reads that never agree do not stop the run, and the line says so", err is None and line["probe_unsteady"] == [f"http://127.0.0.1:{fsrv.server_port}/direct"], (err, line))
+fsrv.shutdown()
 # run20's stop rules and checkpoint retention
 rd = tempfile.mkdtemp()
 def steplog(*rows):
