@@ -77,7 +77,7 @@ case "$MODE" in train67*) [[ $T67_P =~ ^[1-9][0-9]*$ && $T67_G =~ ^[1-9][0-9]*$ 
     done
     T67_LEVERS=$(tr , '\n' <<< "$T67_LEVERS" | sort -u | paste -sd, -)
   fi
-  # malloc=keep: the actor ranks' glibc keeps freed memory, so each micro-batch's gradient buffers reuse the last ones instead of new zeroed pages
+  # malloc=keep: from its first optimizer step's end on, an actor rank's glibc keeps freed memory, so each micro-batch's buffers reuse the last ones instead of new zeroed pages
   # (w958, 4 ranks, the same two recorded rollouts: 47% more tokens/s; loss, KL and log-prob gap equal in every printed digit). The run dir does not change.
   [ -z "$MALLOC_GIVEN" ] || [ "$T67_MALLOC" = keep ] || { echo "malloc=keep is the only value: $T67_MALLOC"; exit 1; }
   [ -z "$CMDT_GIVEN" ] || { [[ $T67_CMD_TIMEOUT =~ ^[1-9][0-9]{0,2}$ ]] && [ "$T67_CMD_TIMEOUT" -ge 5 ] && [ "$T67_CMD_TIMEOUT" -le 600 ]; } \
