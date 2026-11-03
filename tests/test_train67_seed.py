@@ -175,4 +175,21 @@ for a in (("train67", "cmdtimeout=3"), ("train67", "cmdtimeout=abc"), ("train67"
           ("train67", "cmdtimeout=601"), ("run20", "cmdtimeout=30")):
     rc, out = job(*a)
     check(f"rl_job {' '.join(a)}: refused", rc != 0 and "OUT=" not in out, out)
+# malloc=keep: the same run dir (a run can take it at a resume); the training environment gains exactly the three glibc variables
+rc, out = job("train67", "2", "8", "40", "set=signal34", "levers=gate,graphs,tp4", "malloc=keep")
+check("rl_job malloc=keep: the same run dir", rc == 0 and out.endswith(f"OUT={R}/train67_signal34_kgate-graphs-tp4_p2g8 LEVERS=gate,graphs,tp4 MALLOC=keep"), out)
+for a in (("train67", "malloc=x"), ("train67", "malloc="), ("run20", "malloc=keep")):
+    rc, out = job(*a)
+    check(f"rl_job {' '.join(a)}: refused", rc != 0 and "OUT=" not in out, out)
+
+
+def train_env(**env):
+    sh = "".join(l for l in open(os.path.join(ROOT, "rl", "rl_inner.sh")) if l.startswith("TRAIN_ENV") or "T67_MALLOC" in l and l.startswith("["))
+    r = subprocess.run(["bash", "-c", sh + 'printf %s "$TRAIN_ENV"'], capture_output=True, text=True, env={"PATH": os.environ["PATH"], **env})
+    return json.loads(r.stdout)
+
+
+plain = {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "OMP_NUM_THREADS": "11", "MKL_NUM_THREADS": "11"}
+check("rl_inner: no malloc=keep, the environment as before", train_env() == plain)
+check("rl_inner: malloc=keep adds the three glibc variables", train_env(T67_MALLOC="keep") == {**plain, "MALLOC_ARENA_MAX": "1", "MALLOC_MMAP_MAX_": "0", "MALLOC_TRIM_THRESHOLD_": "107374182400"})
 done()

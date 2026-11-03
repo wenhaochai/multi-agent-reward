@@ -84,9 +84,13 @@ P=$((30000 + (JNUM % 1000) * 16))
 # a step with too few samples to give every rank its micro-batches gets zero-weight padding copies (the fork's schedule).
 # train67 replaces the batch flags (TRAIN67 below); the 64k-token micro-batch is the actor's memory bound per GPU, not
 # a batch size, so it stays: a step of B = 32 has ~4x run20's micro-batches (~32 per rank) and ~4x its train time.
+# malloc=keep (rl/rl_job.sh -> T67_MALLOC): freed memory stays with the rank's glibc: no mmap for large buffers, one arena, no trim below 100 GiB
+TRAIN_ENV='{"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "OMP_NUM_THREADS": "11", "MKL_NUM_THREADS": "11"'
+[ -z "${T67_MALLOC:-}" ] || TRAIN_ENV+=', "MALLOC_ARENA_MAX": "1", "MALLOC_MMAP_MAX_": "0", "MALLOC_TRIM_THRESHOLD_": "107374182400"'
+TRAIN_ENV+='}'
 TRAIN=(--train-backend fsdp --hf-checkpoint "$FLINT" --attn-implementation eager
   --actor-num-nodes 1 --actor-num-gpus-per-node "$NG" --seed 1 --fsdp-cpu-offload
-  --train-env-vars '{"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "OMP_NUM_THREADS": "11", "MKL_NUM_THREADS": "11"}'
+  --train-env-vars "$TRAIN_ENV"
   --advantage-estimator grpo --disable-grpo-std-normalization --kl-coef 0 --entropy-coef 0
   --loss-type score_centering --score-centering-is none --rollout-top-logprobs-num 32
   --optimizer adam --lr 2e-7 --lr-decay-style constant --weight-decay 0.0 --adam-beta1 0.9 --adam-beta2 0.98

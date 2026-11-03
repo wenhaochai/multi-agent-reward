@@ -43,10 +43,11 @@ case "$MODE" in smoke|smoke_tp4|smoke_tp8) LIMIT=4800;; train67_smoke) LIMIT=600
   *) echo "usage: rl_job.sh smoke[_tp4|_tp8]|base_tp8|test2|run20|train67[_test|_smoke] [P G [STEPS]] [set=NAME] [seed=N] [levers=LIST] [cmdtimeout=N]"; exit 1;; esac
 # train67: set=NAME, seed=N, levers=LIST and cmdtimeout=N at any place after the mode; the other arguments are P G STEPS in
 # this order
-T67_SET= T67_SEED= SEED_GIVEN= T67_LEVERS= LEVERS_GIVEN= T67_CMD_TIMEOUT= CMDT_GIVEN= POS=()
+T67_SET= T67_SEED= SEED_GIVEN= T67_LEVERS= LEVERS_GIVEN= T67_CMD_TIMEOUT= CMDT_GIVEN= T67_MALLOC= MALLOC_GIVEN= POS=()
 for x in "${@:2}"; do
   case "$x" in set=*) T67_SET=${x#set=};; seed=*) T67_SEED=${x#seed=} SEED_GIVEN=1;;
     levers=*) T67_LEVERS=${x#levers=} LEVERS_GIVEN=1;; cmdtimeout=*) T67_CMD_TIMEOUT=${x#cmdtimeout=} CMDT_GIVEN=1;;
+    malloc=*) T67_MALLOC=${x#malloc=} MALLOC_GIVEN=1;;
     *) POS+=("$x");; esac
 done
 T67_P=${POS[0]:-4} T67_G=${POS[1]:-8} T67_STEPS=${POS[2]:-40}
@@ -63,10 +64,13 @@ case "$MODE" in train67*) [[ $T67_P =~ ^[1-9][0-9]*$ && $T67_G =~ ^[1-9][0-9]*$ 
     done
     T67_LEVERS=$(tr , '\n' <<< "$T67_LEVERS" | sort -u | paste -sd, -)
   fi
+  # malloc=keep: the actor ranks' glibc keeps freed memory, so each micro-batch's gradient buffers reuse the last ones instead of new zeroed pages
+  # (w958, 4 ranks, the same two recorded rollouts: 47% more tokens/s; loss, KL and log-prob gap equal in every printed digit). The run dir does not change.
+  [ -z "$MALLOC_GIVEN" ] || [ "$T67_MALLOC" = keep ] || { echo "malloc=keep is the only value: $T67_MALLOC"; exit 1; }
   [ -z "$CMDT_GIVEN" ] || { [[ $T67_CMD_TIMEOUT =~ ^[1-9][0-9]{0,2}$ ]] && [ "$T67_CMD_TIMEOUT" -ge 5 ] && [ "$T67_CMD_TIMEOUT" -le 600 ]; } \
     || { echo "cmdtimeout=N: seconds per command, 5 to 600 (default 60): $T67_CMD_TIMEOUT"; exit 1; }
   ;;
-  *) [ -z "$T67_SET$SEED_GIVEN$LEVERS_GIVEN$CMDT_GIVEN" ] || { echo "set=NAME, seed=N, levers=LIST and cmdtimeout=N are for the train67 modes only, not $MODE"; exit 1; };; esac
+  *) [ -z "$T67_SET$SEED_GIVEN$LEVERS_GIVEN$CMDT_GIVEN$MALLOC_GIVEN" ] || { echo "set=NAME, seed=N, levers=LIST and cmdtimeout=N are for the train67 modes only, not $MODE"; exit 1; };; esac
 T67_CMD_TIMEOUT=${T67_CMD_TIMEOUT:-60}
 # seed=N (default 67: the run as before, byte for byte): the data order (rl/train67_data.py: epoch e is the permutation
 # of random.Random(N + e)) and miles' seeds (rl/rl_inner.sh: --seed 1 + 100 (N - 67), the actor's torch seed and the
@@ -75,7 +79,7 @@ T67_CMD_TIMEOUT=${T67_CMD_TIMEOUT:-60}
 T67_SEED=${T67_SEED:-67}
 JID=${FETCHED_JOB_ID:-$SLURM_JOB_ID}
 [ -n "$JID" ] || { echo "no job id"; exit 1; }
-REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-train67d
+REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-train67f
 MILES=/scratch/gpfs/GROUP/USER/project/miles-rollout
 SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif
 FLINT=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint
@@ -94,7 +98,7 @@ T67_TAG=${T67_SET:+_$T67_SET}
 [ "$MODE" = train67_test ] && OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/train67_test${T67_TAG}_p${T67_P}g${T67_G}
 RESUMABLE=; case "$MODE" in run20|train67|train67_test) RESUMABLE=1;; esac
 # tests/test_train67_seed.py: the parsed arguments and the run dir only, nothing made or started
-[ -z "${RL_JOB_PRINT_ONLY:-}" ] || { echo "MODE=$MODE P=$T67_P G=$T67_G STEPS=$T67_STEPS SET=$T67_SET SEED=$T67_SEED OUT=$OUT${T67_LEVERS:+ LEVERS=$T67_LEVERS}$([ "$T67_CMD_TIMEOUT" = 60 ] || echo " CMDTIMEOUT=$T67_CMD_TIMEOUT")"; exit 0; }
+[ -z "${RL_JOB_PRINT_ONLY:-}" ] || { echo "MODE=$MODE P=$T67_P G=$T67_G STEPS=$T67_STEPS SET=$T67_SET SEED=$T67_SEED OUT=$OUT${T67_LEVERS:+ LEVERS=$T67_LEVERS}${T67_MALLOC:+ MALLOC=$T67_MALLOC}$([ "$T67_CMD_TIMEOUT" = 60 ] || echo " CMDTIMEOUT=$T67_CMD_TIMEOUT")"; exit 0; }
 # the planned time stop: one step and a save must fit after it (run20: 43 min a step; train67 at B = 32: up to the
 # 60-min wall cap, ~4 x run20's 4-min train time, sync and save, ~85 min)
 STOP_S=4500; case "$MODE" in train67*) STOP_S=6300;; esac
@@ -206,7 +210,7 @@ start timeout -k 300 "$LIMIT" apptainer exec --pid --nv --contain --cleanenv --w
   --bind /scratch/gpfs/GROUP --bind "$TMPDIR/tmp":/tmp --bind "$TMPDIR/datasets":/root/datasets --bind /proc:/host/proc \
   --bind /dev/shm --env PYTHONNOUSERSITE=1 --env PYTHONDONTWRITEBYTECODE=1 --env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" \
   --env JID="$JID" --env OUT="$OUT" --env PKG="$PKG" --env TMPDIR="$TMPDIR" --env T67_P="$T67_P" --env T67_G="$T67_G" \
-  --env T67_STEPS="$T67_STEPS" --env T67_SEED="$T67_SEED" --env T67_LEVERS="$T67_LEVERS" --env T67_CMD_TIMEOUT="$T67_CMD_TIMEOUT" "$SIF" bash "$REPO/rl/rl_inner.sh" "$MODE"
+  --env T67_STEPS="$T67_STEPS" --env T67_SEED="$T67_SEED" --env T67_LEVERS="$T67_LEVERS" --env T67_CMD_TIMEOUT="$T67_CMD_TIMEOUT" --env T67_MALLOC="$T67_MALLOC" "$SIF" bash "$REPO/rl/rl_inner.sh" "$MODE"
 wait "${STARTED[0]}"
 rc=$?
 echo "[s5] $(date -u +%FT%TZ) container exit $rc"
