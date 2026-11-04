@@ -502,7 +502,9 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
     d = os.path.join(out, f"r{rollout_id}")
     os.makedirs(d, exist_ok=True)
     live = os.environ.get("MA_AG_TRACE_DIR")
-    if live and os.path.isdir(live):
+    # async: a resumed run's first drain may hold only restored groups, before any new episode has made the live
+    # directory, and their traces are in the stale ones (w971, rollout 19: no traces, so the sample check failed)
+    if live and (os.environ.get("MA_RL_ASYNC") or os.path.isdir(live)):
         if os.path.isdir(os.path.join(d, "traces")):   # this rollout ran before, in a segment that stopped
             os.rename(os.path.join(d, "traces"), os.path.join(d, f"traces.before_{int(os.path.getmtime(os.path.join(d, 'traces')))}"))
         if os.environ.get("MA_RL_ASYNC"):

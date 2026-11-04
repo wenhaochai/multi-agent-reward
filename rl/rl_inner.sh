@@ -8,7 +8,7 @@
 set -uo pipefail
 : "${JID:?}" "${OUT:?}" "${PKG:?}" "${TMPDIR:?}"
 MODE=$1
-REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic7
+REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic8
 FLINT=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint
 MILES=/scratch/gpfs/GROUP/USER/project/miles-numa2
 MEMPROBE_DATA=/scratch/gpfs/GROUP/USER/tmp/flint_s5/memprobe_data   # a recorded batch for the schedule check
@@ -326,7 +326,12 @@ train() {
   (
     until grep -q 'POST /v1/chat/completions' "$OUT/train_segment.log" 2>/dev/null; do kill -0 $tp 2>/dev/null || exit; sleep 15; done
     python3 -c "import sys; from flint.miles_agent import startup_probe as p; sys.exit(p('$OUT', '$OUT/train_segment.log', '$FLINT'))" \
-      > "$OUT/probe_start.log" 2>&1 || { echo "[s5] startup probe failed: $(tail -1 "$OUT/probe_start.log")"; kill $tp; }
+      > "$OUT/probe_start.log" 2>&1 || {
+        echo "[s5] startup probe failed: $(tail -1 "$OUT/probe_start.log")"
+        # if train.py is already going down, the probe failed because of it: let it print its own error (w971, 2026-11-03: this kill cut it off)
+        for _ in $(seq 24); do kill -0 $tp 2>/dev/null || exit; sleep 5; done
+        kill $tp
+      }
   ) &
   wait $tp
   local rc=$?

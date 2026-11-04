@@ -338,6 +338,20 @@ open(os.path.join(ck, "latest_checkpointed_iteration.txt"), "w").write("7")
 MA._keep_newest_checkpoints(ck, 2)
 check("retention: the newest 2 checkpoints stay, nothing else is touched",
       sorted(os.listdir(ck)) == ["iter_0000005", "iter_0000007", "latest_checkpointed_iteration.txt", "rollout"], os.listdir(ck))
+# async, a resumed run whose first drain holds only restored groups: no new episode has made the live directory yet, and the traces are in a stale one
+# (w971, rollout 19, 2026-11-03: log_rollout took no traces, so the sample check failed and the run stopped)
+live_dir = os.environ["MA_AG_TRACE_DIR"]
+check("async, resume: the live directory does not exist", not os.path.isdir(live_dir))
+stale_dir = os.path.join(out_dir, "traces_live.stale_9")
+os.makedirs(stale_dir)
+open(os.path.join(stale_dir, "agent_11.jsonl"), "w").write(json.dumps({"S": 0.5, "base_url": "http://e/sessions/a", "submissions": [{}], "agents": [{"restarts": 0, "turns": [{"cut": False, "dropped": 0, "prompt_tokens": 10}]}]}) + "\n")
+restored = [SimpleNamespace(tokens=s.tokens, reward=s.reward, metadata={**s.metadata, "flint_trace_pid": 11}) for s in smp[:2]]
+os.environ["MA_RL_ASYNC"] = "1"
+MA.log_rollout(6, args, restored, {}, 12.0)
+del os.environ["MA_RL_ASYNC"]
+last = json.loads(open(os.path.join(out_dir, "steps.jsonl")).readlines()[-1])
+check("async, resume: the restored group's traces are taken from the stale directory", os.listdir(os.path.join(out_dir, "r6", "traces")) == ["agent_11.jsonl"] and os.listdir(stale_dir) == [] and len(last["trace_episodes"]) == 1, last.get("trace_episodes"))
+check("async, resume: no live directory appears", not os.path.isdir(live_dir))
 import pickle  # noqa: E402
 subprocess.run = lambda cmd, **kw: SimpleNamespace(returncode=1, stdout="INSPECT_FAIL {}\n", stderr="")
 try:
