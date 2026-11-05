@@ -104,7 +104,7 @@ T67_CMD_TIMEOUT=${T67_CMD_TIMEOUT:-60}
 T67_SEED=${T67_SEED:-67}
 JID=${FETCHED_JOB_ID:-$SLURM_JOB_ID}
 [ -n "$JID" ] || { echo "no job id"; exit 1; }
-REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic9
+REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic10
 MILES=/scratch/gpfs/GROUP/USER/project/miles-numa3
 # this script is a snapshot in wq, the others are read live: all must name this worktree and this miles, or the run imports another worktree's code (found by the audit of elastic-v7, 2026-11-03)
 grep -qx "REPO=$REPO" "$REPO/rl/rl_inner.sh" && grep -qx "MILES=$MILES" "$REPO/rl/rl_inner.sh" && grep -q "^HERE=$REPO " "$REPO/rl/elastic_engine.sh" \
