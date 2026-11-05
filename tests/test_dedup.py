@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 from helpers import CLOCK, FIN, LABEL, MSG, ROOT, block, check, done, env, inp, scripted, sessions, traces
 
@@ -179,6 +180,71 @@ a, S, info, tr = run([A, "submit", "submit"])
 check("an infra-failed submission is judged again (3 tries each), not a duplicate", len(judged) == 6 and a.dup_submits == 0
       and len(tr["submissions"]) == 2, (len(judged), a.dup_submits))
 RESULT = None
+# (2b) comments and layout (code_key, owner popup 2026-11-05): w1090's loop appended "// finalN" or a blank line
+LOOP = [A, "submit", "echo '// final1' >> solution.cpp", "submit", "printf '\\n\\n' >> solution.cpp", "submit",
+        "sed -i 's/return 0;/return  0;  \\/* x *\\//' solution.cpp", "submit", B, "submit"]
+a, S, info, tr = run(LOOP)
+n_on = len(judged)
+a0, S0, info0, tr0 = run(LOOP, dedup=False)
+lay = ("submit: solution.cpp is unchanged apart from comments and whitespace since your submission #1 (provisional "
+       "40.00), so it was not judged again and no new submission was recorded. Change solution.cpp before you submit it "
+       "again.\n")
+check("a comment, blank lines, spaces and a block comment: duplicates of #1; B is judged as #2",
+      n_on == 2 and a.outs[3] == lay and a.outs[5] == lay and a.outs[7] == lay and a.dup_submits == 3
+      and a.outs[9].startswith("Submission #2 by agent1"), (n_on, a.outs[3], a.outs[7], a.outs[9][:60]))
+check("comments and layout: S and the best provisional equal those of the run that judges every submit (5 judged)",
+      S == S0 and info["fo_lg_best_prov"] == info0["fo_lg_best_prov"] and len(tr0["submissions"]) == 5, (S, S0))
+# the audit's S1: the finish command right after a layout duplicate finds solution.cpp unchanged and restarts
+a, S, info, tr = run([A, "submit", "echo '// c1' >> solution.cpp", "submit", FIN])
+check("a layout duplicate, then the finish command: unchanged since #1, a restart, 1 judged (the end's auto-judge skips "
+      "the layout variant too)", len(tr["submissions"]) == 1 and len(judged) == 1 and info["fo_lg_auto_judged"] == 0.0
+      and a.restarts == 1 and a.outs[4].startswith("solution.cpp is unchanged since your submission #1 (provisional 40.00)"),
+      (len(tr["submissions"]), len(judged), info.get("fo_lg_auto_judged"), a.restarts, a.outs[4][:90]))
+# the audit's S2: an exact resubmit gets the old reply even when a layout variant was judged later (by the finish command)
+a, S, info, tr = run([A, "submit", "echo '// c1' >> solution.cpp", FIN, "sed -i '$d' solution.cpp", "submit", FIN])
+check("A, a layout variant judged by the finish command, A again: the exact reply names #1, then a restart",
+      a.outs[5].startswith("submit: solution.cpp is unchanged since your submission #1 (provisional 40.00)")
+      and a.restarts == 1 and len(judged) == 2, (a.outs[5][:90], a.restarts, len(judged)))
+K = G.code_key
+for x, y, same, why in (
+        ("int main(){}", "int main(){} // final9\n\n", True, "a line comment and blank lines at the end"),
+        ("int a;\nint b;", "  int a;   \n\n\tint b;  ", True, "indentation, blank lines, trailing spaces"),
+        ("int a;\r\nint b;\r\n", "int a;\nint b;\n", True, "CRLF line ends"),
+        ("int a; int b;", "int a; /* note */ int b;", True, "a block comment between statements"),
+        ("int main(){return 0;}", "int main() { return 0; /* x */ }", True, "spaces and a comment between brackets"),
+        ("return x+1;", "return x + 1;", True, "spaces around an operator"),
+        ('puts("a  b");', 'puts("a b");', False, "spaces inside a string"),
+        ('puts("//x");', 'puts("//y");', False, "a // inside a string"),
+        ("char c = '/'; int d; // x", "char c = '/'; int d;", True, "a character literal before a comment"),
+        ("char c = '\"'; // x", "char c = '\"';", True, "a quote inside a character literal"),
+        ('auto s = R"(// a)";', 'auto s = R"(// b)";', False, "a // inside a raw string"),
+        ("#define A 1\nint b;", "#define A 1 int b;", False, "a line break that ends a preprocessor line"),
+        ("#define F(x) x", "#define F (x) x", False, "a space after a macro's name"),
+        ("%:define F(x) x", "%:define F (x) x", False, "a space after a macro's name, digraph directive"),
+        ("x = y - -z;", "x = y --z;", False, "a space between two operators"),
+        ("int a;", "inta;", False, "a space between two words"),
+        ("// note \\\nx = 1;", "// note\nx = 1;", False, "a line comment that a backslash continues"),
+        ('puts("a  \\\nb");', 'puts("a \\\nb");', False, "a line splice inside a string"),
+        ("int n = 1'000; printf(\"it's  %d\", n);", "int n = 1'000; printf(\"it's %d\", n);", False, "a digit separator"),
+        ("int x = 0xe - 1;", "int x = 0xe-1;", False, "a space in an exponent's place"),
+        ("double d = 1e-5;", "double d = 1e -5;", False, "a space after an exponent's e"),
+        ("switch(n){case 1 ... 5: break;}", "switch(n){case 1...5: break;}", False, "a space next to a dot"),
+        ('auto s = u8"x";', 'auto s = u8 "x";', False, "a space after a literal's prefix"),
+        ("int x=0; // c\rx=1;", "int x=0; // c\nx=1;", False, "a lone CR"),
+        ("double d = 1e-5;", "double d = 1e- 5;", False, "a space after an exponent's sign"),
+        ("double d = 1.e5;", "double d = 1. e5;", False, "a space after a number's dot"),
+        ("int $x = 1;", "int$x = 1;", False, "a space before a GNU $ identifier"),
+        ("return 0;", "return 1;", False, "a real change")):
+    check(f"code_key: {why}: {'one key' if same else 'two keys'}", (K(x) == K(y)) == same, (K(x), K(y)))
+odd = ["int main(){}\0\0\x7fELF\0\0" + "\0" * 40, "a\0" + "1" * 5000 + "\0b", "\0" + "0\0"]
+check("code_key: texts with NUL (an ELF binary in solution.cpp) are their own keys",
+      all(K(t) == "\0" + t for t in odd) and K('puts("a"\0' + '0\0);') != K('puts("a""a");'))
+check("flint/game.py is ASCII (no raw characters that diff tools hide or splitlines() breaks at)",
+      all(ord(c) < 128 for c in open(G.__file__, encoding="utf-8").read()))
+t_open = time.time()
+K("/* x " * 50000), K('R"( x ' * 40000), K('"x' * 40000)
+check("code_key: a comment or raw string that is never closed takes under 2 s", time.time() - t_open < 2,
+      time.time() - t_open)
 
 # (3) a checkpoint in the middle: the real Agent with a fake session (replies keyed on the agent's turn count)
 SCRIPT = [A, "submit", "submit", "true", "submit", B, "submit", "submit", "true"]

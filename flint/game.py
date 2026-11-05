@@ -34,7 +34,9 @@ by the problem and the episode). N = 1 is the lone-agent control.
                   between trims) and its instance message says how many; the agents are told to keep what matters in
                   files (notes, SCORES.md, BOARD.md).
   dedup           (MA_LG_DEDUP_SUBMIT=1; off by default) a `submit` of a file whose text equals one of the agent's own
-                  earlier submissions that the judge finished (not an infra failure) is not judged and not recorded:
+                  earlier submissions that the judge finished (not an infra failure), apart from comments and layout
+                  (code_key; owner popup 2026-11-05, after w1090's agents resubmitted one solution up to 1,037 times
+                  with a new "// finalN" line or blank line each time), is not judged and not recorded:
                   the reply names that submission and its provisional score and asks for a change first, so S, the
                   best provisional and every score stay as they would be. The finish command keeps its own rule (an
                   unchanged solution.cpp starts the conversation over). The trace counts them per agent
@@ -55,6 +57,7 @@ there, like at its token budget, so one slow episode cannot keep the other engin
 from __future__ import annotations
 
 import asyncio
+import functools
 import glob
 import hashlib
 import json
@@ -154,6 +157,69 @@ def harness_tag() -> str:
 
 def sha1(code: str) -> str:
     return hashlib.sha1(code.encode()).hexdigest()[:12]
+
+
+_LIT_OR_COMMENT = re.compile("|".join((
+    r'R"([^()\\\s"]{0,16})\([\s\S]*?(?:\)\1"|\Z)',   # a raw string (one that is not closed runs to the end, as in g++)
+    r'"(?:\\.|[^"\\\n])*"',                           # a string
+    r"'(?:\\.|[^'\\\n])*'",                           # a character literal
+    r"//[^\n]*",                                      # a line comment
+    r"/\*[\s\S]*?(?:\*/|\Z)")))                       # a block comment (one that is not closed runs to the end)
+# what code_key does not read, so such a text is compared as it is: NUL (the key's own placeholder), whitespace that
+# str.strip and g++ read apart, a lone CR (g++ ends a line there), a line splice (a backslash at a line's end), a digit
+# separator (the ' of 1'000 opens no character literal)
+_RAW_TEXT = re.compile(r"[\x00\x1c-\x1f\x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]|\r(?!\n)"
+                       r"|\\[ \t\f\v]*\r?\n|\d'\w")
+_OPS = set("+-*/%<>=!&|^~.:?#")
+
+
+def _word(c: str) -> bool:
+    return c.isalnum() or c in "_$\\\0"   # $ and the backslash of a universal character name; \0: a literal's
+    # placeholder (u8 "x" is not u8"x")
+
+
+def _space(m) -> str:
+    """A space stays where taking it out could change the tokens: between two word characters or two operator
+    characters (a b, x - -y), in an exponent's place (0xe - 1, 1e -5, 1e- 5) and next to a dot (case 1 ... 5:, x .5,
+    1. e5)."""
+    a, b = m.group(1), m.group(2)
+    s, i = m.string, m.start()   # s[i] is the space, s[i - 1] is a
+    keep = ((_word(a) and _word(b)) or (a in _OPS and b in _OPS) or (a in "eEpP" and b in "+-")
+            or (_word(a) and b == ".") or (a == "." and b.isdigit())
+            or (a in "+-" and i >= 3 and s[i - 2] in "eEpP" and (s[i - 3].isdigit() or s[i - 3] == "."))
+            or (a == "." and b.isalpha() and i >= 2 and s[i - 2].isdigit()))
+    return " " if keep else ""
+
+
+@functools.lru_cache(maxsize=4096)
+def code_key(code: str) -> str:
+    """What the dedup compares: the code without its comments (a block comment counts as a space, as in C++), with no
+    blank lines and each line's whitespace collapsed to single spaces; outside preprocessor lines a space also goes
+    where it separates nothing (_space). String and character literals stay as written, and so does every remaining
+    line break, so a preprocessor line keeps its end, and a preprocessor line keeps its spaces (#define F(x) is not
+    #define F (x)). A text with what the key does not read (_RAW_TEXT) is its own key. Two texts with one key differ
+    only in comments or layout (the audit of 2026-11-05 compiled its pairs with g++). Cached, since a long episode
+    compares each submit with all its earlier ones."""
+    if _RAW_TEXT.search(code):
+        return "\0" + code
+    lits = []
+
+    def keep(m):
+        t = m.group(0)
+        if t.startswith("//"):
+            return ""
+        if t.startswith("/*"):
+            return " "
+        lits.append(t)
+        return f"\0{len(lits) - 1}\0"
+    lines = []
+    for line in _LIT_OR_COMMENT.sub(keep, code).split("\n"):
+        line = re.sub(r"[ \t\r\f\v]+", " ", line).strip(" ")
+        if line and not line.startswith(("#", "%:")):
+            line = re.sub(r"(?<=(.)) (?=(.))", _space, line)
+        if line:
+            lines.append(line)
+    return re.sub(r"\0(\d+)\0", lambda m: lits[int(m.group(1))], "\n".join(lines))
 
 
 def trace(rec: dict) -> None:
@@ -524,20 +590,25 @@ async def episode(input, messages: list, label: str, new_session, ckpt: Checkpoi
 
     def dup_submit(a, path: str):
         """MA_LG_DEDUP_SUBMIT: the reply to a submit of a file whose text equals one of a's own submissions the judge
-        finished (the latest such), or None (judge it). The text is what the judge would get, so its result would be
-        that submission's again; the state is subs, which the checkpoint keeps. a.last_sha moves as a judged submit
-        of solution.cpp would move it, so the finish command then acts as in the game that judges the duplicate."""
+        finished (the latest such), or else equals one apart from comments and layout (code_key), or None (judge it).
+        Such a text is that submission's program, so its result would be that submission's again; the state is subs,
+        which the checkpoint keeps. a.last_sha moves to this text, as a judged submit of solution.cpp would move it, so
+        the finish command then acts as in the game that judges the duplicate (on this very text: a restart)."""
         got = read_code(path, a.dir)
         if got is None or got[1] is None:
             return None
-        k, x = next(((i, x) for i, x in reversed(list(enumerate(subs, 1))) if x["agent"] == a.name and not x["infra"]
-                     and x["code"] == got[1]), (0, None))
+        mine = [(i, x) for i, x in reversed(list(enumerate(subs, 1))) if x["agent"] == a.name and not x["infra"]]
+        how = "unchanged"
+        k, x = next(((i, x) for i, x in mine if x["code"] == got[1]), (0, None))
+        if x is None:
+            how, key = "unchanged apart from comments and whitespace", code_key(got[1])
+            k, x = next(((i, x) for i, x in mine if code_key(x["code"]) == key), (0, None))
         if x is None:
             return None
         a.dup_submits += 1
         if got[0] == os.path.realpath(os.path.join(a.dir, "solution.cpp")):
-            a.last_sha = x["sha"]
-        return {"output": f"submit: {path} is unchanged since your submission #{k} (provisional {100 * x['prov']:.2f}), "
+            a.last_sha = sha1(got[1])
+        return {"output": f"submit: {path} is {how} since your submission #{k} (provisional {100 * x['prov']:.2f}), "
                           f"so it was not judged again and no new submission was recorded. Change {path} before you "
                           "submit it again.\n", "returncode": 1, "exception_info": ""}
 
@@ -551,7 +622,13 @@ async def episode(input, messages: list, label: str, new_session, ckpt: Checkpoi
         if got[1] is not None and sha1(got[1]) == a.last_sha:
             a.idle_fin += 1
             k, x = next(((i, x) for i, x in reversed(list(enumerate(subs, 1))) if x["agent"] == a.name
-                         and x["sha"] == a.last_sha), (len(subs), {"prov": 0.0}))
+                         and x["sha"] == a.last_sha), (None, None))
+            if x is None and DEDUP_SUBMIT:   # a.last_sha is a layout variant's, from dup_submit
+                key = code_key(got[1])
+                k, x = next(((i, x) for i, x in reversed(list(enumerate(subs, 1))) if x["agent"] == a.name
+                             and not x["infra"] and code_key(x["code"]) == key), (None, None))
+            if x is None:
+                k, x = len(subs), {"prov": 0.0}
             return {"output": f"solution.cpp is unchanged since your submission #{k} (provisional {100 * x['prov']:.2f});"
                               " nothing was submitted. " + P.KEEP_GOING.format(left=max(0, TOKENS - a.generated),
                                                                                total=TOKENS) + "\n",
@@ -749,7 +826,10 @@ async def episode(input, messages: list, label: str, new_session, ckpt: Checkpoi
         auto_sub = []
         for a in agents if TEAM else agents[:1]:   # a team: each agent's solution.cpp; alone: the one repository
             got = read_code("solution.cpp", a.dir)
-            if got is not None and got[1] and got[1].strip() and sha1(got[1]) not in {x["sha"] for x in subs + auto_sub}:
+            # with MA_LG_DEDUP_SUBMIT a layout variant of a judged submission is that program: not judged again either
+            if got is not None and got[1] and got[1].strip() and sha1(got[1]) not in {x["sha"] for x in subs + auto_sub} \
+                    and not (DEDUP_SUBMIT and code_key(got[1]) in {code_key(x["code"]) for x in subs + auto_sub
+                                                                    if not x["infra"]}):
                 res, tries, judge_s = await judge(got[1])
                 auto_sub.append({**({"owner": a.name} if TEAM else {}), "agent": "auto", "round": rounds,
                                  "file": "solution.cpp", "status": res["status"],
