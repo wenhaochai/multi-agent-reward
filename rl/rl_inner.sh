@@ -8,7 +8,7 @@
 set -uo pipefail
 : "${JID:?}" "${OUT:?}" "${PKG:?}" "${TMPDIR:?}"
 MODE=$1
-REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-train67h
+REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-train67i
 FLINT=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint
 MILES=/scratch/gpfs/GROUP/USER/project/miles-rollout2
 MEMPROBE_DATA=/scratch/gpfs/GROUP/USER/tmp/flint_s5/memprobe_data   # a recorded batch for the schedule check
