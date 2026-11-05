@@ -185,6 +185,18 @@ rolls({"S": S32, "dropped_episodes": 8, "failed": 1})
 check("rules B=32: 1 group of 8 out of the loss (25%) goes on", MA._stop_rule(rd, 0) is None)
 rolls({"S": S32, "dropped_episodes": 16, "failed": 2})
 check("rules B=32: 2 groups out of the loss stop", "out of the loss" in (MA._stop_rule(rd, 0) or ""))
+S16 = [0.3] * 16
+one, ok = {"S": S16, "dropped_episodes": 8, "dropped_groups": 1, "failed": 2}, {"S": S16, "dropped_episodes": 0, "dropped_groups": 0}
+rolls(ok, one)
+check("rules P=2: 1 group of 2 out once goes on", MA._stop_rule(rd, 1) is None)
+rolls(one)
+check("rules P=2: 1 group of 2 out in the first rollout goes on", MA._stop_rule(rd, 0) is None)
+rolls(one, ok, one)
+check("rules P=2: out, in, out goes on", MA._stop_rule(rd, 2) is None)
+rolls(one, one)
+check("rules P=2: 1 group of 2 out in 2 rollouts in a row stops", "out of the loss" in (MA._stop_rule(rd, 1) or ""))
+rolls(ok, {"S": S16, "dropped_episodes": 16, "dropped_groups": 2, "failed": 2})
+check("rules P=2: both groups out stops at once", "out of the loss" in (MA._stop_rule(rd, 1) or ""))
 rolls({"S": [0.0] * 32}, {"S": [0.0] * 32}, {"S": [0.0] * 32})
 check("rules B=32: every episode at 0 in 3 rollouts stops", "S = 0" in (MA._stop_rule(rd, 2) or ""))
 del os.environ["MA_RL_WALL_STOP_FRAC"], os.environ["MA_RL_MAX_DROPPED_FRAC"]
@@ -268,12 +280,11 @@ check("log: the check runs in this process on the samples; rollout 0 dumped per 
 os.makedirs(os.environ["MA_AG_TRACE_DIR"])
 MA.log_rollout(1, args, batch(1, fail=True), {}, 30.0)
 rec = json.loads(open(os.path.join(out_dir, "steps.jsonl")).readlines()[-1])
-check("log: a failed episode takes its group out of the loss, the run goes on (1 of 2 groups = 50% > 25%: stop requested)",
+check("log: a failed episode takes its group out of the loss, the run goes on (1 of 2 groups once: no stop)",
       rec["dropped_groups"] == 1 and rec["dropped_episodes"] == 4 and rec["failed"] == 1
-      and "out of the loss" in rec["inspect"] and "out of the loss" in open(os.path.join(out_dir, "stop_request")).read(), rec)
+      and "out of the loss" in rec["inspect"] and not os.path.exists(os.path.join(out_dir, "stop_request")), rec)
 check("log: rollout 1 not dumped (every 5th)", "dumped" not in rec and dumps == [os.path.join(out_dir, "r0")]
       and rec["planned"] == ["9", "23"])
-os.remove(os.path.join(out_dir, "stop_request"))
 problems_next[0] = {"top-k errors": 3}
 os.makedirs(os.environ["MA_AG_TRACE_DIR"])
 try:

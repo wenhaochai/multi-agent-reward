@@ -161,8 +161,10 @@ def _stop_rule(out: str, rollout_id: int) -> str | None:
     wall cap (MA_LG_WALL_MIN) binding often in each of the last 2 rollouts (it would teach the policy not to submit):
     run20 (coordinator 2026-10-29), 8 episodes per rollout: more than 1 episode; with MA_RL_WALL_STOP_FRAC (train67):
     more than that fraction of the rollout's episodes. With MA_RL_MAX_DROPPED_FRAC (train67) also: more than that
-    fraction of the rollout's episodes out of the loss (failed episodes take their whole group out). Returns the
-    reason, or None."""
+    fraction of the rollout's episodes out of the loss (failed or over-cap episodes take their whole group out), when
+    more than one group is out or the rollout before was over too: at P=2 one group is 50%, and a stop then costs a
+    restart and a place in the queue for half a step's data (w1090 at rollout 29, w885 at 24). Returns the reason, or
+    None."""
     steps = _train_steps(os.path.join(out, "train.log"))
     if steps:
         last = steps[max(steps)]
@@ -189,7 +191,9 @@ def _stop_rule(out: str, rollout_id: int) -> str | None:
         return f"every episode at S = 0 in rollouts {rollout_id - 2}-{rollout_id}"
     drop = os.environ.get("MA_RL_MAX_DROPPED_FRAC")
     r = rollouts.get(rollout_id)
-    if drop and r is not None and r.get("dropped_episodes", 0) > float(drop) * max(len(r["S"]), 1):
+    def over(x):
+        return x is not None and x.get("dropped_episodes", 0) > float(drop) * max(len(x["S"]), 1)
+    if drop and over(r) and (r.get("dropped_groups", 2) > 1 or over(rollouts.get(rollout_id - 1))):
         return (f"rollout {rollout_id}: {r['dropped_episodes']} of {len(r['S'])} episodes out of the loss (failed "
                 f"{r.get('failed')}), more than {float(drop):.0%}")
     return None
