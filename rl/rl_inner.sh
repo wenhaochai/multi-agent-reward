@@ -8,9 +8,9 @@
 set -uo pipefail
 : "${JID:?}" "${OUT:?}" "${PKG:?}" "${TMPDIR:?}"
 MODE=$1
-REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic8
+REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic9
 FLINT=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint
-MILES=/scratch/gpfs/GROUP/USER/project/miles-numa2
+MILES=/scratch/gpfs/GROUP/USER/project/miles-numa3
 MEMPROBE_DATA=/scratch/gpfs/GROUP/USER/tmp/flint_s5/memprobe_data   # a recorded batch for the schedule check
 export HOME=$TMPDIR/home TRITON_CACHE_DIR=$TMPDIR/triton TORCHINDUCTOR_CACHE_DIR=$TMPDIR/inductor
 export SGLANG_CACHE_DIR=$TMPDIR/sglang FLASHINFER_WORKSPACE_BASE=$TMPDIR/flashinfer
