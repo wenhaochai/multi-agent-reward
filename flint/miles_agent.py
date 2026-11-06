@@ -73,8 +73,7 @@ async def run(base_url: str, prompt, request_kwargs: dict, metadata: dict, **kwa
     settings = None
     if os.environ.get("MA_RL_OUT"):   # the RL job's settings (rl/rl_inner.sh) must be the game's in this process
         out_dir = os.environ["MA_RL_OUT"]
-        got = {"MA_LG_N": G.N, "MA_LG_TOKENS": G.TOKENS, "MA_LG_CTX_CHARS": G.CTX_CHARS, "MA_AG_TURN": G.TURN,
-               "MA_LG_WALL_MIN": G.WALL_MIN, **({"MA_LG_DEDUP_SUBMIT": 1} if G.DEDUP_SUBMIT else {})}
+        got = _game_settings(G)
         os.makedirs(os.path.join(out_dir, "settings_seen"), exist_ok=True)
         json.dump(got, open(os.path.join(out_dir, "settings_seen", f"{os.getpid()}.json"), "w"))   # startup_probe reads it
         expected = {k: float(v) for k, v in json.load(open(os.path.join(out_dir, "game_settings.json"))).items()}
@@ -310,6 +309,15 @@ def drop_failed_groups(args, data) -> None:
         split_dup_end_turns(data)
 
 
+def _game_settings(G) -> dict:
+    """This process's game settings, keyed as rl/rl_inner.sh records them in game_settings.json (each episode and
+    startup_probe compare the two). MA_LG_DUP_END appears only when set, as rl_inner.sh writes it only with dupend=N
+    (audit 2026-11-06: without it here every episode of a dupend run failed its settings check)."""
+    return {"MA_LG_N": G.N, "MA_LG_TOKENS": G.TOKENS, "MA_LG_CTX_CHARS": G.CTX_CHARS, "MA_AG_TURN": G.TURN,
+            "MA_LG_WALL_MIN": G.WALL_MIN, **({"MA_LG_DEDUP_SUBMIT": 1} if G.DEDUP_SUBMIT else {}),
+            **({"MA_LG_DUP_END": G.DUP_END} if G.DUP_END else {})}
+
+
 def _last_trained_run(mask) -> tuple[int, int] | None:
     """(start, end) of the last run of 1s in a loss mask, end exclusive; None when it holds none."""
     j = len(mask) - 1
@@ -347,6 +355,11 @@ def split_dup_end_turns(data) -> int:
             if run is None:
                 continue
             a, b = run
+            # miles sets rollout_id only on an episode of two or more samples (agentic_tool_call.py), so a one-leaf
+            # episode has none; its two samples now need one, the same, as miles would give them (audit 2026-11-06)
+            rid = last.rollout_id if getattr(last, "rollout_id", None) is not None else last.index
+            for s in samples:
+                s.rollout_id = rid
             turn = copy.copy(last)
             turn.loss_mask = [1 if a <= k < b else 0 for k in range(len(last.loss_mask))]
             turn.metadata = {**(last.metadata or {}), "dup_end_turn": True}
@@ -358,6 +371,9 @@ def split_dup_end_turns(data) -> int:
             else:
                 raise TypeError("split_dup_end_turns: a group that is a single sample")
             n += 1
+    if n:
+        print(f"[flint] split_dup_end_turns: {n} episode(s) ended at a run of duplicate submits; "
+              "their last turn is a sample of its own with reward 0", flush=True)
     return n
 
 
@@ -370,6 +386,8 @@ def reward_post_process(args, samples):
 
     if not (args.advantage_estimator in ("grpo", "gspo", "reinforce_plus_plus_baseline") and args.rewards_normalization):
         raise ValueError("flint.miles_agent.reward_post_process expects miles' GRPO normalization (rewards_normalization)")
+    if getattr(args, "grpo_std_normalization", False):   # (S - mean) / std - S would not be (0 - mean) / std
+        raise ValueError("flint.miles_agent.reward_post_process expects --disable-grpo-std-normalization")
     raw = [s.get_reward_value(args) for s in samples]
     norm = _normalize_rewards_by_rollout(args, samples, raw, None)
     for i, s in enumerate(samples):
@@ -700,7 +718,11 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
     rec |= {"trace_episodes": eps, "cut_turns": sum(e["cut_turns"] for e in eps),
             "turn_cap_hits": sum(e["turn_cap_hits"] for e in eps), "turns": sum(e["turns"] for e in eps),
             "wall_exceeded": sum(e["exit"] == "WallExceeded" for e in eps),
-            "wall_exceeded_S": [e["S"] for e in eps if e["exit"] == "WallExceeded"]}
+            "wall_exceeded_S": [e["S"] for e in eps if e["exit"] == "WallExceeded"],
+            # MA_LG_DUP_END: episodes whose game ended at a run of duplicate submits (their last turn gets reward 0)
+            **({"dup_end": sum(e["exit"] == "DupLoop" for e in eps),
+                "dup_end_S": [e["S"] for e in eps if e["exit"] == "DupLoop"]}
+               if int(os.environ.get("MA_LG_DUP_END") or "0") else {})}
 
     # the job's memory now and its peak so far (rl/rl_job.sh samples its cgroup every 10 s into host_mem.txt: time,
     # node used MiB, cgroup MiB and, since 2026-11-01, the cgroup's non-reclaimable MiB, the part its guard reads)

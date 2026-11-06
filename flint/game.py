@@ -624,7 +624,7 @@ async def episode(input, messages: list, label: str, new_session, ckpt: Checkpoi
         out = (f"submit: {path} is {how} since your submission #{k} (provisional {100 * x['prov']:.2f}), so it was not "
                f"judged again and no new submission was recorded. Change {path} before you submit it again.\n")
         if DUP_END and a.dup_run >= DUP_END:   # the main loop ends this agent's game after this turn
-            out += (f"This is your {a.dup_run}th unchanged submission in a row, so your game ends now and this "
+            out += (f"That makes {a.dup_run} unchanged submissions in a row, so your game ends now and this "
                     "submission scores 0.\n")
         return {"output": out, "returncode": 1, "exception_info": ""}
 

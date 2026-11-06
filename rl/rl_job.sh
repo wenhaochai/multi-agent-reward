@@ -136,7 +136,7 @@ T67_TAG=${T67_SET:+_$T67_SET}
 [ "$MODE" = train67_test ] && OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/train67_test${T67_TAG}_p${T67_P}g${T67_G}
 RESUMABLE=; case "$MODE" in run20|train67|train67_test) RESUMABLE=1;; esac
 # tests/test_train67_seed.py: the parsed arguments and the run dir only, nothing made or started
-[ -z "${RL_JOB_PRINT_ONLY:-}" ] || { echo "MODE=$MODE P=$T67_P G=$T67_G STEPS=$T67_STEPS SET=$T67_SET SEED=$T67_SEED OUT=$OUT${T67_LEVERS:+ LEVERS=$T67_LEVERS}${T67_MALLOC:+ MALLOC=$T67_MALLOC}${T67_ORDER:+ ORDER=$T67_ORDER}$([ "$T67_CMD_TIMEOUT" = 60 ] || echo " CMDTIMEOUT=$T67_CMD_TIMEOUT")${T67_PLACE:+ PLACE=$T67_PLACE}${T67_NOSAVE:+ NOSAVE=1}${T67_INFLIGHT:+ INFLIGHT=$T67_INFLIGHT}${T67_ELASTIC:+ ELASTIC=1}${T67_ASYNC:+ ASYNC=1}${T67_STALE:+ STALE=$T67_STALE}"; exit 0; }
+[ -z "${RL_JOB_PRINT_ONLY:-}" ] || { echo "MODE=$MODE P=$T67_P G=$T67_G STEPS=$T67_STEPS SET=$T67_SET SEED=$T67_SEED OUT=$OUT${T67_DUP_END:+ DUPEND=$T67_DUP_END}${T67_LEVERS:+ LEVERS=$T67_LEVERS}${T67_MALLOC:+ MALLOC=$T67_MALLOC}${T67_ORDER:+ ORDER=$T67_ORDER}$([ "$T67_CMD_TIMEOUT" = 60 ] || echo " CMDTIMEOUT=$T67_CMD_TIMEOUT")${T67_PLACE:+ PLACE=$T67_PLACE}${T67_NOSAVE:+ NOSAVE=1}${T67_INFLIGHT:+ INFLIGHT=$T67_INFLIGHT}${T67_ELASTIC:+ ELASTIC=1}${T67_ASYNC:+ ASYNC=1}${T67_STALE:+ STALE=$T67_STALE}"; exit 0; }
 # the planned time stop: one step and a save must fit after it (run20: 43 min a step; train67 at B = 32: up to the
 # 60-min wall cap, ~4 x run20's 4-min train time, sync and save, ~85 min)
 STOP_S=4500; case "$MODE" in train67*) STOP_S=6300;; esac

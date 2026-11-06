@@ -94,10 +94,10 @@ check("K=0 (off): the same script runs to its end, B judged, no DupLoop, no dup-
 # (3) the instance message
 spec = importlib.util.spec_from_loader("old_prompts", loader=None)
 old = importlib.util.module_from_spec(spec)
-src = subprocess.run(["git", "-C", ROOT, "show", "HEAD:flint/prompts.py"], capture_output=True, text=True).stdout
+src = subprocess.run(["git", "-C", ROOT, "show", "fd4474e:flint/prompts.py"], capture_output=True, text=True).stdout   # the parent
 exec(compile(src, "old_prompts.py", "exec"), old.__dict__)
 for n in (1, 4):
-    check(f"n={n}, K=0: the instance message is HEAD's byte for byte",
+    check(f"n={n}, K=0: the instance message is fd4474e's byte for byte",
           P.instance("PROBLEM", "agent1", n, 128000, 60) == old.instance("PROBLEM", "agent1", n, 128000, 60))
     m = P.instance("PROBLEM", "agent1", n, 128000, 60, dup_end=50)
     check(f"n={n}, K=50: the message states the rule once, after the submit command",
@@ -146,4 +146,44 @@ else:
     want = [0.2, 0.2, -0.4, -0.2, 0.2, -0.2]   # group 0 mean over episodes 0.4: the turn gets 0 - 0.4
     check("reward_post_process: the turn 0 - mean, the rest S - mean (the mean over episodes, not samples)",
           all(abs(x - y) < 1e-6 for x, y in zip(norm, want)) and raw == [0.6, 0.6, 0.6, 0.2, 0.5, 0.1], (raw, norm))
+
+# (5) the settings check of a dupend run (audit 2026-11-06, blocker 1): what each episode reports equals what
+# rl/rl_inner.sh records (its keys, from the environment, as floats)
+want_keys = ("MA_LG_N", "MA_LG_TOKENS", "MA_LG_CTX_CHARS", "MA_AG_TURN", "MA_LG_WALL_MIN", "MA_LG_DEDUP_SUBMIT", "MA_LG_DUP_END")
+recorded = {k: float(os.environ[k]) for k in want_keys if k in os.environ}
+G.DUP_END = 3
+got = MA._game_settings(G)
+check("settings: a dupend run's episode reports what rl_inner.sh records", got.get("MA_LG_DUP_END") == 3
+      and {k: float(v) for k, v in got.items()}.items() >= {k: v for k, v in recorded.items() if k in got}.items()
+      and "MA_LG_DUP_END" in recorded, (got, recorded))
+G.DUP_END = 0
+check("settings: with the rule off the key is absent, as before", "MA_LG_DUP_END" not in MA._game_settings(G))
+G.DUP_END = 3
+
+# (6) a one-leaf episode with real miles Samples (audit 2026-11-06, blocker 2): miles sets rollout_id only on episodes of
+# two or more samples; after the split both samples share one, and miles' compact-rollout check passes
+if Sample is not None:
+    from miles.ray.rollout.rollout_data_conversion import validate_compact_rollout_ids
+
+    def leaf(index, rid, node, mask, dup):
+        s = Sample(index=index, group_index=5, reward=0.5)
+        s.rollout_id = rid
+        s.loss_mask = list(mask)
+        s.metadata = {"fo_lg_dup_end": dup, "leaf": {"node_id": node}}
+        return s
+
+    one = [leaf(11, None, 0, [0, 1, 1, 1], 1.0)]            # one leaf, so miles left rollout_id unset
+    two = [leaf(12, 12, 3, [1, 1, 0], 0.0), leaf(12, 12, 5, [1, 0, 1], 0.0)]
+    data = [[one, two]]
+    validate_compact_rollout_ids(data)
+    n = MA.split_dup_end_turns(data)
+    err = None
+    try:
+        validate_compact_rollout_ids(data)
+    except AssertionError as e:
+        err = str(e)
+    check("one-leaf episode: split, both samples carry rollout_id = index, miles' compact check passes",
+          n == 1 and len(one) == 2 and [s.rollout_id for s in one] == [11, 11] and err is None
+          and one[0].loss_mask == [0, 0, 0, 0] and one[1].loss_mask == [0, 1, 1, 1]
+          and [s.rollout_id for s in two] == [12, 12] and len(two) == 2, (n, [s.rollout_id for s in one], err))
 done()
