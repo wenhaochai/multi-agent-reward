@@ -8,9 +8,9 @@
 set -uo pipefail
 : "${JID:?}" "${OUT:?}" "${PKG:?}" "${TMPDIR:?}"
 MODE=$1
-REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic10
+REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic11
 FLINT=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint
-MILES=/scratch/gpfs/GROUP/USER/project/miles-numa3
+MILES=/scratch/gpfs/GROUP/USER/project/miles-numa4
 MEMPROBE_DATA=/scratch/gpfs/GROUP/USER/tmp/flint_s5/memprobe_data   # a recorded batch for the schedule check
 export HOME=$TMPDIR/home TRITON_CACHE_DIR=$TMPDIR/triton TORCHINDUCTOR_CACHE_DIR=$TMPDIR/inductor
 export SGLANG_CACHE_DIR=$TMPDIR/sglang FLASHINFER_WORKSPACE_BASE=$TMPDIR/flashinfer
@@ -73,6 +73,17 @@ if [ -n "${T67_DUP_END:-}" ]; then
   export MA_LG_DUP_END=$T67_DUP_END
   DUPEND_TRAIN=(--custom-reward-post-process-path flint.miles_agent.reward_post_process)
   echo "[s5] game: $MA_LG_DUP_END unjudged duplicate submits in a row end an agent's game; that turn's reward is 0"
+fi
+# kl=B (rl/rl_job.sh -> T67_KL; owner popup 2026-11-06 「照计划跑，同时测 KL 约束（推荐）」): a KL loss to the original
+# Flint at weight B (low_var_kl, k3 clamped; on the sampled token's full-vocabulary log-probs while the policy score
+# stays over the replayed support: miles flint-grpo-kl), against the drift that runs against their reward
+# (ledger note_2026_11_06_w794_trace_alarm_kl); the reference is the original weights, FSDP2 with CPU offload
+KL_TRAIN=()
+if [ -n "${T67_KL:-}" ]; then
+  case "$MODE" in train67*) ;; *) echo "[s5] kl=B is a train67 setting"; exit 1;; esac
+  [[ $T67_KL =~ ^0\.[0-9]*[1-9]$ ]] || { echo "[s5] T67_KL: $T67_KL"; exit 1; }
+  KL_TRAIN=(--use-kl-loss --kl-loss-coef "$T67_KL" --kl-loss-type low_var_kl --ref-load "$FLINT")
+  echo "[s5] loss: a KL to the original Flint at weight $T67_KL (low_var_kl)"
 fi
 # - milestones (train67 only): besides the newest 2 full checkpoints, the model part (DCP model/ and meta.json, ~149 GB;
 #   no optimizer) of every checkpoint iter_k with k % 20 == 0 stays, in $OUT/milestones/iter_k: hard links made by
@@ -300,6 +311,9 @@ if [ "$MODE" = args ]; then   # off-GPU: miles parses and checks each mode's arg
   A=("${TRAIN[@]}" "${TRAIN67[@]}" "${SERVE4[@]}" "${GAME67[@]}" "${T67_RUN[@]:1}" --num-rollout 40 "${ASYNC_ARGS[@]}"
     --extra-inference-engine-provider-path flint.engine_registry.provider --update-weights-timeout 900)
   T67_MODE=train67 T67_ASYNC=1 T67_ELASTIC=1 python3 "$REPO/rl/args_check.py" "${A[@]}" || exit 1
+  echo "== train67 async with the KL loss of kl=0.01 (miles flint-grpo-kl: replay with --use-kl-loss under score centering)"
+  T67_MODE=train67 T67_ASYNC=1 T67_ELASTIC=1 python3 "$REPO/rl/args_check.py" "${A[@]}" --use-kl-loss --kl-loss-coef 0.01 \
+    --kl-loss-type low_var_kl --ref-load "$FLINT" || exit 1
   SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0 ENGINE_TP=4 write_engine_spec "$OUT/engine_spec.json" "${A[@]}" || exit 1
   python3 "$REPO/rl/elastic_engine_argv.py" "$OUT/engine_spec.json" 172.17.0.1 20040 20000 10 || exit 1
   echo "== train67 schedule (B=$T67_B)"
@@ -363,11 +377,11 @@ case "$MODE" in
     APPEND=1 train "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RUN20[@]}" --num-rollout 20 ;;
   train67)
     echo "[s5] train67 (P=$T67_P G=$T67_G, ${T67_STEPS:-40} steps, seed $T67_SEED) starts from checkpoint: $(cat "$OUT/actor/latest_checkpointed_iteration.txt" 2>/dev/null || echo none)"
-    APPEND=1 train "${TRAIN[@]}" "${TRAIN67[@]}" "${DUPEND_TRAIN[@]}" "${SERVE[@]}" "${GAME67[@]}" "${T67_RUN[@]}" --num-rollout "${T67_STEPS:-40}" ;;
+    APPEND=1 train "${TRAIN[@]}" "${TRAIN67[@]}" "${DUPEND_TRAIN[@]}" "${KL_TRAIN[@]}" "${SERVE[@]}" "${GAME67[@]}" "${T67_RUN[@]}" --num-rollout "${T67_STEPS:-40}" ;;
   train67_test)
     echo "[s5] train67_test (P=$T67_P G=$T67_G, seed $T67_SEED) starts from checkpoint: $(cat "$OUT/actor/latest_checkpointed_iteration.txt" 2>/dev/null || echo none)"
-    APPEND=1 train "${TRAIN[@]}" "${TRAIN67[@]}" "${DUPEND_TRAIN[@]}" "${SERVE[@]}" "${GAME67[@]}" "${T67_TEST[@]}" --num-rollout 2 ;;
-  train67_smoke) train "${TRAIN[@]}" "${TRAIN67[@]}" "${DUPEND_TRAIN[@]}" "${SERVE[@]}" "${GAME67[@]}" --colocate --num-rollout 2 ;;
+    APPEND=1 train "${TRAIN[@]}" "${TRAIN67[@]}" "${DUPEND_TRAIN[@]}" "${KL_TRAIN[@]}" "${SERVE[@]}" "${GAME67[@]}" "${T67_TEST[@]}" --num-rollout 2 ;;
+  train67_smoke) train "${TRAIN[@]}" "${TRAIN67[@]}" "${DUPEND_TRAIN[@]}" "${KL_TRAIN[@]}" "${SERVE[@]}" "${GAME67[@]}" --colocate --num-rollout 2 ;;
 esac
 rc=$?
 echo "[s5] $(date -u +%FT%TZ) train.py exit $rc after $((SECONDS - t0)) s; $(tail -1 "$OUT/probe_start.log" 2>/dev/null)"
