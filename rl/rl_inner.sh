@@ -62,6 +62,18 @@ case "$MODE" in
     export MA_LG_WALL_MIN=60 MA_RL_P=$T67_P MA_RL_WALL_STOP_FRAC=0.25 MA_RL_MAX_DROPPED_FRAC=0.25 MA_RL_DUMP_EVERY=5 \
       MA_RL_DATA=$OUT/data_train67.jsonl FCS_RM_NODE_SLOTS=10 FCS_CASE_PROCS=12 MA_LG_DEDUP_SUBMIT=1 ;;
 esac
+# dupend=N (rl/rl_job.sh -> T67_DUP_END; owner popups 2026-11-06 「RL里面应该也惩罚这个行为」, 「首先prompt里写，然后
+# 触发的那个turn就记0分，前面都正常」): the N-th unjudged duplicate submit in a row ends the agent's game at that turn
+# (flint/game.py MA_LG_DUP_END, stated in the instance message), and that turn's reward is 0 (flint.miles_agent:
+# split_dup_end_turns in the sample filter, reward_post_process); unset: the game and the rewards as before
+DUPEND_TRAIN=()
+if [ -n "${T67_DUP_END:-}" ]; then
+  case "$MODE" in train67*) ;; *) echo "[s5] dupend=N is a train67 setting"; exit 1;; esac
+  [[ $T67_DUP_END =~ ^[1-9][0-9]*$ ]] || { echo "[s5] T67_DUP_END: $T67_DUP_END"; exit 1; }
+  export MA_LG_DUP_END=$T67_DUP_END
+  DUPEND_TRAIN=(--custom-reward-post-process-path flint.miles_agent.reward_post_process)
+  echo "[s5] game: $MA_LG_DUP_END unjudged duplicate submits in a row end an agent's game; that turn's reward is 0"
+fi
 # - milestones (train67 only): besides the newest 2 full checkpoints, the model part (DCP model/ and meta.json, ~149 GB;
 #   no optimizer) of every checkpoint iter_k with k % 20 == 0 stays, in $OUT/milestones/iter_k: hard links made by
 #   flint.miles_agent.log_rollout before its pruning deletes the checkpoint, and once more after train.py ends (the
@@ -70,7 +82,7 @@ esac
 # - a submit of code the agent already submitted is not judged again (flint/game.py MA_LG_DEDUP_SUBMIT; trace analysis
 #   2026-10-31: run20 rollout 17, one episode submitted one solution.cpp 124 times in a row, with a positive advantage);
 #   run20, base_tp8 and the evals keep judging every submit
-python3 -c "import json, os; json.dump({k: os.environ[k] for k in ('MA_LG_N', 'MA_LG_TOKENS', 'MA_LG_CTX_CHARS', 'MA_AG_TURN', 'MA_LG_WALL_MIN', 'MA_LG_DEDUP_SUBMIT') if k in os.environ}, open('$OUT/game_settings.json', 'w'))"
+python3 -c "import json, os; json.dump({k: os.environ[k] for k in ('MA_LG_N', 'MA_LG_TOKENS', 'MA_LG_CTX_CHARS', 'MA_AG_TURN', 'MA_LG_WALL_MIN', 'MA_LG_DEDUP_SUBMIT', 'MA_LG_DUP_END') if k in os.environ}, open('$OUT/game_settings.json', 'w'))"
 ulimit -n "$(ulimit -Hn)"
 NG=$(awk -F, '{print NF}' <<< "$CUDA_VISIBLE_DEVICES")
 JNUM=${JID//[!0-9]/}
@@ -351,11 +363,11 @@ case "$MODE" in
     APPEND=1 train "${TRAIN[@]}" "${SERVE[@]}" "${GAME[@]}" "${RUN20[@]}" --num-rollout 20 ;;
   train67)
     echo "[s5] train67 (P=$T67_P G=$T67_G, ${T67_STEPS:-40} steps, seed $T67_SEED) starts from checkpoint: $(cat "$OUT/actor/latest_checkpointed_iteration.txt" 2>/dev/null || echo none)"
-    APPEND=1 train "${TRAIN[@]}" "${TRAIN67[@]}" "${SERVE[@]}" "${GAME67[@]}" "${T67_RUN[@]}" --num-rollout "${T67_STEPS:-40}" ;;
+    APPEND=1 train "${TRAIN[@]}" "${TRAIN67[@]}" "${DUPEND_TRAIN[@]}" "${SERVE[@]}" "${GAME67[@]}" "${T67_RUN[@]}" --num-rollout "${T67_STEPS:-40}" ;;
   train67_test)
     echo "[s5] train67_test (P=$T67_P G=$T67_G, seed $T67_SEED) starts from checkpoint: $(cat "$OUT/actor/latest_checkpointed_iteration.txt" 2>/dev/null || echo none)"
-    APPEND=1 train "${TRAIN[@]}" "${TRAIN67[@]}" "${SERVE[@]}" "${GAME67[@]}" "${T67_TEST[@]}" --num-rollout 2 ;;
-  train67_smoke) train "${TRAIN[@]}" "${TRAIN67[@]}" "${SERVE[@]}" "${GAME67[@]}" --colocate --num-rollout 2 ;;
+    APPEND=1 train "${TRAIN[@]}" "${TRAIN67[@]}" "${DUPEND_TRAIN[@]}" "${SERVE[@]}" "${GAME67[@]}" "${T67_TEST[@]}" --num-rollout 2 ;;
+  train67_smoke) train "${TRAIN[@]}" "${TRAIN67[@]}" "${DUPEND_TRAIN[@]}" "${SERVE[@]}" "${GAME67[@]}" --colocate --num-rollout 2 ;;
 esac
 rc=$?
 echo "[s5] $(date -u +%FT%TZ) train.py exit $rc after $((SECONDS - t0)) s; $(tail -1 "$OUT/probe_start.log" 2>/dev/null)"

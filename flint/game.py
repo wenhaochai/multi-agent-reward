@@ -93,6 +93,16 @@ DEDUP_SUBMIT = os.environ.get("MA_LG_DEDUP_SUBMIT") or "0"   # 0: every submit i
 if DEDUP_SUBMIT not in ("0", "1"):
     raise ValueError(f"MA_LG_DEDUP_SUBMIT={DEDUP_SUBMIT}: must be 0 (off) or 1")
 DEDUP_SUBMIT = DEDUP_SUBMIT == "1"
+# MA_LG_DUP_END=K (0 = off, the game as before; needs MA_LG_DEDUP_SUBMIT=1): the K-th unjudged duplicate submit in a row
+# since the agent's last judged submission ends the agent's game at that turn (exit DupLoop); the instance message
+# states the rule, and in RL that turn's reward is 0 (flint.miles_agent.split_dup_end_turns, reward_post_process) while
+# the earlier turns keep S. Owner popups 2026-11-06 (quoted in flint/miles_agent.split_dup_end_turns): penalize this in
+# RL too; state the rule in the prompt, score the turn that triggers it 0 and every earlier turn as before. On the 959
+# val40 episodes of 2026-11-06, K = 50 ends 38 loops (e_a3's problem 6: 391 duplicates in 5.6 h) and changes no score:
+# none raised its best provisional score after that point.
+DUP_END = int(os.environ.get("MA_LG_DUP_END") or "0")
+if DUP_END < 0 or (DUP_END and not DEDUP_SUBMIT):
+    raise ValueError(f"MA_LG_DUP_END={DUP_END}: 0 (off), or a positive count together with MA_LG_DEDUP_SUBMIT=1")
 TURN = int(os.environ.get("MA_AG_TURN", "32768"))
 MAX_LEN = int(os.environ.get("MA_AG_MAX_LEN", "262144"))
 MAX_FORMAT_ERRORS = 3
@@ -126,7 +136,7 @@ def answer(text: str) -> str:
 
 
 def instance(problem: str, name: str) -> str:
-    return P.instance(problem, name, N, TOKENS, C.TIMEOUT)
+    return P.instance(problem, name, N, TOKENS, C.TIMEOUT, dup_end=DUP_END)
 
 
 def split_cases(n: int) -> tuple[list[int], list[int], bool]:
@@ -152,7 +162,7 @@ def harness_tag() -> str:
     """The game's name in results.jsonl and the trace: the tag of the same game before the cleanup of 2026-10-28
     (harness v1, budget end, fresh restarts; a team: own repositories, must post)."""
     return (f"long-v1-budget-fresh-ctxlow{CTX_LOW:g}" + ("-own-mustpost" if TEAM else "")
-            + ("-dedup" if DEDUP_SUBMIT else ""))
+            + ("-dedup" if DEDUP_SUBMIT else "") + (f"-dupend{DUP_END}" if DUP_END else ""))
 
 
 def sha1(code: str) -> str:
@@ -259,6 +269,7 @@ class Agent:
     owe_post = False   # a team agent has submitted and not posted since
     post_refused = 0   # commands not run because a post was owed
     dup_submits = 0    # submits not judged: the file equals one of this agent's judged submissions (MA_LG_DEDUP_SUBMIT)
+    dup_run = 0        # of them, those in a row since this agent's last judged submission (MA_LG_DUP_END)
 
     def __init__(self, sess, j: int, problem: str):
         self.name = f"agent{j + 1}"
@@ -356,7 +367,7 @@ class Paused(Exception):
 
 _AGENT_STATE = ("chat", "steps", "fmt_run", "fmt_total", "timeouts", "cut_n", "done", "exit", "turns", "generated",
                 "dropped", "seen", "n_submit", "n_post", "last_sha", "idle_fin", "restarts", "owe_post", "post_refused",
-                "dup_submits")
+                "dup_submits", "dup_run")
 _SESS_STATE = ("used", "queue", "cont", "n_cont", "last_reasoning", "fresh")   # ChatSession's state
 _TAR_MAX = 32 << 20   # a larger file (a generated test input) stays out of the checkpoint; the agent can rebuild it
 
@@ -568,6 +579,7 @@ async def episode(input, messages: list, label: str, new_session, ckpt: Checkpoi
              "cases": [round(c, 4) for c in cases], "case_info": res.get("case_info", [])}
         subs.append(s)
         a.n_submit += 1
+        a.dup_run = 0   # a judged submission ends a run of duplicates (MA_LG_DUP_END)
         if p == os.path.realpath(os.path.join(a.dir, "solution.cpp")):
             a.last_sha = s["sha"]
         tail = f": {res['status']}, provisional {100 * prov:.2f}"
@@ -606,11 +618,15 @@ async def episode(input, messages: list, label: str, new_session, ckpt: Checkpoi
         if x is None:
             return None
         a.dup_submits += 1
+        a.dup_run += 1
         if got[0] == os.path.realpath(os.path.join(a.dir, "solution.cpp")):
             a.last_sha = sha1(got[1])
-        return {"output": f"submit: {path} is {how} since your submission #{k} (provisional {100 * x['prov']:.2f}), "
-                          f"so it was not judged again and no new submission was recorded. Change {path} before you "
-                          "submit it again.\n", "returncode": 1, "exception_info": ""}
+        out = (f"submit: {path} is {how} since your submission #{k} (provisional {100 * x['prov']:.2f}), so it was not "
+               f"judged again and no new submission was recorded. Change {path} before you submit it again.\n")
+        if DUP_END and a.dup_run >= DUP_END:   # the main loop ends this agent's game after this turn
+            out += (f"This is your {a.dup_run}th unchanged submission in a row, so your game ends now and this "
+                    "submission scores 0.\n")
+        return {"output": out, "returncode": 1, "exception_info": ""}
 
     async def finish(a, out: dict) -> dict:
         """The finish command (its command output `out`): submit solution.cpp; unchanged since a.last_sha, a reply
@@ -770,6 +786,8 @@ async def episode(input, messages: list, label: str, new_session, ckpt: Checkpoi
                     dup = dup_submit(a, m_sub.group(1) or "solution.cpp") if DEDUP_SUBMIT else None
                     if dup is not None:
                         timing["dup_submit"] = True
+                        if DUP_END and a.dup_run >= DUP_END:
+                            timing["dup_end"] = True
                     out, secs = dup or await do_submit(a, m_sub.group(1) or "solution.cpp"), 0.0
                 elif m_post:
                     out, secs = do_post(a, m_post.group(1)), 0.0
@@ -806,6 +824,8 @@ async def episode(input, messages: list, label: str, new_session, ckpt: Checkpoi
                     sep = "\n" if out["output"] and not out["output"].endswith("\n") else ""
                     out = {**out, "output": out["output"] + sep + "".join(f"[harness] {n}\n" for n in notes)}
                 a.observe(cmd, {**out, "_timing": timing}, rounds, k)
+                if timing.get("dup_end"):   # MA_LG_DUP_END: this turn ends the agent's game (its turn is the trace's last)
+                    a.done, a.exit = True, "DupLoop"
                 if timing.get("idle_finish"):   # an unchanged finish command: the agent tries to stop
                     start_over(a)
                 if not fin:
@@ -871,6 +891,10 @@ async def episode(input, messages: list, label: str, new_session, ckpt: Checkpoi
             "fo_ag_no_code": float(best is None), "fo_ag_top_author": max(shares.values()) if shares else 0.0,
             **{f"fo_ag_exit_{e}": sum(a.exit == e for a in agents) / N for e in
                ("Finished", "IdleFinish", "TokensExceeded", "ContextExceeded", "RepeatedFormatError", "WallExceeded")},
+            # MA_LG_DUP_END only (off: the info as before, byte for byte): 1 when an agent's game ended at a run of
+            # duplicate submits (alone: at the episode's last turn)
+            **({"fo_ag_exit_DupLoop": sum(a.exit == "DupLoop" for a in agents) / N,
+                "fo_lg_dup_end": float(any(a.exit == "DupLoop" for a in agents))} if DUP_END else {}),
             # a submission still infra after the retries (run_eval reruns such a row)
             "fo_judge_infra_error": float(any(s["infra"] for s in subs)),
             "fo_judge_infra_unresolved": float(any(s["infra"] for s in subs)),

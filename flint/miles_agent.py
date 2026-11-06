@@ -97,7 +97,8 @@ async def run(base_url: str, prompt, request_kwargs: dict, metadata: dict, **kwa
         return {**out, "reward": 0.0, "flint_failed": f"aborted: {e}"[:500]}
     finally:
         await client.close()
-    out = {**out, "reward": S, **{k: info[k] for k in INFO_KEYS}}
+    out = {**out, "reward": S, **{k: info[k] for k in INFO_KEYS},
+           **({"fo_lg_dup_end": info["fo_lg_dup_end"]} if "fo_lg_dup_end" in info else {})}   # MA_LG_DUP_END only
     if "fo_lg_dup_submits" in info:   # MA_LG_DEDUP_SUBMIT=1 (train67)
         out["fo_lg_dup_submits"] = info["fo_lg_dup_submits"]
     if info["fo_judge_infra_error"]:
@@ -203,6 +204,29 @@ def _stop_rule(out: str, rollout_id: int) -> str | None:
 # (tmp/rollout_eff/consistency: the gate's tier 4); over a limit, log_rollout warns, it does not stop the run
 CONSISTENCY_LIMITS = {"train/train_rollout_logprob_abs_diff": 0.0099, "train/train_rollout_kl": 3.4e-4,
                       "train/r3_token_mismatch": 0.146, "train/r3_pick_mismatch": 0.031}
+# generated tokens of one rollout that no training sample holds, up to which the sample check warns (log_rollout):
+# 1,024 = 0.05% of a P=2 rollout (owner popup 2026-11-06 「放宽到 1,024 并继续（推荐）」; the third try of w786's rollout 64
+# missed 158 tokens, over the first limit of 64)
+TRAINED_SHORT_MAX = 1024
+
+
+def _inspect_verdict(summary: dict, problems: dict) -> tuple[dict, dict]:
+    """The sample check's verdict on a rollout: (bad, warn); bad stops the run, warn is logged.
+    2026-11-06: a few generated tokens that no training sample holds warn instead of stopping the run. w786 stopped twice
+    at rollout 64 (12, then 7 of its 2,048,000 tokens, each time in one episode of problem 313 that had sent the finish
+    command and restarted; the third, 158, in an episode of 560 calls); the data order is fixed, so every retry met the
+    same problems. Up to TRAINED_SHORT_MAX such tokens (0.05% of a P=2 rollout) only warn; more, or trained tokens over the generated ones, still stop the run.
+    Failed episodes and judge-infra submissions are the stop rule's to judge, as before."""
+    problems = dict(problems)
+    # a summary without the token counts (tests replace the check) gives short 0: the old verdict
+    short = (summary.get("ok_generated_tokens", 0) - summary.get("ok_trained_tokens", 0)
+             - summary.get("ok_shared_stop_tokens", 0))
+    warn = {}
+    if problems.get("trained != generated") and 0 < short <= TRAINED_SHORT_MAX:
+        problems["trained != generated"] = 0
+        warn = {"trained short of generated": short}
+    bad = {k: v for k, v in problems.items() if v and k not in ("failed episodes", "judge infra submissions")}
+    return bad, warn
 
 
 def _consistency(out: str) -> dict:
@@ -282,6 +306,76 @@ def drop_failed_groups(args, data) -> None:
         if any((s.metadata or {}).get("flint_failed") for s in samples) or _over_cap(samples, cap):
             for s in samples:
                 s.remove_sample = True
+    if int(os.environ.get("MA_LG_DUP_END") or "0"):
+        split_dup_end_turns(data)
+
+
+def _last_trained_run(mask) -> tuple[int, int] | None:
+    """(start, end) of the last run of 1s in a loss mask, end exclusive; None when it holds none."""
+    j = len(mask) - 1
+    while j >= 0 and not mask[j]:
+        j -= 1
+    if j < 0:
+        return None
+    end = j + 1
+    while j >= 0 and mask[j]:
+        j -= 1
+    return j + 1, end
+
+
+def split_dup_end_turns(data) -> int:
+    """MA_LG_DUP_END (flint/game.py): an episode whose game ended at a run of duplicate submits gets that last turn as
+    a sample of its own, marked dup_end_turn, so that reward_post_process gives it reward 0 while the episode's other
+    turns keep S (owner 2026-11-06: 「触发的那个turn就记0分，前面都正常」). The episode's last generation is its newest
+    session node, so the sample with the highest leaf node_id ends with it, as its last run of trained tokens. That
+    run moves from the sample into a copy (the same tokens, log-probs and routing; its loss mask on that run only), so
+    the episode's trained tokens, and its loss denominator, stay the same. A group already out of the loss is left as
+    it is. Returns the number of episodes split."""
+    import copy
+
+    n = 0
+    for group in data:
+        eps = group if isinstance(group, list) else [group]
+        for i, ep in enumerate(eps):
+            samples = _samples(ep)
+            if not samples or not any((s.metadata or {}).get("fo_lg_dup_end") for s in samples):
+                continue
+            if any(getattr(s, "remove_sample", False) for s in samples):
+                continue
+            last = max(samples, key=lambda s: ((s.metadata or {}).get("leaf") or {}).get("node_id", -1))
+            run = _last_trained_run(last.loss_mask)
+            if run is None:
+                continue
+            a, b = run
+            turn = copy.copy(last)
+            turn.loss_mask = [1 if a <= k < b else 0 for k in range(len(last.loss_mask))]
+            turn.metadata = {**(last.metadata or {}), "dup_end_turn": True}
+            last.loss_mask = [0 if a <= k < b else x for k, x in enumerate(last.loss_mask)]
+            if isinstance(ep, list):
+                ep.append(turn)
+            elif isinstance(group, list):
+                group[i] = [ep, turn]
+            else:
+                raise TypeError("split_dup_end_turns: a group that is a single sample")
+            n += 1
+    return n
+
+
+def reward_post_process(args, samples):
+    """miles' --custom-reward-post-process-path under MA_LG_DUP_END (rl/rl_inner.sh dupend=N): miles' own GRPO
+    normalization (each reward minus its group's mean over episodes, every sample of an episode carrying the episode's
+    S), then a dup_end_turn sample (split_dup_end_turns) gets reward 0 in place of S, so its normalized reward is 0
+    minus the group mean. Every other sample is as miles would make it."""
+    from miles.ray.rollout.train_data_conversion import _normalize_rewards_by_rollout
+
+    if not (args.advantage_estimator in ("grpo", "gspo", "reinforce_plus_plus_baseline") and args.rewards_normalization):
+        raise ValueError("flint.miles_agent.reward_post_process expects miles' GRPO normalization (rewards_normalization)")
+    raw = [s.get_reward_value(args) for s in samples]
+    norm = _normalize_rewards_by_rollout(args, samples, raw, None)
+    for i, s in enumerate(samples):
+        if (s.metadata or {}).get("dup_end_turn"):
+            norm[i] -= raw[i]
+    return raw, norm
 
 
 def _post(args, path: str, body: dict) -> tuple[int, object]:
@@ -619,15 +713,16 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
 
     if P:   # in this process, on the samples miles holds anyway; failed episodes are the stop rule's to judge
         summary, problems, lines = _inspect(d, samples)
-        bad = {k: v for k, v in problems.items() if v and k not in ("failed episodes", "judge infra submissions")}
+        bad, warn = _inspect_verdict(summary, problems)
         rec["inspect"] = f"INSPECT_FAIL {bad}" if bad else "INSPECT_OK" + (
-            f" (failed episodes {problems['failed episodes']}, out of the loss)" if problems["failed episodes"] else "")
+            f" (failed episodes {problems['failed episodes']}, out of the loss)" if problems["failed episodes"] else "") + (
+            f" INSPECT_WARN {warn}" if warn else "")
         open(os.path.join(d, "inspect.txt"), "w").write("\n".join(lines + [rec["inspect"]]) + "\n")
         r = subprocess.CompletedProcess([], 1 if bad else 0)
         every = int(os.environ.get("MA_RL_DUMP_EVERY", "0"))
         # a failed check keeps the rollout's samples too: w786's rollout 64 (2026-11-06) failed 'trained != generated'
         # by 12 tokens of one episode, and with no samples on disk the 12 tokens could not be found
-        if (every and rollout_id % every == 0) or bad:
+        if (every and rollout_id % every == 0) or bad or warn:
             _dump_samples(d, samples)
             rec["dumped"] = True
     else:
