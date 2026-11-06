@@ -625,7 +625,9 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
         open(os.path.join(d, "inspect.txt"), "w").write("\n".join(lines + [rec["inspect"]]) + "\n")
         r = subprocess.CompletedProcess([], 1 if bad else 0)
         every = int(os.environ.get("MA_RL_DUMP_EVERY", "0"))
-        if every and rollout_id % every == 0:
+        # a failed check keeps the rollout's samples too: w786's rollout 64 (2026-11-06) failed 'trained != generated'
+        # by 12 tokens of one episode, and with no samples on disk the 12 tokens could not be found
+        if (every and rollout_id % every == 0) or bad:
             _dump_samples(d, samples)
             rec["dumped"] = True
     else:
