@@ -1,0 +1,37 @@
+# signal33: signal34 without problem 75 (owner popup 2026-11-06: 「从 signal34 去掉题 75」), for new runs only; the running
+# runs keep signal34. Problem 75 collapsed under both seeds (w786: S 37 -> 0.5, w794: 21-38 -> 2.7) into turns cut at
+# the 16,384-token limit (62-70% of its budget), against its own signal (score vs log tokens per turn negative in all 14
+# groups); a group whose 8 episodes all fail gives no signal (ledger note_2026_11_06_problem75_trap). One pid per line.
+1
+9
+23
+24
+33
+41
+44
+47
+48
+50
+61
+83
+109
+111
+112
+174
+177
+186
+188
+301
+302
+304
+305
+306
+307
+308
+309
+310
+311
+312
+313
+314
+315
