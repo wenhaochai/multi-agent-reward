@@ -48,7 +48,8 @@ by the problem and the episode). N = 1 is the lone-agent control.
                   outlasts one wq segment.
 
 Env: MA_LG_N (4 agents), MA_LG_TOKENS (125000 per agent), MA_LG_CTX_CHARS (400000), MA_LG_CTX_LOW (0.75),
-MA_LG_MAX_ROUNDS (20000, a safety cap), MA_LG_CKPT_S (300), MA_LG_DEDUP_SUBMIT (0 = off; 1), MA_AG_TURN (32768 tokens
+MA_LG_MAX_ROUNDS (20000, a safety cap), MA_LG_CKPT_S (300), MA_LG_DEDUP_SUBMIT (0 = off; 1), MA_LG_DUP_END (0 = off; K
+with dedup), MA_LG_CUT_ZERO (0 = off; 1: the cut-reply rule), MA_AG_TURN (32768 tokens
 per turn), MA_AG_MAX_LEN (262144 context tokens), MA_AG_TIMEOUT (60 s per command), MA_AG_TRACE_DIR (traces; none if
 unset), MA_AG_CMD_WORKERS (32),
 MA_LG_WALL_MIN (0: none; RL rollouts set it: an episode that is still playing after that many minutes of wall time ends
@@ -104,6 +105,15 @@ DUP_END = int(os.environ.get("MA_LG_DUP_END") or "0")
 if DUP_END < 0 or (DUP_END and not DEDUP_SUBMIT):
     raise ValueError(f"MA_LG_DUP_END={DUP_END}: 0 (off), or a positive count together with MA_LG_DEDUP_SUBMIT=1")
 TURN = int(os.environ.get("MA_AG_TURN", "32768"))
+# MA_LG_CUT_ZERO=1 (0 = off, the game as before): a reply that reaches the turn limit TURN is cut off and runs no
+# command, as before; the instance message states it, and in RL that turn's reward is 0 (flint.miles_agent:
+# split_cut_turns, reward_post_process) while the episode's other turns keep S. A cut at a smaller limit (the last
+# reply of a budget that runs out) keeps S. The owner chose this rule on 2026-11-06 (plan B), after production drifted into replies cut
+# at the turn limit (ledger note_2026_11_06_prod_stop_cut_drift).
+CUT_ZERO = os.environ.get("MA_LG_CUT_ZERO") or "0"
+if CUT_ZERO not in ("0", "1"):
+    raise ValueError(f"MA_LG_CUT_ZERO={CUT_ZERO}: must be 0 (off) or 1")
+CUT_ZERO = CUT_ZERO == "1"
 MAX_LEN = int(os.environ.get("MA_AG_MAX_LEN", "262144"))
 MAX_FORMAT_ERRORS = 3
 MAX_POST = 2000               # characters of one message
@@ -136,7 +146,7 @@ def answer(text: str) -> str:
 
 
 def instance(problem: str, name: str) -> str:
-    return P.instance(problem, name, N, TOKENS, C.TIMEOUT, dup_end=DUP_END)
+    return P.instance(problem, name, N, TOKENS, C.TIMEOUT, dup_end=DUP_END, cut_turn=TURN if CUT_ZERO else 0)
 
 
 def split_cases(n: int) -> tuple[list[int], list[int], bool]:
@@ -162,7 +172,7 @@ def harness_tag() -> str:
     """The game's name in results.jsonl and the trace: the tag of the same game before the cleanup of 2026-10-28
     (harness v1, budget end, fresh restarts; a team: own repositories, must post)."""
     return (f"long-v1-budget-fresh-ctxlow{CTX_LOW:g}" + ("-own-mustpost" if TEAM else "")
-            + ("-dedup" if DEDUP_SUBMIT else "") + (f"-dupend{DUP_END}" if DUP_END else ""))
+            + ("-dedup" if DEDUP_SUBMIT else "") + (f"-dupend{DUP_END}" if DUP_END else "") + ("-cutzero" if CUT_ZERO else ""))
 
 
 def sha1(code: str) -> str:

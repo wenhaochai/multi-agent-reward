@@ -41,6 +41,10 @@ SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif t test_wal
 SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif t test_train67 X=1
 SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif t test_train67_seed X=1
 SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif t test_milestones X=1
+# the rules' trainer side imports miles: this tree's miles (rl/rl_inner.sh MILES) on PYTHONPATH, no GPU
+MILES=$(sed -n 's/^MILES=//p' rl/rl_inner.sh)
+SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif t test_dup_end PYTHONPATH="$MILES:$PWD" CUDA_VISIBLE_DEVICES=
+SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif t test_cut_zero PYTHONPATH="$MILES:$PWD" CUDA_VISIBLE_DEVICES=
 rm -rf "$TMPDIR"
 echo "${#fail[@]} failed${fail:+: ${fail[*]}}"
 [ ${#fail[@]} -eq 0 ]

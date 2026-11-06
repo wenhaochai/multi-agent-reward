@@ -307,6 +307,8 @@ def drop_failed_groups(args, data) -> None:
                 s.remove_sample = True
     if int(os.environ.get("MA_LG_DUP_END") or "0"):
         split_dup_end_turns(data)
+    if os.environ.get("MA_LG_CUT_ZERO") == "1":
+        split_cut_turns(data)
 
 
 def _game_settings(G) -> dict:
@@ -315,7 +317,7 @@ def _game_settings(G) -> dict:
     (audit 2026-11-06: without it here every episode of a dupend run failed its settings check)."""
     return {"MA_LG_N": G.N, "MA_LG_TOKENS": G.TOKENS, "MA_LG_CTX_CHARS": G.CTX_CHARS, "MA_AG_TURN": G.TURN,
             "MA_LG_WALL_MIN": G.WALL_MIN, **({"MA_LG_DEDUP_SUBMIT": 1} if G.DEDUP_SUBMIT else {}),
-            **({"MA_LG_DUP_END": G.DUP_END} if G.DUP_END else {})}
+            **({"MA_LG_DUP_END": G.DUP_END} if G.DUP_END else {}), **({"MA_LG_CUT_ZERO": 1} if G.CUT_ZERO else {})}
 
 
 def _last_trained_run(mask) -> tuple[int, int] | None:
@@ -348,6 +350,8 @@ def split_dup_end_turns(data) -> int:
             samples = _samples(ep)
             if not samples or not any((s.metadata or {}).get("fo_lg_dup_end") for s in samples):
                 continue
+            if any((s.metadata or {}).get("dup_end_turn") for s in samples):   # split already (a second call)
+                continue
             if any(getattr(s, "remove_sample", False) for s in samples):
                 continue
             last = max(samples, key=lambda s: ((s.metadata or {}).get("leaf") or {}).get("node_id", -1))
@@ -377,8 +381,74 @@ def split_dup_end_turns(data) -> int:
     return n
 
 
+def split_cut_turns(data) -> int:
+    """MA_LG_CUT_ZERO (flint/game.py; owner 2026-11-06, plan B): a reply cut off at the turn limit (finish reason
+    length at max_tokens = MA_AG_TURN) gets reward 0 while the episode's other turns keep S. A truncated generation is
+    always a leaf of miles' session tree (a truncated node cannot be extended: rollout/session/v2/session_state.py
+    raises TruncatedGenerationError), its leaf's sample ends with it, never trimmed, and the sample's turn_args are its
+    request's (rollout/session/v2/utils.py build_leaf_material). So the reply is the last run of trained tokens of a
+    sample whose status is truncated, and max_tokens tells a cut at the turn limit from the last reply of a budget
+    that runs out (a smaller limit, kept as it is). The run must end the response and be exactly the limit long, or
+    the sample is left as it is and counted (a length finish at the context limit, say). Checked on w1319's rollout 0
+    and production's r65: in every episode the truncated samples at the limit are the trace's turn-limit cuts, one
+    for one. When the reply is the sample's only trained run the sample itself is marked cut_turn (audit 2026-11-06:
+    on r65, copying those would have added 55% training tokens with no gradient); otherwise the run moves into a copy
+    marked cut_turn (its loss mask on that run only), as in split_dup_end_turns, so the episode's trained tokens and
+    its loss denominator stay the same. Returns the number of cut replies marked."""
+    import copy
+
+    cap = int(os.environ.get("MA_AG_TURN") or "32768")
+    n = skipped = 0
+    for group in data:
+        eps = group if isinstance(group, list) else [group]
+        for i, ep in enumerate(eps):
+            samples = _samples(ep)
+            if not samples or any(getattr(s, "remove_sample", False) for s in samples):
+                continue
+            cuts = [s for s in samples if str(getattr(s.status, "value", s.status)).lower() == "truncated"
+                    and ((s.metadata or {}).get("turn_args") or {}).get("max_tokens") == cap
+                    and not any((s.metadata or {}).get(k) for k in ("dup_end_turn", "cut_turn", "cut_split"))]
+            copies = []
+            for s in cuts:
+                run = _last_trained_run(s.loss_mask)
+                if run is None or run[1] != len(s.loss_mask) or run[1] - run[0] != cap:
+                    skipped += 1
+                    continue
+                a, b = run
+                n += 1
+                if sum(s.loss_mask) == b - a:   # the reply is all this sample trains: mark it, no copy
+                    s.metadata = {**(s.metadata or {}), "cut_turn": True}
+                    continue
+                turn = copy.copy(s)
+                turn.loss_mask = [1 if a <= k < b else 0 for k in range(len(s.loss_mask))]
+                turn.metadata = {**(s.metadata or {}), "cut_turn": True}
+                s.loss_mask = [0 if a <= k < b else x for k, x in enumerate(s.loss_mask)]
+                s.metadata = {**(s.metadata or {}), "cut_split": True}   # split once: a second call leaves it
+                copies.append(turn)
+            if not copies:
+                continue
+            # one rollout_id for every sample of the episode, as miles gives an episode of two or more samples
+            # (split_dup_end_turns, audit 2026-11-06); a one-leaf episode has none until it gets a sibling here
+            anchor = max(samples, key=lambda s: ((s.metadata or {}).get("leaf") or {}).get("node_id", -1))
+            rid = anchor.rollout_id if getattr(anchor, "rollout_id", None) is not None else anchor.index
+            for s in samples + copies:
+                s.rollout_id = rid
+            if isinstance(ep, list):
+                ep.extend(copies)
+            elif isinstance(group, list):
+                group[i] = [ep, *copies]
+            else:
+                raise TypeError("split_cut_turns: a group that is a single sample")
+    if n or skipped:
+        print(f"[flint] split_cut_turns: {n} reply(s) cut at the {cap:,}-token turn limit get reward 0"
+              + (f"; CUT_ZERO_SKIPPED {skipped} truncated sample(s) at the limit whose last run is not a full-limit "
+                 "reply at the response's end, left as they are" if skipped else ""), flush=True)
+    return n
+
+
 def reward_post_process(args, samples):
-    """miles' --custom-reward-post-process-path under MA_LG_DUP_END (rl/rl_inner.sh dupend=N): miles' own GRPO
+    """miles' --custom-reward-post-process-path under MA_LG_DUP_END or MA_LG_CUT_ZERO (rl/rl_inner.sh dupend=N,
+    cutzero=1): miles' own GRPO
     normalization (each reward minus its group's mean over episodes, every sample of an episode carrying the episode's
     S), then a dup_end_turn sample (split_dup_end_turns) gets reward 0 in place of S, so its normalized reward is 0
     minus the group mean. Every other sample is as miles would make it."""
@@ -391,7 +461,7 @@ def reward_post_process(args, samples):
     raw = [s.get_reward_value(args) for s in samples]
     norm = _normalize_rewards_by_rollout(args, samples, raw, None)
     for i, s in enumerate(samples):
-        if (s.metadata or {}).get("dup_end_turn"):
+        if (s.metadata or {}).get("dup_end_turn") or (s.metadata or {}).get("cut_turn"):
             norm[i] -= raw[i]
     return raw, norm
 
@@ -700,7 +770,7 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
 
     # from the episodes' traces, per episode: cut turns (no command; the last one usually at the token budget's end),
     # those cut at the turn cap (MA_AG_TURN), trims, submissions
-    eps = []
+    eps, cap_hits_by_pid = [], {}
     for f in sorted(os.listdir(os.path.join(d, "traces"))) if os.path.isdir(os.path.join(d, "traces")) else []:
         for line in open(os.path.join(d, "traces", f)):
             t = json.loads(line)
@@ -709,6 +779,11 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
             turns = t["agents"][0].get("turns", [])
             dropped = [x.get("dropped", 0) for x in turns]
             cap = int(os.environ.get("MA_AG_TURN", "32768"))
+            try:   # agent_<pid>.jsonl: the pid the samples carry as flint_trace_pid
+                cap_hits_by_pid[int(f.split("_")[1].split(".")[0])] = sum(
+                    1 for x in turns if x.get("cut") and (x.get("completion_tokens") or 0) >= cap)
+            except (IndexError, ValueError):
+                pass
             eps.append({"S": t.get("S"), "cut_turns": sum(1 for x in turns if x.get("cut")),
                         "turn_cap_hits": sum(1 for x in turns if x.get("cut") and (x.get("completion_tokens") or 0) >= cap),
                         "turns": len(turns), "trims": sum(1 for x, y in zip(dropped, dropped[1:]) if y > x),
@@ -723,6 +798,14 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
             **({"dup_end": sum(e["exit"] == "DupLoop" for e in eps),
                 "dup_end_S": [e["S"] for e in eps if e["exit"] == "DupLoop"]}
                if int(os.environ.get("MA_LG_DUP_END") or "0") else {})}
+    if os.environ.get("MA_LG_CUT_ZERO") == "1":   # the replies split_cut_turns gave reward 0, against the traces
+        kept = {(s.metadata or {}).get("flint_trace_pid") for s in samples if not getattr(s, "remove_sample", False)}
+        marked = sum(1 for s in samples if (s.metadata or {}).get("cut_turn") and not getattr(s, "remove_sample", False))
+        want = sum(h for pid, h in cap_hits_by_pid.items() if pid in kept)
+        rec |= {"cut_zero": marked, "cut_zero_traces": want}
+        if marked != want:
+            print(f"[flint] CUT_ZERO_MISMATCH rollout {rollout_id}: {marked} cut replies with reward 0, the kept "
+                  f"episodes' traces have {want} cut at the turn limit", flush=True)
 
     # the job's memory now and its peak so far (rl/rl_job.sh samples its cgroup every 10 s into host_mem.txt: time,
     # node used MiB, cgroup MiB and, since 2026-11-01, the cgroup's non-reclaimable MiB, the part its guard reads)

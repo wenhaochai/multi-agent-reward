@@ -8,7 +8,7 @@
 set -uo pipefail
 : "${JID:?}" "${OUT:?}" "${PKG:?}" "${TMPDIR:?}"
 MODE=$1
-REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic11
+REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic12
 FLINT=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint
 MILES=/scratch/gpfs/GROUP/USER/project/miles-numa4
 MEMPROBE_DATA=/scratch/gpfs/GROUP/USER/tmp/flint_s5/memprobe_data   # a recorded batch for the schedule check
@@ -74,6 +74,16 @@ if [ -n "${T67_DUP_END:-}" ]; then
   DUPEND_TRAIN=(--custom-reward-post-process-path flint.miles_agent.reward_post_process)
   echo "[s5] game: $MA_LG_DUP_END unjudged duplicate submits in a row end an agent's game; that turn's reward is 0"
 fi
+# cutzero=1 (rl/rl_job.sh -> T67_CUT_ZERO; owner 2026-11-06 「嗯用方案B」): a reply cut off at the turn limit
+# (MA_AG_TURN) is a sample of its own with reward 0 (flint.miles_agent: split_cut_turns in the sample filter,
+# reward_post_process), and the instance message states it (flint/game.py MA_LG_CUT_ZERO); unset: as before
+if [ -n "${T67_CUT_ZERO:-}" ]; then
+  case "$MODE" in train67*) ;; *) echo "[s5] cutzero=1 is a train67 setting"; exit 1;; esac
+  [ "$T67_CUT_ZERO" = 1 ] || { echo "[s5] T67_CUT_ZERO: $T67_CUT_ZERO"; exit 1; }
+  export MA_LG_CUT_ZERO=1
+  DUPEND_TRAIN=(--custom-reward-post-process-path flint.miles_agent.reward_post_process)
+  echo "[s5] game: a reply cut off at the ${MA_AG_TURN:-?}-token turn limit is a sample of its own with reward 0"
+fi
 # kl=B (rl/rl_job.sh -> T67_KL; owner popup 2026-11-06 「照计划跑，同时测 KL 约束（推荐）」): a KL loss to the original
 # Flint at weight B (low_var_kl, k3 clamped; on the sampled token's full-vocabulary log-probs while the policy score
 # stays over the replayed support: miles flint-grpo-kl), against the drift that runs against their reward
@@ -93,7 +103,7 @@ fi
 # - a submit of code the agent already submitted is not judged again (flint/game.py MA_LG_DEDUP_SUBMIT; trace analysis
 #   2026-10-31: run20 rollout 17, one episode submitted one solution.cpp 124 times in a row, with a positive advantage);
 #   run20, base_tp8 and the evals keep judging every submit
-python3 -c "import json, os; json.dump({k: os.environ[k] for k in ('MA_LG_N', 'MA_LG_TOKENS', 'MA_LG_CTX_CHARS', 'MA_AG_TURN', 'MA_LG_WALL_MIN', 'MA_LG_DEDUP_SUBMIT', 'MA_LG_DUP_END') if k in os.environ}, open('$OUT/game_settings.json', 'w'))"
+python3 -c "import json, os; json.dump({k: os.environ[k] for k in ('MA_LG_N', 'MA_LG_TOKENS', 'MA_LG_CTX_CHARS', 'MA_AG_TURN', 'MA_LG_WALL_MIN', 'MA_LG_DEDUP_SUBMIT', 'MA_LG_DUP_END', 'MA_LG_CUT_ZERO') if k in os.environ}, open('$OUT/game_settings.json', 'w'))"
 ulimit -n "$(ulimit -Hn)"
 NG=$(awk -F, '{print NF}' <<< "$CUDA_VISIBLE_DEVICES")
 JNUM=${JID//[!0-9]/}

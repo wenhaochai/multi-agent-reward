@@ -124,7 +124,7 @@ TEAM_ENV = ("You are {name}, one of {n} agents working at the same time on this 
 TOOLS = """## Long work, submissions and messages
 
 You have a budget of about {budget} generated tokens, and you should use it: keep improving your program for as long \
-as you can make it better. Three commands are provided by the harness; each must be the whole action, alone:
+as you can make it better.{cut_rule} Three commands are provided by the harness; each must be the whole action, alone:
 
 - `submit` or `submit <file>`: judges the file (default solution.cpp) right away and shows its PROVISIONAL score \
 (0-100): the mean over half of the hidden tests, with the score of each of those tests and any compiler errors. You \
@@ -140,6 +140,9 @@ TEAM_SUBMIT = " Every submission of every agent and its provisional score is sho
 DUP_RULE = (" Do not submit an unchanged program again: a file unchanged since one of your judged submissions (apart "
             "from comments and layout) is not judged again, and after {k} such submissions in a row your game ends at "
             "once and that submission scores 0.")
+# MA_LG_CUT_ZERO=1 (flint/game.py; owner 2026-11-06 「嗯用方案B」, after production's drift into replies cut at the turn
+# limit): the rule, stated next to the budget, as dupend's is next to the submit command (「首先prompt里写」)
+CUT_RULE = " A reply that reaches {cap} tokens is cut off there: it runs no command and scores 0."
 TEAM_POST = ("sends the message to every other agent; their messages appear at the top of your next observations, and "
              "BOARD.md keeps them all. Use it to split the work, report what you found and agree on the next step. "
              "After each of your submissions, your next command must be `post <message>`: tell the team what you "
@@ -212,12 +215,14 @@ POST_REFUSED = ("Nothing was run: after each of your submissions, your next comm
                 "then send your command again.\n")
 
 
-def instance(problem: str, name: str, n: int, tokens: int, timeout: int, dup_end: int = 0) -> str:
+def instance(problem: str, name: str, n: int, tokens: int, timeout: int, dup_end: int = 0, cut_turn: int = 0) -> str:
     """The instance message of agent `name` in a game of n agents with `tokens` generated tokens each; dup_end > 0
-    states the duplicate-submit rule of MA_LG_DUP_END (0: the message as before, byte for byte)."""
+    states the duplicate-submit rule of MA_LG_DUP_END, cut_turn > 0 the cut-reply rule of MA_LG_CUT_ZERO at that turn
+    limit (0 and 0: the message as before, byte for byte)."""
     team = n > 1
     tools = TOOLS.format(budget=f"{tokens:,}", team_submit=TEAM_SUBMIT if team else "",
                          post_text=TEAM_POST if team else SOLO_POST, when_end=TEAM_END if team else SOLO_END,
-                         dup_rule=DUP_RULE.format(k=dup_end) if dup_end else "")
+                         dup_rule=DUP_RULE.format(k=dup_end) if dup_end else "",
+                         cut_rule=CUT_RULE.format(cap=f"{cut_turn:,}") if cut_turn else "")
     env = TEAM_ENV.format(name=name, n=n) if team else SOLO_ENV
     return INSTANCE.format(problem=problem, env=env, tools=tools, timeout=timeout)
