@@ -45,6 +45,9 @@ SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif t test_mil
 MILES=$(sed -n 's/^MILES=//p' rl/rl_inner.sh)
 SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif t test_dup_end PYTHONPATH="$MILES:$PWD" CUDA_VISIBLE_DEVICES=
 SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif t test_cut_zero PYTHONPATH="$MILES:$PWD" CUDA_VISIBLE_DEVICES=
+# kl=B: the reference scoring (fake server) and the producer's compact routed experts
+SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif t test_ref_scorer PYTHONPATH="$MILES:$PWD" CUDA_VISIBLE_DEVICES=
+SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif t test_compact_experts PYTHONPATH="$MILES:$PWD" CUDA_VISIBLE_DEVICES=
 rm -rf "$TMPDIR"
 echo "${#fail[@]} failed${fail:+: ${fail[*]}}"
 [ ${#fail[@]} -eq 0 ]

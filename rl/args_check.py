@@ -37,6 +37,9 @@ elif a.load_debug_rollout_data is None and os.environ.get("T67_ASYNC"):   # trai
         want["custom_async_data_buffer_path"] = "flint.elastic_rollout.OldestFirstDataBuffer"
         if a.async_data_buffer_capacity_factor < (a.max_weight_staleness or 1) + 1:
             want["async_data_buffer_capacity_factor"] = (a.max_weight_staleness or 1) + 1
+    if a.use_kl_loss:   # kl=B (rl/rl_inner.sh): the reference scored during rollout by a server beside the rollout engine
+        want |= {"ref_log_probs_from_rollout": True, "ref_load": None, "kl_loss_type": "low_var_kl",
+                 "rollout_temperature": 1.0, "sglang_mem_fraction_static": 0.80, "sglang_swa_full_tokens_ratio": 0.1}
 elif a.load_debug_rollout_data is None:   # the colocated RL run
     want |= {"colocate": True, "offload_train": True, "offload_rollout": True, "rollout_num_gpus_per_engine": 2,
              "use_session_server": "v2", "tito_model": "flint", "pause_generation_mode": "in_place",
@@ -95,8 +98,18 @@ if os.environ.get("T67"):   # train67 (rl/rl_inner.sh args): P problems x G epis
     if os.environ.get("T67_ELASTIC"):
         want |= {"extra_inference_engine_provider_path": "flint.engine_registry.provider", "update_weights_timeout": 900,
                  "rollout_external": False, "colocate": not os.environ.get("T67_ASYNC")}
-    want["kv_fits"] = True
+    kl_layout = os.environ.get("T67_ASYNC") and a.use_kl_loss
+    if kl_layout:   # kl=B: the rollout engine beside the reference server (rl/rl_inner.sh start_ref_engine): about
+        # 35.5 GB free after its weights (77.4 GB, minus the reference server's ~23 GB static and its own 18.7 GB), less
+        # 0.20 of 79.6 GB, is ~19.6 GB of KV; per full-attention token 6.68 KB plus 0.1 x 17.9 KB of sliding-window KV
+        # (w1400's engine log: 3,522,771 full and 1,409,108 sliding-window tokens in 23.5 GB each)
+        pool = int(19.6e9 / (6.68e3 + 0.1 * 17.9e3))
     a.kv_fits = per_engine * 60000 <= 0.9 * pool
+    if kl_layout:   # the 60k-token budget per session is the cap, not the use: w1400's engine peaked at 1.28M tokens for
+        # 42 running sessions (step 0, 48 in flight), so the smoke test measures the pool and its use; reported only
+        print(f"kl=B: KV pool ~{pool:,} tokens, budget {per_engine * 60000:,} at 60k per session (w1400 peak 1,279,171)")
+    else:
+        want["kv_fits"] = True
     print(f"train67 {mode}: B = {P * G} episodes, {8 // tp} x TP{tp}, KV {per_engine * 60000:,} of {pool:,} tokens per "
           f"engine ({per_engine * 60000 / pool:.0%}), session-server workers {a.session_server_workers}"
           + (f", levers {','.join(levers)}" if levers else ""))

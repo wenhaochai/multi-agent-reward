@@ -88,9 +88,11 @@ case "$MODE" in train67*) [[ $T67_P =~ ^[1-9][0-9]*$ && $T67_G =~ ^[1-9][0-9]*$ 
   # dupend=N (owner popups 2026-11-06): the N-th unjudged duplicate submit in a row ends an agent's game, and that turn's
   # reward is 0 (rl/rl_inner.sh: MA_LG_DUP_END, flint.miles_agent.reward_post_process); 1 to 9999
   [ -z "$DUPEND_GIVEN" ] || [[ $T67_DUP_END =~ ^[1-9][0-9]{0,3}$ ]] || { echo "dupend=N: duplicate submits in a row, 1 to 9999: $T67_DUP_END"; exit 1; }
-  # kl=B (owner popup 2026-11-06 「照计划跑，同时测 KL 约束（推荐）」): a KL loss to the original Flint at weight B
-  # (rl/rl_inner.sh; miles flint-grpo-kl: the sampled token's full-vocabulary log-probs under replay), 0 < B < 1
+  # kl=B (owner popups 2026-11-06 「照计划跑，同时测 KL 约束（推荐）」, 「和 rollout 引擎共用 4 张卡（推荐）」): a KL
+  # loss to the original Flint at weight B, 0 < B < 1, the reference scored during rollout by a reference server on the
+  # run's own engine GPUs (rl/rl_inner.sh start_ref_engine; flint/ref_scorer.py; miles flint-grpo-kl-rollref), so async=1
   [ -z "$KL_GIVEN" ] || [[ $T67_KL =~ ^0\.[0-9]*[1-9]$ ]] || { echo "kl=B: the KL weight, 0 < B < 1 without trailing zeros, as 0.01: $T67_KL"; exit 1; }
+  [ -z "$KL_GIVEN" ] || [ -n "$ASYNC_GIVEN" ] || { echo "kl=B goes with async=1 (the reference is scored by the async producer)"; exit 1; }
   # cutzero=1 (owner 2026-11-06 「嗯用方案B」): a reply cut off at the turn limit gets reward 0 (rl/rl_inner.sh)
   [ -z "$CUTZERO_GIVEN" ] || [ "$T67_CUT_ZERO" = 1 ] || { echo "cutzero=1 is the only value: $T67_CUT_ZERO"; exit 1; }
   [ -z "$ELASTIC_GIVEN" ] || [ "$T67_ELASTIC" = 1 ] || { echo "elastic=1 is the only value: $T67_ELASTIC"; exit 1; }
@@ -115,8 +117,8 @@ T67_CMD_TIMEOUT=${T67_CMD_TIMEOUT:-60}
 T67_SEED=${T67_SEED:-67}
 JID=${FETCHED_JOB_ID:-$SLURM_JOB_ID}
 [ -n "$JID" ] || { echo "no job id"; exit 1; }
-REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic12
-MILES=/scratch/gpfs/GROUP/USER/project/miles-numa4
+REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic13
+MILES=/scratch/gpfs/GROUP/USER/project/miles-numa5
 # this script is a snapshot in wq, the others are read live: all must name this worktree and this miles, or the run imports another worktree's code (found by the audit of elastic-v7, 2026-11-03)
 grep -qx "REPO=$REPO" "$REPO/rl/rl_inner.sh" && grep -qx "MILES=$MILES" "$REPO/rl/rl_inner.sh" && grep -q "^HERE=$REPO " "$REPO/rl/elastic_engine.sh" \
   || { echo "[s5] rl_inner.sh or elastic_engine.sh names another repo or miles than this script ($REPO, $MILES)"; exit 1; }

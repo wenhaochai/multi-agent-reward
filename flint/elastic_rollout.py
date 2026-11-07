@@ -251,6 +251,59 @@ def _oldest_version(entry) -> float:
     return float("-inf") if v is None else v
 
 
+def _group_samples(groups) -> list:
+    """Every sample of a list of groups or of one group: a group holds one entry per episode, a sample or a list of the
+    episode's samples (one per session-tree leaf)."""
+    out, stack = [], [groups]
+    while stack:
+        x = stack.pop()
+        if isinstance(x, list):
+            stack.extend(reversed(x))
+        elif x is not None:
+            out.append(x)
+    return out
+
+
+def compact_routed_experts(group) -> int:
+    """A finished group's routed experts as uint8 while it waits in the buffer, when every id fits (Flint: 256 experts,
+    ids 0-255; its dense layers 0 and 1 hold 0): 49 layers x top-6 x 4 bytes = 1,176 bytes per token become 294. They
+    were 88% of a sample's memory (w1400's step-0 samples), and the buffer holds 8-14 groups of ~4.3 GiB each, which
+    took the run's host memory to the 860 GiB guard (w1407's second step: 843 GiB, 75 of it the rollout process).
+    An array with an id outside 0-255 stays int32. expand_routed_experts gives int32 back at the drain, before miles'
+    conversion: the typed transport keeps a dtype, and the trainer's replay indexes with the ids (a uint8 index would
+    be a mask). Returns the bytes saved."""
+    import numpy as np
+
+    saved, made = 0, {}   # id(original) -> (original, compacted): the original stays referenced, so its id is not reused
+    for s in _group_samples(group):
+        r = getattr(s, "rollout_routed_experts", None)
+        if r is None or r.dtype == np.uint8 or not r.size:
+            continue
+        if id(r) in made:   # an array this group's samples share (a split copy and its source): compacted once
+            s.rollout_routed_experts = made[id(r)][1]
+            continue
+        if r.min() >= 0 and r.max() <= 255:
+            c = r.astype(np.uint8)
+            made[id(r)] = (r, c)
+            s.rollout_routed_experts = c
+            saved += r.nbytes - c.nbytes
+    return saved
+
+
+def expand_routed_experts(groups) -> None:
+    """The routed experts of the drained groups as int32 again (compact_routed_experts), one array per array: copies
+    made by the sample filter's splits share theirs, and keep sharing it."""
+    import numpy as np
+
+    out = {}   # id(compact) -> (compact, expanded), the compact array kept referenced as in compact_routed_experts
+    for s in _group_samples(groups):
+        r = getattr(s, "rollout_routed_experts", None)
+        if r is not None and r.dtype == np.uint8:
+            if id(r) not in out:
+                out[id(r)] = (r, r.astype(np.int32))
+            s.rollout_routed_experts = out[id(r)][1]
+
+
 class Warmup:
     """The warm-up engine of a fresh start or a resume (module docstring). Its files under DIR (rl/rl_job.sh, rl/elastic_engine.sh
     EL_WARMUP=1):
@@ -412,6 +465,26 @@ class ElasticFullyAsyncRolloutFn(FullyAsyncRolloutFn):
                 remove=lambda url: client.remove_worker(url, legacy),
                 checksums=engine_checksums, version=engine_weight_version, set_version=set_engine_weight_version,
                 on_change=self._engines_changed)
+        # kl=B (rl/rl_inner.sh): every sample of a finished group gets its reference log-probs from the reference
+        # server before the group enters the buffer (flint/ref_scorer.py); a failure fails the group's task, and so
+        # the run. The URL is in MA_REF_FILE, written by rl_inner.sh's start_ref_engine once the server passed its
+        # check (this process takes Ray's environment, older than the server)
+        self._ref = None
+        if path := os.environ.get("MA_REF_FILE"):
+            from flint.ref_scorer import RefScorer, vocab_size_of
+
+            if not os.path.exists(path):
+                raise RuntimeError(f"kl=B: no reference server URL in {path} (rl/rl_inner.sh start_ref_engine)")
+            url = open(path).read().strip()
+            self._ref = RefScorer(url, vocab_size_of(self.args.hf_checkpoint), os.environ.get("MA_REF_LOG"))
+            logger.info(f"elastic producer: reference log-probs from {url}")
+
+    async def _generate_group(self, prompt_group):
+        entry = await super()._generate_group(prompt_group)
+        if self._ref is not None:
+            await self._ref.score_group(entry.group)
+        compact_routed_experts(entry.group)
+        return entry
 
     def _submit_one_group(self):
         task = super()._submit_one_group()
@@ -473,6 +546,7 @@ class ElasticFullyAsyncRolloutFn(FullyAsyncRolloutFn):
         finally:
             self._draining = False
             self._wake.set()
+        expand_routed_experts(out.samples)   # int32 again for miles' conversion and the trainer's replay
         if self._warmup is not None:
             await self._warmup.release()
         return out

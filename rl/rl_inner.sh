@@ -8,9 +8,9 @@
 set -uo pipefail
 : "${JID:?}" "${OUT:?}" "${PKG:?}" "${TMPDIR:?}"
 MODE=$1
-REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic12
+REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic13
 FLINT=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint
-MILES=/scratch/gpfs/GROUP/USER/project/miles-numa4
+MILES=/scratch/gpfs/GROUP/USER/project/miles-numa5
 MEMPROBE_DATA=/scratch/gpfs/GROUP/USER/tmp/flint_s5/memprobe_data   # a recorded batch for the schedule check
 export HOME=$TMPDIR/home TRITON_CACHE_DIR=$TMPDIR/triton TORCHINDUCTOR_CACHE_DIR=$TMPDIR/inductor
 export SGLANG_CACHE_DIR=$TMPDIR/sglang FLASHINFER_WORKSPACE_BASE=$TMPDIR/flashinfer
@@ -84,16 +84,28 @@ if [ -n "${T67_CUT_ZERO:-}" ]; then
   DUPEND_TRAIN=(--custom-reward-post-process-path flint.miles_agent.reward_post_process)
   echo "[s5] game: a reply cut off at the ${MA_AG_TURN:-?}-token turn limit is a sample of its own with reward 0"
 fi
-# kl=B (rl/rl_job.sh -> T67_KL; owner popup 2026-11-06 「照计划跑，同时测 KL 约束（推荐）」): a KL loss to the original
-# Flint at weight B (low_var_kl, k3 clamped; on the sampled token's full-vocabulary log-probs while the policy score
-# stays over the replayed support: miles flint-grpo-kl), against the drift that runs against their reward
-# (ledger note_2026_11_06_w794_trace_alarm_kl); the reference is the original weights, FSDP2 with CPU offload
+# kl=B (rl/rl_job.sh -> T67_KL; owner popups 2026-11-06 「方案A肯定也要做啊，这不是GRPO里的必备项吗」 and 「和 rollout
+# 引擎共用 4 张卡（推荐）」): a KL loss to the original Flint at weight B (low_var_kl, k3 clamped; on the sampled token's
+# full-vocabulary log-probs while the policy score stays over the replayed support: miles flint-grpo-kl), against the
+# drift that runs against their reward (ledger note_2026_11_06_w794_trace_alarm_kl). The trainer has no room for a
+# reference model (host memory peaks at 790-819 of the 860 GiB guard), so a reference server with the original weights
+# shares the run's own engine GPUs (start_ref_engine below) and the producer scores every sample of a finished group
+# with it (flint/ref_scorer.py; miles flint-grpo-kl-rollref --ref-log-probs-from-rollout). Async only: the scoring
+# hook is the async producer's. The rollout engine gives up GPU memory for it: 0.80 of each GPU instead of 0.85, and a
+# sliding-window KV pool of 0.1 of the full one instead of 0.4 (the window is 513 tokens: w1400's engine used 3% of its
+# 1.41M sliding-window tokens at its peak, 36% of its 3.52M full ones)
 KL_TRAIN=()
 if [ -n "${T67_KL:-}" ]; then
-  case "$MODE" in train67*) ;; *) echo "[s5] kl=B is a train67 setting"; exit 1;; esac
+  case "$MODE" in train67|train67_test) ;; *) echo "[s5] kl=B is a train67 or train67_test setting"; exit 1;; esac
+  [ -n "${T67_ASYNC:-}" ] || { echo "[s5] kl=B needs async=1 (the reference scoring is the async producer's)"; exit 1; }
   [[ $T67_KL =~ ^0\.[0-9]*[1-9]$ ]] || { echo "[s5] T67_KL: $T67_KL"; exit 1; }
-  KL_TRAIN=(--use-kl-loss --kl-loss-coef "$T67_KL" --kl-loss-type low_var_kl --ref-load "$FLINT")
-  echo "[s5] loss: a KL to the original Flint at weight $T67_KL (low_var_kl)"
+  KL_TRAIN=(--use-kl-loss --kl-loss-coef "$T67_KL" --kl-loss-type low_var_kl --ref-log-probs-from-rollout)
+  # the producer runs in a Ray worker, which takes the environment of `ray start` below: it reads the server's URL
+  # from MA_REF_FILE, which start_ref_engine writes once the server passed its check (this segment's server: a file
+  # from an earlier segment names a port that is gone)
+  export MA_REF_FILE=$OUT/ref_engine.url MA_REF_LOG=$OUT/ref_scoring.jsonl
+  rm -f -- "$MA_REF_FILE"
+  echo "[s5] loss: a KL to the original Flint at weight $T67_KL (low_var_kl), the reference scored during rollout"
 fi
 # - milestones (train67 only): besides the newest 2 full checkpoints, the model part (DCP model/ and meta.json, ~149 GB;
 #   no optimizer) of every checkpoint iter_k with k % 20 == 0 stays, in $OUT/milestones/iter_k: hard links made by
@@ -223,7 +235,55 @@ if [ -n "${T67_ASYNC:-}" ]; then
   # order=oldest (rl/rl_job.sh -> T67_ORDER): a drain takes the oldest weight version first and waits for an older group when it must (flint.elastic_rollout.OldestFirstDataBuffer)
   [ -z "${T67_ORDER:-}" ] || ASYNC+=(--custom-async-data-buffer-path flint.elastic_rollout.OldestFirstDataBuffer)
   echo "[s5] async: actor 4 GPUs, own engine 1 x TP4, $MA_ASYNC_SAMPLES_PER_ENGINE episodes per engine in flight, TIS, staleness bound ${T67_STALE:-none}${T67_ORDER:+, drains $T67_ORDER first}"
+  # kl=B: the rollout engine shares its GPUs with the reference server (KL_TRAIN above; later flags win in miles' parser)
+  [ -z "${T67_KL:-}" ] || ASYNC+=(--sglang-mem-fraction-static 0.80 --sglang-swa-full-tokens-ratio 0.1)
 fi
+# kl=B: the reference server (rl/ref_engine_argv.py: the run's own engine's arguments, the original Flint, a KV pool
+# for one sample at a time) on the GPUs miles gives its own engine (the last 4 of MILES_GPU_ORDER or of this job's
+# GPUs), started and checked before the trainer, so that the rollout engine sizes its KV pool around it. The check
+# (flint.ref_scorer check): the server's own sampled tokens, scored again, come back with their sampling log-probs.
+# Prints the URL the producer reads (MA_REF_URL); its log is $OUT/ref_engine.log, its per-group scoring $OUT/ref_scoring.jsonl.
+start_ref_engine() {
+  local gpus base port out env_line argv_line t0=$SECONDS
+  IFS=, read -r -a gpus <<< "${MILES_GPU_ORDER:-$CUDA_VISIBLE_DEVICES}"
+  [ ${#gpus[@]} -eq 8 ] || { echo "[s5] ref: 8 GPUs expected, got ${gpus[*]}"; return 1; }
+  base=$(python3 - <<'PY'
+import random, socket
+for _ in range(500):
+    b, socks = random.randrange(20000, 29000), []
+    try:
+        for p in range(b, b + 10):
+            s = socket.socket(); socks.append(s); s.bind(("0.0.0.0", p))
+        print(b); break
+    except OSError:
+        pass
+    finally:
+        for s in socks: s.close()
+PY
+)
+  [ -n "$base" ] || { echo "[s5] ref: no free ports"; return 1; }
+  port=$((base + 9))
+  out=$(REF_MEM_FRACTION=0.35 REF_MAX_TOKENS=160000 python3 "$REPO/rl/ref_engine_argv.py" "$OUT/engine_spec.json" "$port" "$base") \
+    || { echo "[s5] ref: argv failed: $out"; return 1; }
+  env_line=$(grep '^ENV ' <<< "$out" | cut -d' ' -f2-) argv_line=$(grep '^ARGV ' <<< "$out" | cut -d' ' -f2-)
+  echo "[s5] ref: differs from the run's own engine in: $(grep '^DIFF ' <<< "$out" | cut -d' ' -f2-)"
+  (
+    for kv in $env_line; do export "$kv"; done
+    export CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${gpus[*]:4:4}")" SGLANG_CACHE_DIR=$TMPDIR/sglang_ref FLASHINFER_WORKSPACE_BASE=$TMPDIR/flashinfer_ref
+    eval "exec $argv_line"
+  ) > "$OUT/ref_engine.log" 2>&1 &
+  REF_PID=$!
+  echo "[s5] ref: reference server pid $REF_PID on GPUs ${gpus[*]:4:4}, port $port (log $OUT/ref_engine.log)"
+  until [ "$(curl -s --noproxy '*' -m 10 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/health_generate")" = 200 ]; do
+    kill -0 $REF_PID 2>/dev/null || { echo "[s5] ref: the server ended while loading: $(tail -n 5 "$OUT/ref_engine.log")"; return 1; }
+    [ $((SECONDS - t0)) -lt 1800 ] || { echo "[s5] ref: not healthy after 30 min"; return 1; }
+    sleep 10
+  done
+  grep -hE "Load weight end|KV Cache is allocated|Memory pool end" "$OUT/ref_engine.log" | grep "TP0" | sed 's/^/[s5] ref: /' | cut -c1-220
+  python3 -m flint.ref_scorer check "http://127.0.0.1:$port" "$FLINT" || { echo "[s5] ref: the alignment check failed"; return 1; }
+  echo "http://127.0.0.1:$port" > "$MA_REF_FILE.tmp" && mv -f -- "$MA_REF_FILE.tmp" "$MA_REF_FILE"
+  echo "[s5] ref: serving after $((SECONDS - t0)) s"
+}
 write_engine_spec() {   # write_engine_spec FILE ARGV...: the spec rl/elastic_engine.sh serves (rl/elastic_engine_argv.py)
   python3 - "$1" "$ENGINE_TP" "$REPO" "$MILES" "$FLINT" "${@:2}" <<'PY'
 import json, os, subprocess, sys
@@ -321,11 +381,14 @@ if [ "$MODE" = args ]; then   # off-GPU: miles parses and checks each mode's arg
   A=("${TRAIN[@]}" "${TRAIN67[@]}" "${SERVE4[@]}" "${GAME67[@]}" "${T67_RUN[@]:1}" --num-rollout 40 "${ASYNC_ARGS[@]}"
     --extra-inference-engine-provider-path flint.engine_registry.provider --update-weights-timeout 900)
   T67_MODE=train67 T67_ASYNC=1 T67_ELASTIC=1 python3 "$REPO/rl/args_check.py" "${A[@]}" || exit 1
-  echo "== train67 async with the KL loss of kl=0.01 (miles flint-grpo-kl: replay with --use-kl-loss under score centering)"
-  T67_MODE=train67 T67_ASYNC=1 T67_ELASTIC=1 python3 "$REPO/rl/args_check.py" "${A[@]}" --use-kl-loss --kl-loss-coef 0.01 \
-    --kl-loss-type low_var_kl --ref-load "$FLINT" || exit 1
   SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0 ENGINE_TP=4 write_engine_spec "$OUT/engine_spec.json" "${A[@]}" || exit 1
   python3 "$REPO/rl/elastic_engine_argv.py" "$OUT/engine_spec.json" 172.17.0.1 20040 20000 10 || exit 1
+  echo "== train67 async with kl=0.01: the KL loss read from the rollout's reference scores (miles flint-grpo-kl-rollref), the rollout engine beside the reference server, and the reference server's argv"
+  AK=("${A[@]}" --use-kl-loss --kl-loss-coef 0.01 --kl-loss-type low_var_kl --ref-log-probs-from-rollout
+    --sglang-mem-fraction-static 0.80 --sglang-swa-full-tokens-ratio 0.1)
+  T67_MODE=train67 T67_ASYNC=1 T67_ELASTIC=1 python3 "$REPO/rl/args_check.py" "${AK[@]}" || exit 1
+  SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0 ENGINE_TP=4 write_engine_spec "$OUT/engine_spec_kl.json" "${AK[@]}" || exit 1
+  REF_MEM_FRACTION=0.35 REF_MAX_TOKENS=160000 python3 "$REPO/rl/ref_engine_argv.py" "$OUT/engine_spec_kl.json" 20049 20040 || exit 1
   echo "== train67 schedule (B=$T67_B)"
   python3 "$REPO/rl/schedule_check.py" "$MEMPROBE_DATA/rollout_0.pt" --episodes "$T67_B" --group "$T67_G" \
     "${TRAIN[@]}" "${TRAIN67[@]}" "${MEMPROBE[@]}"
@@ -353,6 +416,8 @@ train() {
   if [ ${#ELASTIC[@]} -gt 0 ] || [ ${#ASYNC[@]} -gt 0 ]; then
     write_engine_spec "$OUT/engine_spec.json" "$@" || return 1
   fi
+  # kl=B: the reference server takes its GPU memory before the rollout engine sizes its KV pool
+  [ -z "${T67_KL:-}" ] || start_ref_engine || return 1
   if [ -n "${APPEND:-}" ]; then echo "=== segment $(date -u +%FT%TZ)" >> "$OUT/train.log"; else : > "$OUT/train.log"; fi
   local from=$(( $(wc -l < "$OUT/train.log") + 1 ))   # this segment's lines (run20 appends one segment after another)
   tail -n +"$from" -F "$OUT/train.log" > "$OUT/train_segment.log" 2>/dev/null &
