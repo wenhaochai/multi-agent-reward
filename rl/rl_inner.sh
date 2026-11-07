@@ -110,6 +110,10 @@ fi
 # skipfwd=1 (rl/rl_job.sh -> T67_SKIPFWD): the trainer skips the old-policy log-prob pass score centering never reads
 # (miles flint-grpo-kl-rollref-skipfwd); appended after the KL settings above, which set KL_TRAIN anew
 [ -z "${T67_SKIPFWD:-}" ] || { KL_TRAIN+=(--skip-actor-forward-only); echo "[s5] trainer: no separate old-policy log-prob pass (skipfwd=1)"; }
+# profile=1 (rl/rl_job.sh -> T67_PROFILE): torch.profiler traces of the training forward-backward, micro-batches 4-6 of
+# each step, one file per rank and step under $OUT/prof (miles TrainProfiler, target train_actor)
+[ -z "${T67_PROFILE:-}" ] || { KL_TRAIN+=(--use-pytorch-profiler --profile-target train_actor --profile-step-start 4 --profile-step-end 7
+  --tensorboard-dir "$OUT/prof"); echo "[s5] trainer: torch.profiler on micro-batches 4-6 of each step (profile=1)"; }
 # - milestones (train67 only): besides the newest 2 full checkpoints, the model part (DCP model/ and meta.json, ~149 GB;
 #   no optimizer) of every checkpoint iter_k with k % 20 == 0 stays, in $OUT/milestones/iter_k: hard links made by
 #   flint.miles_agent.log_rollout before its pruning deletes the checkpoint, and once more after train.py ends (the
