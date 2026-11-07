@@ -8,9 +8,9 @@
 set -uo pipefail
 : "${JID:?}" "${OUT:?}" "${PKG:?}" "${TMPDIR:?}"
 MODE=$1
-REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic13
+REPO=/scratch/gpfs/GROUP/USER/project/mas-rl-elastic14
 FLINT=/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint
-MILES=/scratch/gpfs/GROUP/USER/project/miles-numa5
+MILES=/scratch/gpfs/GROUP/USER/project/miles-numa6
 MEMPROBE_DATA=/scratch/gpfs/GROUP/USER/tmp/flint_s5/memprobe_data   # a recorded batch for the schedule check
 export HOME=$TMPDIR/home TRITON_CACHE_DIR=$TMPDIR/triton TORCHINDUCTOR_CACHE_DIR=$TMPDIR/inductor
 export SGLANG_CACHE_DIR=$TMPDIR/sglang FLASHINFER_WORKSPACE_BASE=$TMPDIR/flashinfer
@@ -107,6 +107,9 @@ if [ -n "${T67_KL:-}" ]; then
   rm -f -- "$MA_REF_FILE"
   echo "[s5] loss: a KL to the original Flint at weight $T67_KL (low_var_kl), the reference scored during rollout"
 fi
+# skipfwd=1 (rl/rl_job.sh -> T67_SKIPFWD): the trainer skips the old-policy log-prob pass score centering never reads
+# (miles flint-grpo-kl-rollref-skipfwd); appended after the KL settings above, which set KL_TRAIN anew
+[ -z "${T67_SKIPFWD:-}" ] || { KL_TRAIN+=(--skip-actor-forward-only); echo "[s5] trainer: no separate old-policy log-prob pass (skipfwd=1)"; }
 # - milestones (train67 only): besides the newest 2 full checkpoints, the model part (DCP model/ and meta.json, ~149 GB;
 #   no optimizer) of every checkpoint iter_k with k % 20 == 0 stays, in $OUT/milestones/iter_k: hard links made by
 #   flint.miles_agent.log_rollout before its pruning deletes the checkpoint, and once more after train.py ends (the
@@ -399,6 +402,8 @@ if [ "$MODE" = args ]; then   # off-GPU: miles parses and checks each mode's arg
   T67_MODE=train67 T67_ASYNC=1 T67_ELASTIC=1 python3 "$REPO/rl/args_check.py" "${AK[@]}" || exit 1
   SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0 ENGINE_TP=4 write_engine_spec "$OUT/engine_spec_kl.json" "${AK[@]}" || exit 1
   REF_MEM_FRACTION=0.35 REF_MAX_TOKENS=100000 python3 "$REPO/rl/ref_engine_argv.py" "$OUT/engine_spec_kl.json" 20049 20040 || exit 1
+  echo "== train67 async with kl=0.01 and skipfwd=1: no separate old-policy log-prob pass (miles flint-grpo-kl-rollref-skipfwd)"
+  T67_MODE=train67 T67_ASYNC=1 T67_ELASTIC=1 python3 "$REPO/rl/args_check.py" "${AK[@]}" --skip-actor-forward-only || exit 1
   echo "== train67 schedule (B=$T67_B)"
   python3 "$REPO/rl/schedule_check.py" "$MEMPROBE_DATA/rollout_0.pt" --episodes "$T67_B" --group "$T67_G" \
     "${TRAIN[@]}" "${TRAIN67[@]}" "${MEMPROBE[@]}"

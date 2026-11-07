@@ -40,6 +40,8 @@ elif a.load_debug_rollout_data is None and os.environ.get("T67_ASYNC"):   # trai
     if a.use_kl_loss:   # kl=B (rl/rl_inner.sh): the reference scored during rollout by a server beside the rollout engine
         want |= {"ref_log_probs_from_rollout": True, "ref_load": None, "kl_loss_type": "low_var_kl",
                  "rollout_temperature": 1.0, "sglang_mem_fraction_static": 0.70, "sglang_swa_full_tokens_ratio": 0.1}
+    if getattr(a, "skip_actor_forward_only", False):   # skipfwd=1: only with score centering, the loss that never reads the pass
+        want |= {"loss_type": "score_centering", "kl_coef": 0}
 elif a.load_debug_rollout_data is None:   # the colocated RL run
     want |= {"colocate": True, "offload_train": True, "offload_rollout": True, "rollout_num_gpus_per_engine": 2,
              "use_session_server": "v2", "tito_model": "flint", "pause_generation_mode": "in_place",
