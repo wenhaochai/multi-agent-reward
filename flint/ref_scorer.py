@@ -147,21 +147,36 @@ def vocab_size_of(model_dir: str) -> int:
 
 CHECK_PROMPT_TOKENS = 3500   # with the 1,200 generated ones the sequence crosses the 4,096-token prefill chunk
 CHECK_NEW_TOKENS = 1200
+CHECK_JUMP = 0.1             # a position whose sampled log-prob differs this much from its neighbor's tests the shift
+CHECK_MIN_JUMPS = 30
+FCS_PROBLEMS = "/scratch/gpfs/GROUP/USER/project/Frontier-CS-v1.1/algorithmic/problems"
+
+
+def _check_prompt(tok) -> list[int]:
+    """Natural text, not a repeated paragraph: Frontier-CS problem statements in id order until 3,500 tokens (w1429's
+    check, 2026-11-06, repeated one paragraph; the model copied it at log-probs near 0, and a shift by one changed
+    almost nothing, so the shift test had no power)."""
+    text, ids = "", []
+    for d in sorted((x for x in os.listdir(FCS_PROBLEMS) if x.isdigit()), key=int):
+        f = os.path.join(FCS_PROBLEMS, d, "statement.txt")
+        if os.path.isfile(f):
+            text += open(f, errors="replace").read() + "\n\n"
+            ids = tok.encode(text)
+            if len(ids) >= CHECK_PROMPT_TOKENS:
+                break
+    assert len(ids) >= CHECK_PROMPT_TOKENS, f"check prompt: {len(ids)} tokens from {FCS_PROBLEMS}"
+    return ids[:CHECK_PROMPT_TOKENS]
 
 
 async def _check(url: str, model_dir: str) -> dict:
     """The server's own sampled tokens, scored again, come back with their sampling log-probs, also across the prefill
-    chunk boundary at 4,096 tokens; shifted by one position, they do not. Mean |diff| under 0.03 and its 99th percentile
-    under 0.5 (decode against prefill numerics; a router flip moves a single token), the shifted mean over 5x the mean."""
+    chunk boundary at 4,096 tokens: mean |diff| under 0.03 and its 99th percentile under 0.5 (decode against prefill
+    numerics; a router flip moves a single token). A shift by one position must show: on the positions whose sampled
+    log-prob differs from its neighbor's by over 0.1 (at least 30), the shifted mean |diff| is over 5x the aligned one."""
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
-    para = ("You are given an array of n integers and q queries; each query asks for the number of distinct values in a "
-            "range. Explain an offline algorithm, its complexity, and the data structures it needs, then write it in C++.\n")
-    prompt = []
-    while len(prompt) < CHECK_PROMPT_TOKENS:
-        prompt += tok.encode(para)
-    prompt = prompt[:CHECK_PROMPT_TOKENS]
+    prompt = _check_prompt(tok)
     scorer = RefScorer(url, vocab_size_of(model_dir))
     try:
         gen = await scorer._post({"input_ids": prompt, "return_logprob": True, "stream": False,
@@ -179,13 +194,15 @@ async def _check(url: str, model_dir: str) -> dict:
         if scorer._session is not None:
             await scorer._session.close()
     diff = [abs(a - b) for a, b in zip(scored, sampled)]
-    shifted = [abs(a - b) for a, b in zip(scored[1:], sampled[:-1])]
+    jumps = [i for i in range(1, len(sampled)) if abs(sampled[i] - sampled[i - 1]) > CHECK_JUMP]
+    aligned_j = sum(abs(scored[i] - sampled[i]) for i in jumps) / max(len(jumps), 1)
+    shifted_j = sum(abs(scored[i] - sampled[i - 1]) for i in jumps) / max(len(jumps), 1)
     srt = sorted(diff)
     res = {"tokens": len(ids), "crosses_chunk": len(tokens) > 4096, "mean_abs_diff": sum(diff) / len(diff),
-           "p99_abs_diff": srt[int(0.99 * (len(srt) - 1))], "max_abs_diff": srt[-1],
-           "shifted_mean_abs_diff": sum(shifted) / len(shifted)}
+           "p99_abs_diff": srt[int(0.99 * (len(srt) - 1))], "max_abs_diff": srt[-1], "jump_positions": len(jumps),
+           "aligned_mean_at_jumps": aligned_j, "shifted_mean_at_jumps": shifted_j}
     res["ok"] = (res["crosses_chunk"] and res["mean_abs_diff"] < 0.03 and res["p99_abs_diff"] < 0.5
-                 and res["shifted_mean_abs_diff"] > 5 * res["mean_abs_diff"])
+                 and len(jumps) >= CHECK_MIN_JUMPS and shifted_j > 5 * aligned_j)
     return res
 
 
