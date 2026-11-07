@@ -186,7 +186,9 @@ async def _check(url: str, model_dir: str) -> dict:
         tokens = prompt + ids
         # an empty radix cache, so the scoring prefill runs the whole sequence and crosses the 4,096-token chunk (the
         # cached prompt would otherwise leave only the 1,200 new tokens, one chunk; audit 2026-11-06)
-        async with scorer._session.post(url.rstrip("/") + "/flush_cache") as r:
+        # timeout: wait up to 30 s for the finished generation to leave the scheduler (at 0 SGLang answers 400 meanwhile;
+        # audit 2026-11-06)
+        async with scorer._session.post(url.rstrip("/") + "/flush_cache?timeout=30") as r:
             if r.status != 200:
                 raise RuntimeError(f"reference server {url}: /flush_cache answered {r.status}")
         scored = parse(await scorer._post(payload(tokens, len(ids))), tokens, len(ids), scorer.vocab_size)
