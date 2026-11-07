@@ -35,8 +35,8 @@
 #   train67_test   B episodes of 128k, 2 steps, a full checkpoint after each (host memory at its peak: the end of the
 #                  optimizer step and the save; step time), resumable in runs/train67_test[_NAME]_p<P>g<G>, exit 0
 #                  when done
-#   train67        the run, resumable in runs/train67[_NAME][_s<N>]_p<P>g<G>: checkpoints every 2 steps, the newest 2
-#                  kept, and the model part of every 20th in runs/<dir>/milestones/ (MA_RL_KEEP_EVERY, rl/rl_inner.sh)
+#   train67        the run, resumable in runs/train67[_NAME][_s<N>]_p<P>g<G>: checkpoints every 2 steps, the newest
+#                  kept (KEEP_CHECKPOINTS), and the model part of every 20th in runs/<dir>/milestones/ (MA_RL_KEEP_EVERY, rl/rl_inner.sh)
 # The first failure ends the job: nothing is retried. Results: tmp/flint_s5/runs/<job>/. One container with a PID
 # namespace of its own (--pid) holds everything (see rl/rollout_job.sh); bounds: timeout -s KILL around it, the GPU
 # watch (rl/gpu_watch.sh) and cleanup of only the process groups this job started (serving/check/procs.sh).

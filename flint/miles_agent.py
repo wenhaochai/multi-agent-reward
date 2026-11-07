@@ -268,6 +268,10 @@ def _keep_milestone(root: str, it: int, milestones: str) -> None:
     print(f"[flint] milestone {dst} (model only, hard links)", flush=True)
 
 
+KEEP_CHECKPOINTS = 1   # 2026-11-07 (team disk 100.5 of 125 TiB, ~445 GB a checkpoint): the newest, plus the tracker's
+                       # while miles writes the next one; the owner's rule keeps the last checkpoint only, to resume
+
+
 def _keep_newest_checkpoints(root: str, keep: int, every: int = 0) -> None:
     """Delete miles' checkpoints (root/iter_NNNNNNN) but the newest ``keep`` and the one the tracker names. With
     ``every`` > 0, each checkpoint whose iteration is a multiple of it first leaves its model part in
@@ -856,7 +860,7 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
     with open(os.path.join(out, "steps.jsonl"), "a") as f:
         f.write(json.dumps(rec) + "\n")
     print(f"[flint rollout {rollout_id}] {json.dumps(rec)}", flush=True)
-    _keep_newest_checkpoints(os.path.join(out, "actor"), 2, int(os.environ.get("MA_RL_KEEP_EVERY", "0") or 0))
+    _keep_newest_checkpoints(os.path.join(out, "actor"), KEEP_CHECKPOINTS, int(os.environ.get("MA_RL_KEEP_EVERY", "0") or 0))
     stop = _stop_rule(out, rollout_id)
     if stop and not os.path.exists(os.path.join(out, "stop_request")):
         open(os.path.join(out, "stop_request"), "w").write(f"3 rule: {stop}\n")   # rl/rl_job.sh: checkpoint, then stop

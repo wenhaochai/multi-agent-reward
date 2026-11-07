@@ -38,15 +38,15 @@ def listing(d):
     return sorted(os.path.relpath(os.path.join(a, f), d) for a, _, fs in os.walk(d) for f in fs)
 
 
-def run(every, steps=44):
+def run(every, steps=44, keep=2):
     out = tempfile.mkdtemp(dir=os.environ["TMPDIR"])
     root = os.path.join(out, "actor")
     os.makedirs(root)
     for r in range(steps):   # train.py: rollout r (log_rollout prunes), training step r, save iter_{r+1} if even
-        MA._keep_newest_checkpoints(root, 2, every)
+        MA._keep_newest_checkpoints(root, keep, every)
         if (r + 1) % 2 == 0:
             save(root, r + 1)
-    MA._keep_newest_checkpoints(root, 2, every)   # rl_inner.sh after train.py
+    MA._keep_newest_checkpoints(root, keep, every)   # rl_inner.sh after train.py
     return out, root
 
 
@@ -106,6 +106,30 @@ check("rl_inner.sh: MA_RL_KEEP_EVERY=20 for train67 only", '[ "$MODE" = train67 
       and src.count("MA_RL_KEEP_EVERY=") == 1)
 check("log_rollout passes MA_RL_KEEP_EVERY to the pruning",
       'int(os.environ.get("MA_RL_KEEP_EVERY", "0") or 0)' in open(os.path.join(ROOT, "flint", "miles_agent.py")).read())
+# KEEP_CHECKPOINTS = 1 (2026-11-07): the newest only, the tracker's one too while miles writes the next
+check("KEEP_CHECKPOINTS is 1, used by log_rollout and by rl_inner.sh's pass after train.py",
+      MA.KEEP_CHECKPOINTS == 1 and "KEEP_CHECKPOINTS, int(os.environ.get(\"MA_RL_KEEP_EVERY\"" in
+      open(os.path.join(ROOT, "flint", "miles_agent.py")).read() and "KEEP_CHECKPOINTS as n; k('$OUT/actor', n," in src)
+out1, root1 = run(20, keep=1)
+check("keep 1: iter_44 alone in actor/, whole; milestones 20 and 40",
+      sorted(os.listdir(root1)) == ["iter_0000044", "latest_checkpointed_iteration.txt"]
+      and listing(os.path.join(root1, "iter_0000044")) == full
+      and sorted(os.listdir(os.path.join(out1, "milestones"))) == ["iter_0000020", "iter_0000040"], os.listdir(root1))
+out3 = tempfile.mkdtemp(dir=os.environ["TMPDIR"])
+root3 = os.path.join(out3, "actor")
+os.makedirs(root3)
+save(root3, 16)
+save(root3, 18)
+save(root3, 20, tracker=False)
+MA._keep_newest_checkpoints(root3, 1, 20)
+check("keep 1, iter_20 in writing (tracker at 18): iter_18 and iter_20 stay, iter_16 goes, no milestone yet",
+      sorted(os.listdir(root3)) == ["iter_0000018", "iter_0000020", "latest_checkpointed_iteration.txt"]
+      and not os.path.exists(os.path.join(out3, "milestones", "iter_0000020")), os.listdir(root3))
+open(os.path.join(root3, "latest_checkpointed_iteration.txt"), "w").write("20")
+MA._keep_newest_checkpoints(root3, 1, 20)
+check("keep 1, once the tracker names iter_20: iter_20 alone, and its milestone",
+      sorted(os.listdir(root3)) == ["iter_0000020", "latest_checkpointed_iteration.txt"]
+      and os.path.isdir(os.path.join(out3, "milestones", "iter_0000020")), os.listdir(root3))
 r = subprocess.run(["bash", "-n", os.path.join(ROOT, "rl", "rl_inner.sh")], capture_output=True, text=True)
 check("rl_inner.sh parses", r.returncode == 0, r.stderr)
 done()

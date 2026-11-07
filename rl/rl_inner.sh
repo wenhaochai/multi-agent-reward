@@ -497,8 +497,9 @@ case "$MODE" in
 esac
 rc=$?
 echo "[s5] $(date -u +%FT%TZ) train.py exit $rc after $((SECONDS - t0)) s; $(tail -1 "$OUT/probe_start.log" 2>/dev/null)"
-if [ "${MA_RL_KEEP_EVERY:-0}" -gt 0 ]; then   # the milestone of a checkpoint written after the last rollout's hook
-  python3 -c "from flint.miles_agent import _keep_newest_checkpoints as k; k('$OUT/actor', 2, $MA_RL_KEEP_EVERY)" \
+if [ "${MA_RL_KEEP_EVERY:-0}" -gt 0 ]; then   # the milestone of a checkpoint written after the last rollout's hook,
+  # and the pruning after the last save (flint.miles_agent.KEEP_CHECKPOINTS: a stopped run leaves its newest only)
+  python3 -c "from flint.miles_agent import _keep_newest_checkpoints as k, KEEP_CHECKPOINTS as n; k('$OUT/actor', n, $MA_RL_KEEP_EVERY)" \
     || echo "[s5] milestone pass failed (the checkpoints are untouched)"
   echo "[s5] milestones: $(ls "$OUT/milestones" 2>/dev/null | tr '\n' ' ')"
 fi
