@@ -312,14 +312,16 @@ PY
 }
 # the long game as a miles agent on problem 0 (flint/miles_agent.py), sampling as in the eval; the engines return each
 # token's routed experts, incremental rows per turn (pause mode in_place); an episode the judge could not score takes
-# its group out of the loss (drop_failed_groups) and fails the rollout's check (log_rollout), which ends the run
+# its group out of the loss (drop_failed_groups) and fails the rollout's check (log_rollout), which ends the run.
+# 8 session servers, not miles' default 32: each holds sglang and torch (0.88 GiB of private memory before any session),
+# and the 32 of the async main line used 0.04 cores in all (2026-11-07, w1479); a session picks its server at random
 DATA=$OUT/data_p0.jsonl
 case "$MODE" in train67*) DATA=$OUT/data_train67.jsonl;; esac
 GAME=(--prompt-data "$DATA" --input-key prompt --label-key label --metadata-key metadata
   --rollout-temperature 1.0 --rollout-top-p 0.95 --rollout-top-k 20
   --rollout-max-response-len 16384 --max-seq-len 262144
   --custom-generate-function-path miles.rollout.generate_hub.agentic_tool_call.generate
-  --custom-agent-function-path flint.miles_agent.run --use-session-server v2 --tito-model flint
+  --custom-agent-function-path flint.miles_agent.run --use-session-server v2 --tito-model flint --session-server-workers 8
   --session-message-matcher flint.miles_agent.message_matches
   --sglang-tool-call-parser flint --sglang-reasoning-parser flint --pause-generation-mode in_place
   --rollout-sample-filter-path flint.miles_agent.drop_failed_groups
