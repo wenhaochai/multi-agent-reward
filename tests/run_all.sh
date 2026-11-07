@@ -48,6 +48,11 @@ SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif t test_cut
 # kl=B: the reference scoring (fake server) and the producer's compact routed experts
 SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif t test_ref_scorer PYTHONPATH="$MILES:$PWD" CUDA_VISIBLE_DEVICES=
 SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif t test_compact_experts PYTHONPATH="$MILES:$PWD" CUDA_VISIBLE_DEVICES=
+# 2026-11-07: the eight tests run_all.sh had left out (each passed alone in miles-v0.1.3.sif, no GPU)
+for x in test_elastic_rollout test_engine_registry test_export_ckpt test_flint_hf_grad test_flint_hf_tiny test_gpu_order \
+         test_inspect_verdict test_registry; do
+  SIF=/scratch/gpfs/GROUP/USER/project/miles-q38-build/miles-v0.1.3.sif t "$x" PYTHONPATH="$MILES:$PWD" CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=6
+done
 rm -rf "$TMPDIR"
 echo "${#fail[@]} failed${fail:+: ${fail[*]}}"
 [ ${#fail[@]} -eq 0 ]
