@@ -9,6 +9,8 @@ import sys
 from collections import defaultdict
 
 d = sys.argv[1]
+if not os.path.exists(os.path.join(d, "train.log")):   # the run stopped before training started (a failed
+    sys.exit(f"[steps] no train.log in {d}: no step ran")       # start check): no table, no traceback
 steps = defaultdict(dict)
 line_re = re.compile(r"\b(step|perf) (\d+): (\{.*\})\s*$")
 for line in open(os.path.join(d, "train.log"), errors="replace"):
