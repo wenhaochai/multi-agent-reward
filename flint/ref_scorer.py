@@ -168,11 +168,23 @@ def _check_prompt(tok) -> list[int]:
     return ids[:CHECK_PROMPT_TOKENS]
 
 
+CHECK_GROSS = 0.25           # mean |decode - prefill| above this is a wrong model or a wrong position, not numerics
+CHECK_REPEAT = 1e-5          # the run's request against the same sequence scored from position 0
+
+
 async def _check(url: str, model_dir: str) -> dict:
-    """The server's own sampled tokens, scored again, come back with their sampling log-probs, also across the prefill
-    chunk boundary at 4,096 tokens: mean |diff| under 0.03 and its 99th percentile under 0.5 (decode against prefill
-    numerics; a router flip moves a single token). A shift by one position must show: on the positions whose sampled
-    log-prob differs from its neighbor's by over 0.1 (at least 30), the shifted mean |diff| is over 5x the aligned one."""
+    """The server's own 1,200 sampled tokens, scored as the run scores them (from P - 1, across the 4,096-token prefill
+    chunk), against what the server returned while sampling them. Three tests:
+    - alignment: on the positions whose sampled log-prob moves by over 0.1 from its neighbor's (at least 30), the scores
+      shifted by one position are over 5x farther from the sampled log-probs than the aligned ones;
+    - reproducible scoring: the same sequence scored from position 0 (other log-prob chunk edges, the cached prompt
+      gone) gives the same response log-probs within 1e-5;
+    - no gross error: mean |decode - prefill| under 0.25.
+    Decode and prefill do not agree closely, and need not: their kernels differ in shape, and Flint's 256-expert routing
+    flips under the difference (w1469, 2026-11-06, on this check's prompt: mean 0.078, median 0.014, 99th percentile
+    0.74, max 12.2, largest in the first 100 tokens, where the text is least predictable; 0.060 when sampling the full
+    distribution; prefill repeated, from the radix cache and from position 0 agree exactly). The reference scores are
+    prefill alone; miles' Megatron reference also routes on its own (no replay)."""
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
@@ -192,6 +204,11 @@ async def _check(url: str, model_dir: str) -> dict:
             if r.status != 200:
                 raise RuntimeError(f"reference server {url}: /flush_cache answered {r.status}")
         scored = parse(await scorer._post(payload(tokens, len(ids))), tokens, len(ids), scorer.vocab_size)
+        whole = await scorer._post(dict(payload(tokens, len(ids)), logprob_start_len=0))
+        entries = whole["meta_info"]["input_token_logprobs"]
+        if len(entries) != len(tokens):
+            raise ValueError(f"reference check: {len(entries)} input log-probs from position 0 for {len(tokens)} tokens")
+        again = [float(e[0]) for e in entries[len(prompt):]]
     finally:
         if scorer._session is not None:
             await scorer._session.close()
@@ -201,10 +218,11 @@ async def _check(url: str, model_dir: str) -> dict:
     shifted_j = sum(abs(scored[i] - sampled[i - 1]) for i in jumps) / max(len(jumps), 1)
     srt = sorted(diff)
     res = {"tokens": len(ids), "crosses_chunk": len(tokens) > 4096, "mean_abs_diff": sum(diff) / len(diff),
-           "p99_abs_diff": srt[int(0.99 * (len(srt) - 1))], "max_abs_diff": srt[-1], "jump_positions": len(jumps),
-           "aligned_mean_at_jumps": aligned_j, "shifted_mean_at_jumps": shifted_j}
-    res["ok"] = (res["crosses_chunk"] and res["mean_abs_diff"] < 0.03 and res["p99_abs_diff"] < 0.5
-                 and len(jumps) >= CHECK_MIN_JUMPS and shifted_j > 5 * aligned_j)
+           "median_abs_diff": srt[len(srt) // 2], "p99_abs_diff": srt[int(0.99 * (len(srt) - 1))], "max_abs_diff": srt[-1],
+           "jump_positions": len(jumps), "aligned_mean_at_jumps": aligned_j, "shifted_mean_at_jumps": shifted_j,
+           "repeat_max_abs_diff": max(abs(a - b) for a, b in zip(scored, again))}
+    res["ok"] = (res["crosses_chunk"] and len(jumps) >= CHECK_MIN_JUMPS and shifted_j > 5 * aligned_j
+                 and res["repeat_max_abs_diff"] <= CHECK_REPEAT and res["mean_abs_diff"] < CHECK_GROSS)
     return res
 
 

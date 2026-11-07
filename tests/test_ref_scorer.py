@@ -220,4 +220,62 @@ check("hook: with a scorer the group comes back scored", out is entry and s.ref_
       [lp(t, 7 + i) for i, t in enumerate(s.tokens[7:])], s.ref_log_probs)
 check("the fake model's scores are finite and differ by position", all(math.isfinite(x) for x in s.ref_log_probs)
       and len(set(s.ref_log_probs)) == len(s.ref_log_probs))
+
+
+# (6) the startup check (2026-11-06) against a fake SGLang that samples and scores: a log-prob that moves a lot from one
+# position to the next (so the shift test has power), decode = prefill +- 0.01; the check passes on that and fails on
+# scores one position off, on a from-0 rescoring that differs by 1e-3, and on scores 0.5 off (aligned and repeatable)
+FLINT = "/scratch/gpfs/GROUP/USER/project/labs-molt/_workspace/models/flint"
+
+
+def flp(t, i):
+    return -((t * 7919 + i * 104729) % 1000) / 100.0
+
+
+class FakeLM:
+    def __init__(self, mode):
+        self.mode, self.flushes = mode, 0
+
+    async def generate(self, request):
+        body = await request.json()
+        ids, n = body["input_ids"], body["sampling_params"]["max_new_tokens"]
+        if n > 0:
+            new = [(k * 31) % 997 + 3 for k in range(n)]
+            out = [[flp(t, len(ids) + k) + (0.01 if k % 2 else -0.01), t, None] for k, t in enumerate(new)]
+            return web.json_response({"meta_info": {"output_token_logprobs": out}})
+        start = body["logprob_start_len"]
+        ent = [[None, ids[start], None]]
+        for i in range(start + 1, len(ids)):
+            v = flp(ids[i - 1], i - 1) if self.mode == "shifted" else flp(ids[i], i)
+            v += 0.5 if self.mode == "gross" else 0.0
+            v += 1e-3 if self.mode == "unrepeatable" and start == 0 else 0.0
+            ent.append([v, ids[i], None])
+        return web.json_response({"meta_info": {"input_token_logprobs": ent}})
+
+    async def flush(self, request):
+        self.flushes += 1
+        return web.Response(text="ok")
+
+
+async def run_check(fake):
+    app = web.Application(); app.router.add_post("/generate", fake.generate); app.router.add_post("/flush_cache", fake.flush)
+    runner = web.AppRunner(app); await runner.setup()
+    port = free_port(); site = web.TCPSite(runner, "127.0.0.1", port); await site.start()
+    try:
+        return await RS._check(f"http://127.0.0.1:{port}", FLINT)
+    finally:
+        await runner.cleanup()
+
+
+res = {m: (lambda f: (asyncio.run(run_check(f)), f.flushes))(FakeLM(m)) for m in ("good", "shifted", "unrepeatable", "gross")}
+g = res["good"][0]
+check("check: aligned, repeatable, 0.01 apart: OK (crosses the chunk, the cache flushed once)", g["ok"] and g["crosses_chunk"]
+      and g["jump_positions"] >= RS.CHECK_MIN_JUMPS and g["repeat_max_abs_diff"] == 0 and res["good"][1] == 1, g)
+check("check: scores one position off fail (the shift test)", not res["shifted"][0]["ok"]
+      and res["shifted"][0]["shifted_mean_at_jumps"] < res["shifted"][0]["aligned_mean_at_jumps"], res["shifted"][0])
+check("check: a from-0 rescoring 1e-3 off fails (repeatable scoring)", not res["unrepeatable"][0]["ok"]
+      and abs(res["unrepeatable"][0]["repeat_max_abs_diff"] - 1e-3) < 1e-9, res["unrepeatable"][0])
+check("check: scores 0.5 off fail on the gross bound alone", not res["gross"][0]["ok"]
+      and res["gross"][0]["shifted_mean_at_jumps"] > 5 * res["gross"][0]["aligned_mean_at_jumps"]
+      and res["gross"][0]["repeat_max_abs_diff"] == 0 and res["gross"][0]["mean_abs_diff"] > RS.CHECK_GROSS, res["gross"][0])
 done()
