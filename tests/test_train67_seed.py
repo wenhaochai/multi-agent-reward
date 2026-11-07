@@ -168,6 +168,18 @@ lev = {("train67", "2", "8", "160", "set=signal34", "levers=tp4,gate"):
 for a, want in lev.items():
     rc, out = job(*a)
     check(f"rl_job {' '.join(a)}: {want.split('/')[-1]}", rc == 0 and out.endswith(want), out)
+# tag=NAME (2026-11-07): a test's own run dir, last in the name; refused when malformed or outside the train67 modes
+for a, want in {("train67_test", "set=signal34", "tag=if64"): f"SEED=67 OUT={R}/train67_test_signal34_if64_p4g8",
+                 ("train67_test", "set=signal34", "levers=tp4", "tag=if64"):
+                     f"SEED=67 OUT={R}/train67_test_signal34_ktp4_if64_p4g8 LEVERS=tp4",
+                 ("train67", "4", "8", "80", "set=signal34", "seed=68", "tag=lr-half"):
+                     f"SEED=68 OUT={R}/train67_signal34_s68_lr-half_p4g8"}.items():
+    rc, out = job(*a)
+    check(f"rl_job {' '.join(a)}: {want.split('/')[-1]}", rc == 0 and out.endswith(want), out)
+for a in (("train67_test", "tag="), ("train67_test", "tag=A"), ("train67_test", "tag=a_b"), ("train67_test", "tag=a b"),
+          ("train67_test", "tag=-a"), ("train67_test", "tag=" + "a" * 25), ("run20", "tag=x"), ("smoke", "tag=x")):
+    rc, out = job(*a)
+    check(f"rl_job {' '.join(a)}: refused", rc != 0 and "OUT=" not in out, out)
 rc, out = job("train67", "2", "8", "160", "set=signal34")
 check("rl_job without levers: no LEVERS field, the w765 run dir", rc == 0 and "LEVERS" not in out
       and out.endswith(f"OUT={R}/train67_signal34_p2g8"), out)

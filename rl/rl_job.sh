@@ -52,6 +52,7 @@ case "$MODE" in smoke|smoke_tp4|smoke_tp8) LIMIT=4800;; train67_smoke) LIMIT=600
 # this order
 T67_SET= T67_SEED= SEED_GIVEN= T67_LEVERS= LEVERS_GIVEN= T67_CMD_TIMEOUT= CMDT_GIVEN= T67_MALLOC= MALLOC_GIVEN= T67_ELASTIC= ELASTIC_GIVEN=
 T67_ASYNC= ASYNC_GIVEN= T67_STALE= STALE_GIVEN= T67_PLACE= PLACE_GIVEN= T67_NOSAVE= NOSAVE_GIVEN= T67_INFLIGHT= INFLIGHT_GIVEN= T67_ORDER= ORDER_GIVEN= T67_DUP_END= DUPEND_GIVEN= T67_KL= KL_GIVEN= T67_PROFILE= PROFILE_GIVEN= T67_CUT_ZERO= CUTZERO_GIVEN= POS=() T67_SKIPFWD= SKIPFWD_GIVEN=
+T67_NAME= NAME_GIVEN=
 for x in "${@:2}"; do
   case "$x" in set=*) T67_SET=${x#set=};; seed=*) T67_SEED=${x#seed=} SEED_GIVEN=1;;
     levers=*) T67_LEVERS=${x#levers=} LEVERS_GIVEN=1;; cmdtimeout=*) T67_CMD_TIMEOUT=${x#cmdtimeout=} CMDT_GIVEN=1;;
@@ -66,6 +67,7 @@ for x in "${@:2}"; do
     place=*) T67_PLACE=${x#place=} PLACE_GIVEN=1;; save=0) T67_NOSAVE=1 NOSAVE_GIVEN=1;;
     inflight=*) T67_INFLIGHT=${x#inflight=} INFLIGHT_GIVEN=1;;
     order=*) T67_ORDER=${x#order=} ORDER_GIVEN=1;;
+    tag=*) T67_NAME=${x#tag=} NAME_GIVEN=1;;
     *) POS+=("$x");; esac
 done
 T67_P=${POS[0]:-4} T67_G=${POS[1]:-8} T67_STEPS=${POS[2]:-40}
@@ -114,8 +116,10 @@ case "$MODE" in train67*) [[ $T67_P =~ ^[1-9][0-9]*$ && $T67_G =~ ^[1-9][0-9]*$ 
   # order=oldest: a drain takes the oldest weight version first and waits for an older group in flight when it must, so no group is dropped as stale. Not in the run dir: a run can take it at a resume.
   [ -z "$ORDER_GIVEN" ] || { [ -n "$STALE_GIVEN" ] && [ "$T67_ORDER" = oldest ]; } || { echo "order=oldest goes with async=1 and stale=N: $T67_ORDER"; exit 1; }
   [ -z "$INFLIGHT_GIVEN" ] || { [ -n "$ASYNC_GIVEN" ] && [[ $T67_INFLIGHT =~ ^[1-9][0-9]?$ ]]; } || { echo "inflight=N (1-99) goes with async=1: $T67_INFLIGHT"; exit 1; }
+  # tag=NAME: a test of its own (its own run dir), e.g. two smokes of one setup that differ in inflight=N
+  [ -z "$NAME_GIVEN" ] || [[ $T67_NAME =~ ^[a-z0-9][a-z0-9-]{0,23}$ ]] || { echo "tag=NAME (a-z, 0-9, -; up to 24): $T67_NAME"; exit 1; }
   ;;
-  *) [ -z "$T67_SET$SEED_GIVEN$LEVERS_GIVEN$CMDT_GIVEN$DUPEND_GIVEN$KL_GIVEN$CUTZERO_GIVEN$SKIPFWD_GIVEN$PROFILE_GIVEN$MALLOC_GIVEN$ELASTIC_GIVEN$ASYNC_GIVEN$STALE_GIVEN$PLACE_GIVEN$NOSAVE_GIVEN$INFLIGHT_GIVEN$ORDER_GIVEN" ] || { echo "set=NAME, seed=N, levers=LIST, cmdtimeout=N, dupend=N, kl=B, cutzero=1, malloc=keep, order=oldest, elastic=1, async=1 and stale=N are for the train67 modes only, not $MODE"; exit 1; };; esac
+  *) [ -z "$T67_SET$SEED_GIVEN$LEVERS_GIVEN$CMDT_GIVEN$DUPEND_GIVEN$KL_GIVEN$CUTZERO_GIVEN$SKIPFWD_GIVEN$PROFILE_GIVEN$MALLOC_GIVEN$ELASTIC_GIVEN$ASYNC_GIVEN$STALE_GIVEN$PLACE_GIVEN$NOSAVE_GIVEN$INFLIGHT_GIVEN$ORDER_GIVEN$NAME_GIVEN" ] || { echo "set=NAME, seed=N, levers=LIST, cmdtimeout=N, dupend=N, kl=B, cutzero=1, malloc=keep, order=oldest, elastic=1, async=1 and stale=N are for the train67 modes only, not $MODE"; exit 1; };; esac
 T67_CMD_TIMEOUT=${T67_CMD_TIMEOUT:-60}
 # seed=N (default 67: the run as before, byte for byte): the data order (rl/train67_data.py: epoch e is the permutation
 # of random.Random(N + e)) and miles' seeds (rl/rl_inner.sh: --seed 1 + 100 (N - 67), the actor's torch seed and the
@@ -154,6 +158,8 @@ T67_TAG=${T67_SET:+_$T67_SET}
 [ -z "$T67_ELASTIC" ] || T67_TAG=${T67_TAG}_e
 # async=1: another layout and estimator, so its own run dir too (_a, or _a<N> with a staleness bound)
 [ -z "$T67_ASYNC" ] || T67_TAG=${T67_TAG}_a$T67_STALE
+# tag=NAME: its own run dir, last in the name
+[ -z "$T67_NAME" ] || T67_TAG=${T67_TAG}_$T67_NAME
 [ "$MODE" = train67 ] && OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/train67${T67_TAG}_p${T67_P}g${T67_G}
 [ "$MODE" = train67_test ] && OUT=/scratch/gpfs/GROUP/USER/tmp/flint_s5/runs/train67_test${T67_TAG}_p${T67_P}g${T67_G}
 RESUMABLE=; case "$MODE" in run20|train67|train67_test) RESUMABLE=1;; esac
