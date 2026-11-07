@@ -294,15 +294,21 @@ def _over_cap(samples, cap: int) -> bool:
     return cap > 0 and any(len(s.tokens) > cap for s in samples)
 
 
+def group_leaves_the_loss(samples) -> bool:
+    """drop_failed_groups' rule for one group's samples: a failed episode, or a sample over MA_RL_MAX_SAMPLE_TOKENS.
+    The reference scoring of kl=B (flint.elastic_rollout) applies the same rule before the filter runs: such a group's
+    samples train nothing, and one over the cap may not fit the reference server's KV pool."""
+    return any((s.metadata or {}).get("flint_failed") for s in samples) or _over_cap(samples, _sample_cap())
+
+
 def drop_failed_groups(args, data) -> None:
     """miles' sample filter: every sample of a group with a failed episode leaves the loss, and (2026-11-02) every
     sample of a group with a sample over MA_RL_MAX_SAMPLE_TOKENS: the 110,000-character context cap assumes ~0.31
     tokens per history character, and problem 177's history runs at ~0.6 (w793 rollout 3: 78,151 tokens; it used to
     end the run). A group holds one entry per episode, a list of the episode's samples (one per session-tree leaf)."""
-    cap = _sample_cap()
     for group in data:
         samples = _samples(group)
-        if any((s.metadata or {}).get("flint_failed") for s in samples) or _over_cap(samples, cap):
+        if group_leaves_the_loss(samples):
             for s in samples:
                 s.remove_sample = True
     if int(os.environ.get("MA_LG_DUP_END") or "0"):

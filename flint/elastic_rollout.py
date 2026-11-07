@@ -481,9 +481,9 @@ class ElasticFullyAsyncRolloutFn(FullyAsyncRolloutFn):
 
     async def _generate_group(self, prompt_group):
         entry = await super()._generate_group(prompt_group)
+        compact_routed_experts(entry.group)   # first: a group waits for the reference server holding the small arrays
         if self._ref is not None:
             await self._ref.score_group(entry.group)
-        compact_routed_experts(entry.group)
         return entry
 
     def _submit_one_group(self):

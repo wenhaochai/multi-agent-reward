@@ -33,7 +33,8 @@ import aiohttp
 
 RETRIES = 6
 BACKOFF_S = (5, 15, 30, 60, 120, 300)
-REQUEST_TIMEOUT_S = 1800.0      # one sample of up to ~150k tokens, queued behind others on a shared GPU
+REQUEST_TIMEOUT_S = 600.0       # one sample of up to 70k tokens behind at most one other (audit 2026-11-06: a server that
+                                # took requests and never answered held a group 7 x 30 min, past the GPU watch)
 CONCURRENCY = int(os.environ.get("MA_REF_CONCURRENCY", "2"))
 
 
@@ -104,32 +105,62 @@ class RefScorer:
         reply = await self._post(payload(s.tokens, s.response_length))
         s.ref_log_probs = parse(reply, s.tokens, s.response_length, self.vocab_size)
 
-    async def score_group(self, group) -> None:
-        """Fill ref_log_probs on every sample of a finished group (the samples of one GRPO group's episodes)."""
-        samples = [s for s in _samples(group) if getattr(s, "ref_log_probs", None) is None]
+    async def score_group(self, group) -> str:
+        """Fill ref_log_probs on every sample of a finished group (the samples of one GRPO group's episodes). A group
+        with an aborted sample is skipped: miles' buffer rejects it (apply_aborted_filter). A group the sample filter
+        will take out of the loss (flint.miles_agent.group_leaves_the_loss: a failed episode or a sample over the
+        actor's cap, which may not fit the server's KV pool either) gets zeros: its loss mask becomes 0, so the KL
+        never reads them, and the train data still needs a reference per sample. Returns what it did."""
+        from flint.miles_agent import group_leaves_the_loss
+
+        every = _samples(group)
+        if any(str(getattr(s.status, "value", s.status)).lower() == "aborted" for s in every):
+            what = "skipped (aborted)"
+            todo = []
+        elif group_leaves_the_loss(every):
+            for s in every:
+                if getattr(s, "ref_log_probs", None) is None:
+                    s.ref_log_probs = [0.0] * s.response_length
+            what = "zeros (the group leaves the loss)"
+            todo = []
+        else:
+            what = "scored"
+            todo = [s for s in every if getattr(s, "ref_log_probs", None) is None]
         t0 = time.monotonic()
-        await asyncio.gather(*(self.score_sample(s) for s in samples))
+        await asyncio.gather(*(self.score_sample(s) for s in todo))
         if self.log_path:
-            rec = {"time": time.time(), "samples": len(samples), "tokens": sum(len(s.tokens) for s in samples),
-                   "response_tokens": sum(s.response_length for s in samples), "seconds": round(time.monotonic() - t0, 1)}
+            rec = {"time": time.time(), "what": what, "samples": len(todo), "tokens": sum(len(s.tokens) for s in todo),
+                   "response_tokens": sum(s.response_length for s in todo), "seconds": round(time.monotonic() - t0, 1)}
             with open(self.log_path, "a") as f:
                 f.write(json.dumps(rec) + "\n")
+        return what
 
 
 def vocab_size_of(model_dir: str) -> int:
     return int(json.load(open(os.path.join(model_dir, "config.json")))["vocab_size"])
 
 
+CHECK_PROMPT_TOKENS = 3500   # with the 1,200 generated ones the sequence crosses the 4,096-token prefill chunk
+CHECK_NEW_TOKENS = 1200
+
+
 async def _check(url: str, model_dir: str) -> dict:
-    """The server's own sampled tokens, scored again, come back with their sampling log-probs; shifted by one, not."""
+    """The server's own sampled tokens, scored again, come back with their sampling log-probs, also across the prefill
+    chunk boundary at 4,096 tokens; shifted by one position, they do not. Mean |diff| under 0.03 and its 99th percentile
+    under 0.5 (decode against prefill numerics; a router flip moves a single token), the shifted mean over 5x the mean."""
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
-    prompt = tok.encode("Write a C++ function that returns the number of set bits in a 64-bit integer.\n")
+    para = ("You are given an array of n integers and q queries; each query asks for the number of distinct values in a "
+            "range. Explain an offline algorithm, its complexity, and the data structures it needs, then write it in C++.\n")
+    prompt = []
+    while len(prompt) < CHECK_PROMPT_TOKENS:
+        prompt += tok.encode(para)
+    prompt = prompt[:CHECK_PROMPT_TOKENS]
     scorer = RefScorer(url, vocab_size_of(model_dir))
     try:
         gen = await scorer._post({"input_ids": prompt, "return_logprob": True, "stream": False,
-                                  "sampling_params": {"max_new_tokens": 64, "temperature": 1.0, "ignore_eos": True}})
+                                  "sampling_params": {"max_new_tokens": CHECK_NEW_TOKENS, "temperature": 1.0, "ignore_eos": True}})
         out = gen["meta_info"]["output_token_logprobs"]
         ids, sampled = [int(e[1]) for e in out], [float(e[0]) for e in out]
         tokens = prompt + ids
@@ -139,9 +170,12 @@ async def _check(url: str, model_dir: str) -> dict:
             await scorer._session.close()
     diff = [abs(a - b) for a, b in zip(scored, sampled)]
     shifted = [abs(a - b) for a, b in zip(scored[1:], sampled[:-1])]
-    res = {"tokens": len(ids), "mean_abs_diff": sum(diff) / len(diff), "max_abs_diff": max(diff),
+    srt = sorted(diff)
+    res = {"tokens": len(ids), "crosses_chunk": len(tokens) > 4096, "mean_abs_diff": sum(diff) / len(diff),
+           "p99_abs_diff": srt[int(0.99 * (len(srt) - 1))], "max_abs_diff": srt[-1],
            "shifted_mean_abs_diff": sum(shifted) / len(shifted)}
-    res["ok"] = res["mean_abs_diff"] < 0.02 and res["max_abs_diff"] < 0.25 and res["shifted_mean_abs_diff"] > 5 * res["mean_abs_diff"]
+    res["ok"] = (res["crosses_chunk"] and res["mean_abs_diff"] < 0.03 and res["p99_abs_diff"] < 0.5
+                 and res["shifted_mean_abs_diff"] > 5 * res["mean_abs_diff"])
     return res
 
 

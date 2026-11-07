@@ -31,8 +31,12 @@ def lp(token, pos):
     return -0.001 * token - 0.01 * pos - 0.1
 
 
-def sample(tokens, response_length, index=0):
-    return SimpleNamespace(tokens=list(tokens), response_length=response_length, index=index, ref_log_probs=None)
+os.environ["MA_RL_MAX_SAMPLE_TOKENS"] = "200"   # the actor's cap (rl_inner.sh: 70,000), small for the tests
+
+
+def sample(tokens, response_length, index=0, status="completed", failed=False):
+    return SimpleNamespace(tokens=list(tokens), response_length=response_length, index=index, ref_log_probs=None,
+                           status=SimpleNamespace(value=status), metadata={"flint_failed": True} if failed else {})
 
 
 # (1) the request
@@ -130,6 +134,35 @@ rec = [json.loads(x) for x in open(log)]
 check("group: one log line (samples, tokens, response tokens, seconds)",
       len(rec) == 1 and rec[0]["samples"] == 4 and rec[0]["response_tokens"] == 25 + 9 + 31 and rec[0]["tokens"] == 39 + 29 + 40 + 3, rec)
 check("retry: a 503 once, then the answer", fake.calls == 4 and all(s.ref_log_probs is not None for s in flat))
+
+
+async def run_one(url, group):
+    scorer = RS.RefScorer(url, VOCAB)
+    try:
+        return await scorer.score_group(group)
+    finally:
+        if scorer._session is not None:
+            await scorer._session.close()
+
+
+quiet = Fake()
+aborted = [[sample(range(1, 30), 9), sample(range(1, 30), 9, status="aborted")]]
+what = asyncio.run(with_server(quiet, lambda url: run_one(url, aborted)))
+check("a group with an aborted sample is skipped (miles' buffer rejects it): no request, no scores",
+      what.startswith("skipped") and quiet.calls == 0 and all(s.ref_log_probs is None for s in aborted[0]), (what, quiet.calls))
+over = [sample(range(1, 250), 30), sample(range(1, 40), 7)]   # 249 tokens > the cap of 200
+what = asyncio.run(with_server(quiet, lambda url: run_one(url, over)))
+check("a group with a sample over the actor's cap gets zeros, unscored (the filter takes it out of the loss)",
+      what.startswith("zeros") and quiet.calls == 0 and over[0].ref_log_probs == [0.0] * 30 and over[1].ref_log_probs == [0.0] * 7,
+      (what, quiet.calls))
+failed = [[sample(range(1, 40), 7, failed=True)], sample(range(1, 40), 5)]
+what = asyncio.run(with_server(quiet, lambda url: run_one(url, failed)))
+check("a group with a failed episode gets zeros, unscored", what.startswith("zeros") and quiet.calls == 0
+      and failed[1].ref_log_probs == [0.0] * 5, (what, quiet.calls))
+from flint import miles_agent as MAG  # noqa: E402
+
+check("the scorer's rule is the sample filter's (flint.miles_agent.group_leaves_the_loss)",
+      MAG.group_leaves_the_loss(over) and MAG.group_leaves_the_loss([failed[0][0]]) and not MAG.group_leaves_the_loss([sample(range(1, 40), 7)]))
 
 
 def raises(fake):

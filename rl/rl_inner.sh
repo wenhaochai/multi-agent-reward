@@ -235,8 +235,13 @@ if [ -n "${T67_ASYNC:-}" ]; then
   # order=oldest (rl/rl_job.sh -> T67_ORDER): a drain takes the oldest weight version first and waits for an older group when it must (flint.elastic_rollout.OldestFirstDataBuffer)
   [ -z "${T67_ORDER:-}" ] || ASYNC+=(--custom-async-data-buffer-path flint.elastic_rollout.OldestFirstDataBuffer)
   echo "[s5] async: actor 4 GPUs, own engine 1 x TP4, $MA_ASYNC_SAMPLES_PER_ENGINE episodes per engine in flight, TIS, staleness bound ${T67_STALE:-none}${T67_ORDER:+, drains $T67_ORDER first}"
-  # kl=B: the rollout engine shares its GPUs with the reference server (KL_TRAIN above; later flags win in miles' parser)
-  [ -z "${T67_KL:-}" ] || ASYNC+=(--sglang-mem-fraction-static 0.80 --sglang-swa-full-tokens-ratio 0.1)
+  # kl=B: the rollout engine shares its GPUs with the reference server (KL_TRAIN above; later flags win in miles' parser).
+  # SGLang keeps (1 - mem fraction) of the memory free at the engine's own start (pool_configurator: slack =
+  # pre_model_load_memory x (1 - mem_fraction_static)), and the reference server holds ~23 GB by then: 0.70 keeps
+  # ~16 GB for the engine's own buffers (~4.2 GB), CUDA graphs (~3.1), the weight push (~2.9) and the reference
+  # server's scoring (~0.7 at 512-row log-prob chunks), and leaves a KV pool of ~19 GB, ~2.2M full-attention tokens
+  # (audit 2026-11-06: at 0.80 the slack is ~10.6 GB and the first scored group runs a GPU out of memory)
+  [ -z "${T67_KL:-}" ] || ASYNC+=(--sglang-mem-fraction-static 0.70 --sglang-swa-full-tokens-ratio 0.1)
 fi
 # kl=B: the reference server (rl/ref_engine_argv.py: the run's own engine's arguments, the original Flint, a KV pool
 # for one sample at a time) on the GPUs miles gives its own engine (the last 4 of MILES_GPU_ORDER or of this job's
@@ -245,7 +250,8 @@ fi
 # Prints the URL the producer reads (MA_REF_URL); its log is $OUT/ref_engine.log, its per-group scoring $OUT/ref_scoring.jsonl.
 start_ref_engine() {
   local gpus base port out env_line argv_line t0=$SECONDS
-  IFS=, read -r -a gpus <<< "${MILES_GPU_ORDER:-$CUDA_VISIBLE_DEVICES}"
+  # miles orders the GPUs by MILES_GPU_ORDER, else by id (placement_group.py): without an order, sort this job's list
+  IFS=, read -r -a gpus <<< "${MILES_GPU_ORDER:-$(tr , '\n' <<< "$CUDA_VISIBLE_DEVICES" | sort -n | paste -sd,)}"
   [ ${#gpus[@]} -eq 8 ] || { echo "[s5] ref: 8 GPUs expected, got ${gpus[*]}"; return 1; }
   base=$(python3 - <<'PY'
 import random, socket
@@ -263,13 +269,17 @@ PY
 )
   [ -n "$base" ] || { echo "[s5] ref: no free ports"; return 1; }
   port=$((base + 9))
-  out=$(REF_MEM_FRACTION=0.35 REF_MAX_TOKENS=160000 python3 "$REPO/rl/ref_engine_argv.py" "$OUT/engine_spec.json" "$port" "$base") \
+  # a KV pool for one sample of up to MA_RL_MAX_SAMPLE_TOKENS (70k; a group with a longer one is not scored) and its
+  # prefix in the radix cache
+  out=$(REF_MEM_FRACTION=0.35 REF_MAX_TOKENS=100000 python3 "$REPO/rl/ref_engine_argv.py" "$OUT/engine_spec.json" "$port" "$base") \
     || { echo "[s5] ref: argv failed: $out"; return 1; }
   env_line=$(grep '^ENV ' <<< "$out" | cut -d' ' -f2-) argv_line=$(grep '^ARGV ' <<< "$out" | cut -d' ' -f2-)
   echo "[s5] ref: differs from the run's own engine in: $(grep '^DIFF ' <<< "$out" | cut -d' ' -f2-)"
   (
     for kv in $env_line; do export "$kv"; done
-    export CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${gpus[*]:4:4}")" SGLANG_CACHE_DIR=$TMPDIR/sglang_ref FLASHINFER_WORKSPACE_BASE=$TMPDIR/flashinfer_ref
+    # 512-row log-prob chunks: a 2,048-row chunk of fp32 logits over 150,144 tokens takes ~2.6 GB at its peak, ~0.7 here
+    export CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${gpus[*]:4:4}")" SGLANG_CACHE_DIR=$TMPDIR/sglang_ref FLASHINFER_WORKSPACE_BASE=$TMPDIR/flashinfer_ref \
+      SGLANG_LOGPROB_CHUNK_SIZE=512
     eval "exec $argv_line"
   ) > "$OUT/ref_engine.log" 2>&1 &
   REF_PID=$!
@@ -385,10 +395,10 @@ if [ "$MODE" = args ]; then   # off-GPU: miles parses and checks each mode's arg
   python3 "$REPO/rl/elastic_engine_argv.py" "$OUT/engine_spec.json" 172.17.0.1 20040 20000 10 || exit 1
   echo "== train67 async with kl=0.01: the KL loss read from the rollout's reference scores (miles flint-grpo-kl-rollref), the rollout engine beside the reference server, and the reference server's argv"
   AK=("${A[@]}" --use-kl-loss --kl-loss-coef 0.01 --kl-loss-type low_var_kl --ref-log-probs-from-rollout
-    --sglang-mem-fraction-static 0.80 --sglang-swa-full-tokens-ratio 0.1)
+    --sglang-mem-fraction-static 0.70 --sglang-swa-full-tokens-ratio 0.1)
   T67_MODE=train67 T67_ASYNC=1 T67_ELASTIC=1 python3 "$REPO/rl/args_check.py" "${AK[@]}" || exit 1
   SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0 ENGINE_TP=4 write_engine_spec "$OUT/engine_spec_kl.json" "${AK[@]}" || exit 1
-  REF_MEM_FRACTION=0.35 REF_MAX_TOKENS=160000 python3 "$REPO/rl/ref_engine_argv.py" "$OUT/engine_spec_kl.json" 20049 20040 || exit 1
+  REF_MEM_FRACTION=0.35 REF_MAX_TOKENS=100000 python3 "$REPO/rl/ref_engine_argv.py" "$OUT/engine_spec_kl.json" 20049 20040 || exit 1
   echo "== train67 schedule (B=$T67_B)"
   python3 "$REPO/rl/schedule_check.py" "$MEMPROBE_DATA/rollout_0.pt" --episodes "$T67_B" --group "$T67_G" \
     "${TRAIN[@]}" "${TRAIN67[@]}" "${MEMPROBE[@]}"
@@ -426,6 +436,17 @@ train() {
   local tp=$!
   (
     until grep -q 'POST /v1/chat/completions' "$OUT/train_segment.log" 2>/dev/null; do kill -0 $tp 2>/dev/null || exit; sleep 15; done
+    # kl=B: the rollout engine's own free memory after its CUDA graphs, beside the reference server, must leave the
+    # weight push (~2.9 GB), the reference's scoring (~0.7) and a margin: under 7 GB the run stops here, minutes in,
+    # not at the first scored group (standalone at 0.85 it is ~4.3 GB, all the engine's own)
+    if [ -n "${T67_KL:-}" ]; then
+      free_gb=$(grep -h "TP0\] Capture target decode CUDA graph end" "$OUT/train_segment.log" | tail -1 | sed -n 's/.*avail mem=\([0-9.]*\) GB.*/\1/p')
+      echo "[s5] ref: the rollout engine has ${free_gb:-?} GB free after its CUDA graphs"
+      if [ -z "$free_gb" ] || awk -v f="$free_gb" 'BEGIN { exit !(f < 7.0) }'; then
+        echo "[s5] ref: under 7 GB free on the engine GPUs (or not found): stopping"
+        kill $tp; exit
+      fi
+    fi
     python3 -c "import sys; from flint.miles_agent import startup_probe as p; sys.exit(p('$OUT', '$OUT/train_segment.log', '$FLINT'))" \
       > "$OUT/probe_start.log" 2>&1 || {
         echo "[s5] startup probe failed: $(tail -1 "$OUT/probe_start.log")"
