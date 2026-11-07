@@ -92,7 +92,12 @@ class RefScorer:
                     last = f"HTTP {r.status}: {(await r.text())[:300]}"
                     if r.status < 500:
                         break   # a request the server refuses will not pass on a retry
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            except asyncio.TimeoutError as e:
+                # a request that ran REQUEST_TIMEOUT_S without an answer is not retried (audit 2026-11-06: 7 tries of a
+                # hung server took ~79 min, past the GPU watch's 60): the group fails now
+                last = f"{type(e).__name__}: no answer in {REQUEST_TIMEOUT_S:.0f} s"
+                break
+            except aiohttp.ClientError as e:
                 last = f"{type(e).__name__}: {e}"
             if i < RETRIES:
                 await asyncio.sleep(BACKOFF_S[i])
@@ -164,6 +169,11 @@ async def _check(url: str, model_dir: str) -> dict:
         out = gen["meta_info"]["output_token_logprobs"]
         ids, sampled = [int(e[1]) for e in out], [float(e[0]) for e in out]
         tokens = prompt + ids
+        # an empty radix cache, so the scoring prefill runs the whole sequence and crosses the 4,096-token chunk (the
+        # cached prompt would otherwise leave only the 1,200 new tokens, one chunk; audit 2026-11-06)
+        async with scorer._session.post(url.rstrip("/") + "/flush_cache") as r:
+            if r.status != 200:
+                raise RuntimeError(f"reference server {url}: /flush_cache answered {r.status}")
         scored = parse(await scorer._post(payload(tokens, len(ids))), tokens, len(ids), scorer.vocab_size)
     finally:
         if scorer._session is not None:

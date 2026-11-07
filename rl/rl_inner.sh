@@ -434,6 +434,10 @@ train() {
   local tl=$!
   python3 "$MILES/$driver" "$@" >> "$OUT/train.log" 2>&1 &
   local tp=$!
+  # a start check that stops train.py leaves this marker, and train() then returns 3: a SIGTERM's 143 would make wq
+  # requeue a --partial job, and the next segment would fail the same way (audit 2026-11-06)
+  local failed=$OUT/start_check_failed
+  rm -f -- "$failed"
   (
     until grep -q 'POST /v1/chat/completions' "$OUT/train_segment.log" 2>/dev/null; do kill -0 $tp 2>/dev/null || exit; sleep 15; done
     # kl=B: the rollout engine's own free memory after its CUDA graphs, beside the reference server, must leave the
@@ -444,7 +448,7 @@ train() {
       echo "[s5] ref: the rollout engine has ${free_gb:-?} GB free after its CUDA graphs"
       if [ -z "$free_gb" ] || awk -v f="$free_gb" 'BEGIN { exit !(f < 7.0) }'; then
         echo "[s5] ref: under 7 GB free on the engine GPUs (or not found): stopping"
-        kill $tp; exit
+        echo "engine free memory ${free_gb:-?} GB" > "$failed"; kill $tp; exit
       fi
     fi
     python3 -c "import sys; from flint.miles_agent import startup_probe as p; sys.exit(p('$OUT', '$OUT/train_segment.log', '$FLINT'))" \
@@ -452,12 +456,13 @@ train() {
         echo "[s5] startup probe failed: $(tail -1 "$OUT/probe_start.log")"
         # if train.py is already going down, the probe failed because of it: let it print its own error (w971, 2026-11-03: this kill cut it off)
         for _ in $(seq 24); do kill -0 $tp 2>/dev/null || exit; sleep 5; done
-        kill $tp
+        echo "startup probe" > "$failed"; kill $tp
       }
   ) &
   wait $tp
   local rc=$?
   kill $tl 2>/dev/null
+  [ -e "$failed" ] && { echo "[s5] the start check stopped train.py ($(cat "$failed")): exit 3, not requeued"; rc=3; }
   return $rc
 }
 
