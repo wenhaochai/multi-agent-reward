@@ -259,24 +259,35 @@ WD=$!
 # a pilot host's cgroup also keeps the cache of earlier guests, and checkpoint writes add more. A
 # stop request ($OUT/stop_request: "<exit code> <reason>", from here or from flint.miles_agent.log_rollout's rules)
 # asks miles for a checkpoint at its next save point (--save-trigger-sentinel $OUT/save_now); once miles has written it
-# (the sentinel is gone) the job stops with that exit code. Requests: non-reclaimable memory over 860 GiB (3: a
-# failure); less than 75 min left of LIMIT (99: wq requeues it, the next segment resumes from the checkpoint); run20's
-# first segment stops after its first checkpoint (99), so the second one proves the resume. Over 875 GiB the job stops
-# at once (3).
+# (the sentinel is gone) the job stops with that exit code. Requests: non-reclaimable memory over 860 GiB; less than
+# 75 min left of LIMIT (99: wq requeues it, the next segment resumes from the checkpoint); run20's first segment stops
+# after its first checkpoint (99), so the second one proves the resume. Over 875 GiB the job stops at once. A memory stop
+# of a resumable run is 99 (requeued: the next segment starts with fresh processes, whose memory is lower), up to 3 in
+# 24 h ($OUT/memory_stops), then 3 (a failure); of any other run, 3. 2026-11-07: the main line stopped at 862 GiB as
+# step 6 began, after a planned save, as a failure, and waited for a hand-made restart.
 CG=/sys/fs/cgroup$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup | sed -E 's#(/job_[0-9]+)/.*#\1#')/memory.current   # the job's
 MS=${CG%memory.current}memory.stat
 TRACKER=$OUT/actor/latest_checkpointed_iteration.txt
 ( t0=$SECONDS asked=
   request() { [ -e "$OUT/stop_request" ] || echo "$1" > "$OUT/stop_request"; }
   finish() { echo "$1" | cut -d' ' -f1 > "$OUT/exit_code"; echo "PLANNED_STOP: $1" >&2; kill -TERM $$; }
+  memcode() {   # the exit code of a memory stop, recorded in $OUT/memory_stops: 99 up to 3 in 24 h of a resumable run
+    local n=3
+    if [ -n "$RESUMABLE" ]; then
+      n=$(awk -v t=$(($(date +%s) - 86400)) '$1 > t' "$OUT/memory_stops" 2>/dev/null | wc -l)
+      n=$([ "$n" -lt 3 ] && echo 99 || echo 3)
+    fi
+    echo "$(date +%s) $1 $n" >> "$OUT/memory_stops"
+    echo "$n"
+  }
   while sleep 10; do
     cur=$(cat "$CG" 2>/dev/null || echo 0)
     pc=$(awk '$1 == "file" {f = $2} $1 == "shmem" {s = $2} END {printf "%.0f\n", f - s}' "$MS" 2>/dev/null)   # page cache bytes
     [[ $pc =~ ^[0-9]+$ ]] || pc=0   # no memory.stat: count everything (as before)
     cg=$((cur / 1048576)) nr=$(((cur - pc) / 1048576))
     echo "$(date +%s) $(free -m | awk '/Mem:/{print $3}') $cg $nr"
-    if [ "$nr" -gt $((875 * 1024)) ]; then finish "3 host memory: $nr MiB non-reclaimable (cgroup $cg MiB) over 875 GiB"; break; fi
-    [ "$nr" -gt $((860 * 1024)) ] && request "3 host memory: $nr MiB non-reclaimable (cgroup $cg MiB) over 860 GiB"
+    if [ "$nr" -gt $((875 * 1024)) ]; then finish "$(memcode 875) host memory: $nr MiB non-reclaimable (cgroup $cg MiB) over 875 GiB"; break; fi
+    [ "$nr" -gt $((860 * 1024)) ] && [ ! -e "$OUT/stop_request" ] && request "$(memcode 860) host memory: $nr MiB non-reclaimable (cgroup $cg MiB) over 860 GiB"
     [ -n "$RESUMABLE" ] && [ "$(date +%s)" -gt $((END - STOP_S)) ] && request "99 time: less than $((STOP_S / 60)) min left"
     if [ "$MODE" = run20 ] && [ -n "$FRESH" ] && [ -e "$TRACKER" ]; then finish "99 first segment: checkpoint $(cat "$TRACKER") written, resume next"; break; fi
     if [ -e "$OUT/stop_request" ] && [ -z "$asked" ]; then touch "$OUT/save_now"; asked=1; fi
