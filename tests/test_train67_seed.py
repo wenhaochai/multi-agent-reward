@@ -96,9 +96,29 @@ def base_only(av):
     return [a for a in av if not any(x in a for x in NEW) and not any(w.endswith("elastic_engine_argv.py") for w in a)]
 
 
+# Later intended changes to the calls 60e6d34 makes, taken out before the byte-for-byte comparison (audit 2026-11-07:
+# the four argv checks had failed since elastic-v14 on these three only): kl=B's reference argv check (a new call, as
+# above), a8bce3b's --session-server-workers N in every train argv, and the game settings dump's two newer keys
+# (dupend=N, cutzero=1). Anything else that differs from 60e6d34 still fails.
+LATER_KEYS = ", 'MA_LG_DUP_END', 'MA_LG_CUT_ZERO'"
+
+
+def normalize(av):
+    out = []
+    for a in av:
+        if any(w.endswith("ref_engine_argv.py") for w in a):
+            continue
+        a = [w.replace(LATER_KEYS, "") if "game_settings.json" in w else w for w in a]
+        if "--session-server-workers" in a:
+            i = a.index("--session-server-workers")
+            a = a[:i] + a[i + 2:]
+        out.append(a)
+    return out
+
+
 n_new = len(a1) - len(base_only(a1))
 check("argv: the elastic and async checks add python3 calls (an engine provider or --fully-async)", n_new > 0, n_new)
-a1, a2, a3 = base_only(a1), base_only(a2), base_only(a3)
+a1, a2, a3 = (normalize(base_only(x)) for x in (a1, a2, a3))
 check(f"argv: {BASE}'s rl_inner.sh args gives 9 python3 calls (game settings, 4 run20/memprobe, 3 train67, schedule)",
       rc0 == 0 and len(a0) == 9, (rc0, len(a0), l0[-500:]))
 check(f"argv seed unset: every python3 argv byte-identical to {BASE}'s", rc1 == 0 and a1 == a0, l1[-500:])
