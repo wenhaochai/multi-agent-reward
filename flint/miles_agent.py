@@ -199,10 +199,17 @@ def _stop_rule(out: str, rollout_id: int) -> str | None:
     return None
 
 
-# the trainer's train/* consistency numbers of the last step against run20's maximum over its 20 steps
-# (tmp/rollout_eff/consistency: the gate's tier 4); over a limit, log_rollout warns, it does not stop the run
-CONSISTENCY_LIMITS = {"train/train_rollout_logprob_abs_diff": 0.0099, "train/train_rollout_kl": 3.4e-4,
-                      "train/r3_token_mismatch": 0.146, "train/r3_pick_mismatch": 0.031}
+# the trainer's train/* consistency numbers of the last step against a baseline's maximum (tmp/rollout_eff/consistency:
+# the gate's tier 4); over a limit, log_rollout warns, it does not stop the run. A synchronous run: run20's 20 steps. An
+# asynchronous run (T67_ASYNC): the staleness-2 runs' steps, e_a2 (40 at P = 2) and the main line's first 4 at P = 4
+# (2026-11-06: under run20's limits nearly every async step warned, the lag of up to 2 weight versions adding to the gap;
+# KL = 2.98e-4 + 1.02e-4 lag^2)
+CONSISTENCY_BASELINE, CONSISTENCY_LIMITS = (
+    ("the staleness-2 runs'", {"train/train_rollout_logprob_abs_diff": 0.0178, "train/train_rollout_kl": 1.26e-3,
+                               "train/r3_token_mismatch": 0.175, "train/r3_pick_mismatch": 0.039})
+    if os.environ.get("T67_ASYNC") else
+    ("run20's", {"train/train_rollout_logprob_abs_diff": 0.0099, "train/train_rollout_kl": 3.4e-4,
+                 "train/r3_token_mismatch": 0.146, "train/r3_pick_mismatch": 0.031}))
 # generated tokens of one rollout that no training sample holds, up to which the sample check warns (log_rollout):
 # 1,024 = 0.05% of a P=2 rollout (owner popup 2026-11-06 「放宽到 1,024 并继续（推荐）」; the third try of w786's rollout 64
 # missed 158 tokens, over the first limit of 64)
@@ -845,7 +852,7 @@ def _log_rollout(rollout_id, args, samples, rollout_extra_metrics, rollout_time)
     rec |= _consistency(out)
     if rec.get("consistency_over"):
         print(f"[flint rollout {rollout_id}] CONSISTENCY WARNING: step {rec['consistency_step']} "
-              f"{ {k: rec['consistency'][k] for k in rec['consistency_over']} } over run20's maximum", flush=True)
+              f"{ {k: rec['consistency'][k] for k in rec['consistency_over']} } over {CONSISTENCY_BASELINE} maximum", flush=True)
     with open(os.path.join(out, "steps.jsonl"), "a") as f:
         f.write(json.dumps(rec) + "\n")
     print(f"[flint rollout {rollout_id}] {json.dumps(rec)}", flush=True)
